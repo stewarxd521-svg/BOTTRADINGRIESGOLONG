@@ -1,6 +1,12 @@
 """Bot LONG para ganadores de Binance Futures. Detecta símbolos >40% de
-cambio 24h, abre por tramos entre 50%-80%, y activa TP (=distancia del SL)
-solo si el cambio supera 100%; el SL siempre está activo."""
+cambio 24h y abre por tramos en 50%, 75% y 100% de cambio.
+
+Gestión de riesgo:
+- 1ra entrada (50%): protegida con SL_FRACTION (stop loss normal en USDT).
+- 2da y 3ra entrada (75% / 100%): una vez se abren, el stop deja de ser el
+  SL_FRACTION y pasa a ser BREAKEVEN (cierra en PnL ~0 si el precio cae).
+- TP: solo cierra por Take Profit cuando el PnL no realizado de la posición
+  alcanza TAKE_PROFIT_USDT (por defecto 10 USDT), sin importar el nivel."""
 
 from __future__ import annotations 
 
@@ -91,11 +97,6 @@ except Exception :
             "active_connections":0 ,
             }
 
-
-
-
-
-
 BASE_URL =os .getenv ("BASE_URL","https://fapi.binance.com")
 QUOTE_ASSET =os .getenv ("QUOTE_ASSET","USDT")
 PAPER_MODE =os .getenv ("PAPER_MODE","true").lower ()=="true"
@@ -137,27 +138,30 @@ WS_STOP_GRACE =float (os .getenv ("WS_STOP_GRACE","0.8"))
 
 MAX_PRICE_BLOCK =float (os .getenv ("MAX_PRICE_BLOCK","1.5"))
 
-ENTRY_LEVELS =[float (x )for x in os .getenv ("ENTRY_LEVELS","50,75").split (",")]
-ENTRY_NOTIONALS =[float (x )for x in os .getenv ("ENTRY_NOTIONALS","5.1,5.1").split (",")]
-ENTRY_MAX_LEVEL =float (os .getenv ("ENTRY_MAX_LEVEL","80"))
+ENTRY_LEVELS =[float (x )for x in os .getenv ("ENTRY_LEVELS","50,75,100").split (",")]
+ENTRY_NOTIONALS =[float (x )for x in os .getenv ("ENTRY_NOTIONALS","5.1,5.1,10.2").split (",")]
+# ENTRY_MAX_LEVEL debe quedar por ENCIMA del último nivel de entrada (100%)
+# para que la entrada del 100% no quede bloqueada por overshoot del cambio.
+ENTRY_MAX_LEVEL =float (os .getenv ("ENTRY_MAX_LEVEL","110"))
 MAX_ENTRY_LEVEL =ENTRY_MAX_LEVEL 
 TP_TRIGGER_LEVEL =float (os .getenv ("TP_TRIGGER_LEVEL","100"))
 
 SL_FRACTION =float (os .getenv ("SL_FRACTION",os .getenv ("TAKE_PROFIT_FRACTION","0.14284")))
-TAKE_PROFIT_USDT =float (os .getenv ("TAKE_PROFIT_USDT","0"))
+
+# El TP ahora es un objetivo FIJO en USDT de PnL no realizado de la posición
+# (no depende del nivel de cambio ni del notional). Por defecto: 10 USDT.
+TAKE_PROFIT_USDT =float (os .getenv ("TAKE_PROFIT_USDT","10"))
+BREAKEVEN_BUFFER_USDT =float (os .getenv ("BREAKEVEN_BUFFER_USDT","0.0"))
 
 def tp_target_for (notional :float )->float :
-    return max (0.0 ,notional *SL_FRACTION )
-
-
+    """Objetivo de TP en USDT. Ya no depende del notional: siempre es
+    TAKE_PROFIT_USDT (cierre por TP únicamente cuando el PnL llega a ese
+    valor en dólares)."""
+    return TAKE_PROFIT_USDT 
 
 EXECUTOR_URL =os .getenv ("EXECUTOR_URL","https://executor-5lu0.onrender.com/").strip ().rstrip ("/")
 EXECUTOR_SIGNAL_SECRET =os .getenv ("EXECUTOR_SIGNAL_SECRET",os .getenv ("SIGNAL_SECRET","clave-secreta-aleatoria"))
 EXECUTOR_POLL_SECS =int (os .getenv ("EXECUTOR_POLL_SECS","5"))
-
-
-
-
 
 
 @dataclass 
@@ -200,10 +204,6 @@ class BotPosition :
 
     def opened_levels (self )->set :
         return {f .level for f in self .fills }
-
-
-
-
 
 
 class BinanceFuturesClient :
@@ -300,11 +300,6 @@ class BinanceFuturesClient :
         "quantity":qty ,"reduceOnly":"true"},
         signed =True )
 
-
-
-
-
-
 def _executor_send_signal_sync (payload :dict )->None :
     """Envía una señal (open/close) al Executor. Falla en silencio (solo log)
     si el Executor no está configurado o no responde — nunca debe tumbar
@@ -343,11 +338,6 @@ def _executor_fetch_state_sync ()->Optional [dict ]:
     except Exception :
         return None 
 
-
-
-
-
-
 class TradingBot :
     def __init__ (self )->None :
         self .client =BinanceFuturesClient ()
@@ -357,35 +347,17 @@ class TradingBot :
         self .events :List [str ]=[]
         # RLock evita deadlocks si un método con lock llama a self.log() o a otro método que también usa el mismo lock.
         self .lock =threading .RLock ()
-
-
         self .symbol_cooldown :Dict [str ,float ]={}
-
-
         self .price_blocked :set =set ()
-
-
         self .change_blocked :set =set ()
-
-
         self .total_realized_pnl :float =0.0 
-
-
         self ._trade_id_seq :int =0 
-
-
         self .executor_state :Dict [str ,Any ]={}
-
-
         self .all_symbols :List [str ]=[]
         self .last_symbols_refresh_at :float =0.0 
-
-
         self .price_cache :Optional [SymbolWebSocketPriceCache ]=None 
         self .kline_cache :Optional [KlineWebSocketCache ]=None 
         self .subscribed_symbols :List [str ]=[]
-
-
         self .running =False 
         self .scan_count =0 
         self .last_scan_at =0.0 
@@ -398,20 +370,14 @@ class TradingBot :
         self .exchange_symbols =0 
         self .started_at =time .time ()
         self ._sse_snapshot :str ="{}"
-
         self .loop :Optional [asyncio .AbstractEventLoop ]=None 
         self .thread :Optional [threading .Thread ]=None 
-
-
-
     def log (self ,msg :str )->None :
         stamp =datetime .now (timezone .utc ).strftime ("%Y-%m-%d %H:%M:%S UTC")
         line =f"{stamp } | {msg }"
         print (line ,flush =True )
         with self .lock :
             self .events =[line ,*self .events [:99 ]]
-
-
 
     def start (self )->None :
         if self .running :
@@ -438,8 +404,6 @@ class TradingBot :
             self .last_error =str (exc )
             self .log (f"Bot detenido por error no controlado: {exc }")
 
-
-
     async def _supervised (self ,coro_factory ,name :str ,restart_delay :float =2.0 ):
         """Envuelve una corrutina con reinicio automático."""
         while self .running :
@@ -464,8 +428,6 @@ class TradingBot :
             except asyncio .CancelledError :
                 if not self .running :
                     break 
-
-
 
     async def _main (self )->None :
         self .log ("Bot iniciado — modo "+(
@@ -492,7 +454,6 @@ class TradingBot :
         self ._supervised (self ._executor_poll_loop ,"_executor_poll_loop"),
         return_exceptions =True ,
         )
-
 
 
     def _stop_price_cache (self )->None :
@@ -551,8 +512,6 @@ class TradingBot :
         self .kline_cache .start ()
         self .log (f"KlineCache iniciado con {len (symbols )} símbolos (1m)")
 
-
-
     def _load_symbols_from_cache (self )->List [str ]:
         """Lee la lista de símbolos desde el archivo de caché en disco."""
         try :
@@ -583,8 +542,6 @@ class TradingBot :
             self .log (f"Caché de símbolos guardado: {len (symbols )} símbolos → {SYMBOLS_CACHE_FILE }")
         except Exception as exc :
             self .log (f"No pude guardar caché de símbolos: {exc }")
-
-
 
     async def _refresh_all_symbols (self )->bool :
         """
@@ -1235,16 +1192,30 @@ class TradingBot :
                 pos .tp_armed =True 
 
             pnl =pos .unrealized_pnl (price )
-            notional =pos .notional 
+            num_fills =len (pos .fills )
+            first_fill_notional =pos .fills [0 ].notional 
             tp_armed =pos .tp_armed 
 
-        tp_target =tp_target_for (notional )
-        sl_target =notional *SL_FRACTION 
-
+        # --- Stop loss / Breakeven ---
+        # Mientras solo exista la 1ra entrada (50%), el stop es el SL_FRACTION
+        # normal calculado sobre el notional de esa 1ra entrada.
+        # En el momento en que se abre la 2da (75%) y/o 3ra (100%) entrada,
+        # el stop deja de ser el SL_FRACTION y pasa a ser BREAKEVEN: si el
+        # precio cae y el PnL combinado de la posición vuelve a <= 0 (o al
+        # buffer configurado), se cierra todo en breakeven.
         reason =None 
-        if pnl <=-sl_target :
-            reason ="SL"
-        elif tp_armed and pnl >=tp_target :
+        if num_fills <=1 :
+            sl_target =first_fill_notional *SL_FRACTION 
+            if pnl <=-sl_target :
+                reason ="SL"
+        else :
+            if pnl <=BREAKEVEN_BUFFER_USDT :
+                reason ="BE"
+
+        # --- Take Profit ---
+        # El TP SOLO ocurre cuando el PnL no realizado de la posición llega
+        # a TAKE_PROFIT_USDT (en dólares), sin importar el nivel de cambio.
+        if reason is None and pnl >=TAKE_PROFIT_USDT :
             reason ="TP"
 
         if reason is None :
@@ -1411,7 +1382,13 @@ class TradingBot :
             total_unreal +=pnl 
             total_notional +=pos .notional 
             tp_target =tp_target_for (pos .notional )
-            sl_target =pos .notional *SL_FRACTION 
+            num_fills =len (pos .fills )
+            if num_fills <=1 :
+                sl_target =pos .fills [0 ].notional *SL_FRACTION if pos .fills else pos .notional *SL_FRACTION 
+                stop_mode ="SL"
+            else :
+                sl_target =BREAKEVEN_BUFFER_USDT 
+                stop_mode ="BE"
             open_positions .append ({
             "symbol":symbol ,
             "mark_price":price ,
@@ -1421,6 +1398,7 @@ class TradingBot :
             "tp_target":tp_target ,
             "target":tp_target ,
             "sl_target":sl_target ,
+            "stop_mode":stop_mode ,
             "unrealized_pnl":pnl ,
             "tp_armed":pos .tp_armed ,
             "fills":[f .__dict__ for f in pos .fills ],
@@ -1493,6 +1471,7 @@ class TradingBot :
         "max_entry_level":ENTRY_MAX_LEVEL ,
         "tp_trigger_level":TP_TRIGGER_LEVEL ,
         "sl_pct":SL_FRACTION *100 ,
+        "take_profit_usdt":TAKE_PROFIT_USDT ,
         "tp_usdt_full":tp_target_for (total_notional ),
         "total_unrealized":total_unreal ,
         "total_notional":total_notional ,
