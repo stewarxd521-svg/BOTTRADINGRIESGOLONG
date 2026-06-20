@@ -97,6 +97,11 @@ except Exception :
             "active_connections":0 ,
             }
 
+
+
+
+
+
 BASE_URL =os .getenv ("BASE_URL","https://fapi.binance.com")
 QUOTE_ASSET =os .getenv ("QUOTE_ASSET","USDT")
 PAPER_MODE =os .getenv ("PAPER_MODE","true").lower ()=="true"
@@ -139,7 +144,7 @@ WS_STOP_GRACE =float (os .getenv ("WS_STOP_GRACE","0.8"))
 MAX_PRICE_BLOCK =float (os .getenv ("MAX_PRICE_BLOCK","1.5"))
 
 ENTRY_LEVELS =[float (x )for x in os .getenv ("ENTRY_LEVELS","50,75,100").split (",")]
-ENTRY_NOTIONALS =[float (x )for x in os .getenv ("ENTRY_NOTIONALS","5.1,5.1,10.2").split (",")]
+ENTRY_NOTIONALS =[float (x )for x in os .getenv ("ENTRY_NOTIONALS","5.1,5.1,5.1").split (",")]
 # ENTRY_MAX_LEVEL debe quedar por ENCIMA del último nivel de entrada (100%)
 # para que la entrada del 100% no quede bloqueada por overshoot del cambio.
 ENTRY_MAX_LEVEL =float (os .getenv ("ENTRY_MAX_LEVEL","110"))
@@ -151,6 +156,9 @@ SL_FRACTION =float (os .getenv ("SL_FRACTION",os .getenv ("TAKE_PROFIT_FRACTION"
 # El TP ahora es un objetivo FIJO en USDT de PnL no realizado de la posición
 # (no depende del nivel de cambio ni del notional). Por defecto: 10 USDT.
 TAKE_PROFIT_USDT =float (os .getenv ("TAKE_PROFIT_USDT","10"))
+
+# Buffer (en USDT) para considerar "breakeven". 0.0 = cierra exactamente en
+# PnL <= 0. Puede subirse un poco (ej. 0.05) para cubrir comisiones.
 BREAKEVEN_BUFFER_USDT =float (os .getenv ("BREAKEVEN_BUFFER_USDT","0.0"))
 
 def tp_target_for (notional :float )->float :
@@ -159,9 +167,15 @@ def tp_target_for (notional :float )->float :
     valor en dólares)."""
     return TAKE_PROFIT_USDT 
 
+
+
 EXECUTOR_URL =os .getenv ("EXECUTOR_URL","https://executor-5lu0.onrender.com/").strip ().rstrip ("/")
 EXECUTOR_SIGNAL_SECRET =os .getenv ("EXECUTOR_SIGNAL_SECRET",os .getenv ("SIGNAL_SECRET","clave-secreta-aleatoria"))
 EXECUTOR_POLL_SECS =int (os .getenv ("EXECUTOR_POLL_SECS","5"))
+
+
+
+
 
 
 @dataclass 
@@ -204,6 +218,10 @@ class BotPosition :
 
     def opened_levels (self )->set :
         return {f .level for f in self .fills }
+
+
+
+
 
 
 class BinanceFuturesClient :
@@ -300,6 +318,11 @@ class BinanceFuturesClient :
         "quantity":qty ,"reduceOnly":"true"},
         signed =True )
 
+
+
+
+
+
 def _executor_send_signal_sync (payload :dict )->None :
     """Envía una señal (open/close) al Executor. Falla en silencio (solo log)
     si el Executor no está configurado o no responde — nunca debe tumbar
@@ -338,6 +361,11 @@ def _executor_fetch_state_sync ()->Optional [dict ]:
     except Exception :
         return None 
 
+
+
+
+
+
 class TradingBot :
     def __init__ (self )->None :
         self .client =BinanceFuturesClient ()
@@ -347,17 +375,35 @@ class TradingBot :
         self .events :List [str ]=[]
         # RLock evita deadlocks si un método con lock llama a self.log() o a otro método que también usa el mismo lock.
         self .lock =threading .RLock ()
+
+
         self .symbol_cooldown :Dict [str ,float ]={}
+
+
         self .price_blocked :set =set ()
+
+
         self .change_blocked :set =set ()
+
+
         self .total_realized_pnl :float =0.0 
+
+
         self ._trade_id_seq :int =0 
+
+
         self .executor_state :Dict [str ,Any ]={}
+
+
         self .all_symbols :List [str ]=[]
         self .last_symbols_refresh_at :float =0.0 
+
+
         self .price_cache :Optional [SymbolWebSocketPriceCache ]=None 
         self .kline_cache :Optional [KlineWebSocketCache ]=None 
         self .subscribed_symbols :List [str ]=[]
+
+
         self .running =False 
         self .scan_count =0 
         self .last_scan_at =0.0 
@@ -370,14 +416,20 @@ class TradingBot :
         self .exchange_symbols =0 
         self .started_at =time .time ()
         self ._sse_snapshot :str ="{}"
+
         self .loop :Optional [asyncio .AbstractEventLoop ]=None 
         self .thread :Optional [threading .Thread ]=None 
+
+
+
     def log (self ,msg :str )->None :
         stamp =datetime .now (timezone .utc ).strftime ("%Y-%m-%d %H:%M:%S UTC")
         line =f"{stamp } | {msg }"
         print (line ,flush =True )
         with self .lock :
             self .events =[line ,*self .events [:99 ]]
+
+
 
     def start (self )->None :
         if self .running :
@@ -404,6 +456,8 @@ class TradingBot :
             self .last_error =str (exc )
             self .log (f"Bot detenido por error no controlado: {exc }")
 
+
+
     async def _supervised (self ,coro_factory ,name :str ,restart_delay :float =2.0 ):
         """Envuelve una corrutina con reinicio automático."""
         while self .running :
@@ -428,6 +482,8 @@ class TradingBot :
             except asyncio .CancelledError :
                 if not self .running :
                     break 
+
+
 
     async def _main (self )->None :
         self .log ("Bot iniciado — modo "+(
@@ -454,6 +510,7 @@ class TradingBot :
         self ._supervised (self ._executor_poll_loop ,"_executor_poll_loop"),
         return_exceptions =True ,
         )
+
 
 
     def _stop_price_cache (self )->None :
@@ -512,6 +569,8 @@ class TradingBot :
         self .kline_cache .start ()
         self .log (f"KlineCache iniciado con {len (symbols )} símbolos (1m)")
 
+
+
     def _load_symbols_from_cache (self )->List [str ]:
         """Lee la lista de símbolos desde el archivo de caché en disco."""
         try :
@@ -542,6 +601,8 @@ class TradingBot :
             self .log (f"Caché de símbolos guardado: {len (symbols )} símbolos → {SYMBOLS_CACHE_FILE }")
         except Exception as exc :
             self .log (f"No pude guardar caché de símbolos: {exc }")
+
+
 
     async def _refresh_all_symbols (self )->bool :
         """
@@ -1817,8 +1878,7 @@ let _cdData       = {};
 let _lastFetch    = 0;
 let _prevFilter   = 0;
 let _prevWsTicker = 0;
-let _filterAt     = 0;
-let _filterCycle  = 300;
+let _filterDeadlineMs = 0;
 
 // Decrementa cooldowns y cuenta regresiva del ciclo de filtrado
 function tickTimers() {
@@ -1845,9 +1905,13 @@ function tickTimers() {
     }
   });
 
-  // Cuenta regresiva del próximo ciclo de filtrado
-  if (_filterAt > 0) {
-    const nextIn = Math.max(0, _filterCycle - elapsed);
+  // Cuenta regresiva del próximo ciclo de filtrado.
+  // Usamos un "deadline" absoluto (timestamp de cuando termina el ciclo)
+  // calculado UNA sola vez por ciclo, en vez de restar el tiempo transcurrido
+  // desde el último poll contra la duración total del ciclo (eso causaba que
+  // el contador se reiniciara visualmente cada vez que llegaba un nuevo poll).
+  if (_filterDeadlineMs > 0) {
+    const nextIn = Math.max(0, (_filterDeadlineMs - Date.now()) / 1000);
     q('nextFilter').textContent = nextIn > 0 ? `en ${fmtCd(nextIn)}` : 'pronto…';
     q('fbNext').textContent     = nextIn > 0 ? fmtCd(nextIn) : 'pronto…';
   }
@@ -1858,8 +1922,17 @@ setInterval(tickTimers, 1000);
 function render(d) {
   if (!d) return;
   _lastFetch    = Date.now();
-  _filterAt     = n(d.last_filter_cycle_at || 0);  // no viene en snapshot directamente, usamos texto
-  _filterCycle  = n(d.filter_cycle_secs || 300);
+
+  // Deadline absoluto del próximo ciclo de filtrado (timestamp en ms en el
+  // que debe terminar el ciclo). Se recalcula en cada poll a partir del
+  // momento real en que comenzó el ciclo (last_filter_cycle_at, en
+  // segundos epoch) + su duración total. Así el contador nunca "salta" ni
+  // se reinicia visualmente entre polls: solo se mueve hacia 0 de forma
+  // continua y se vuelve a fijar un nuevo deadline cuando el ciclo real
+  // cambia.
+  const filterAtSecs  = n(d.last_filter_cycle_at || 0);
+  const filterCycle   = n(d.filter_cycle_secs || 300);
+  _filterDeadlineMs    = filterAtSecs > 0 ? (filterAtSecs + filterCycle) * 1000 : 0;
 
   const mode = d.mode || '—';
   q('mode').textContent      = mode;
@@ -1870,11 +1943,23 @@ function render(d) {
   q('pnl').textContent            = money(pu);
   q('pnl').className              = 'value ' + cls(pu);
   q('notional').textContent       = money(d.total_notional);
+
+  const prPaper = n(d.total_realized_paper);
+  const prReal  = n(d.total_realized_real);
+  const prComb  = n(d.total_realized_combined);
+  q('pnlRealPaper').textContent   = money(prPaper);
+  q('pnlRealPaper').className     = 'value ' + cls(prPaper);
+  q('pnlRealReal').textContent    = money(prReal);
+  q('pnlRealReal').className      = 'value ' + cls(prReal);
+  // PnL combinado = no realizado + realizado (paper + real)
+  const pnlCombinedTotal = pu + prComb;
+  q('pnlCombined').textContent    = money(pnlCombinedTotal);
+  q('pnlCombined').className      = 'value ' + cls(pnlCombinedTotal);
+
   q('scan').textContent           = d.last_scan_text         || 'pendiente';
   q('scanCount').textContent      = n(d.scan_count);
   q('filterCycles').textContent   = n(d.filter_cycle_count);
   q('lastFilter').textContent     = d.last_filter_text       || 'pendiente';
-  q('nextFilter').textContent     = d.next_filter_text       || '—';
   q('allSymbols').textContent     = n(d.all_symbols_count);
   q('subCount').textContent       = n(d.subscribed_count);
   q('lastWsTicker').textContent   = d.last_ws_ticker_text    || 'pendiente';
@@ -1890,7 +1975,6 @@ function render(d) {
   q('fbThreshold').textContent = threshold;
   q('fbUnsub').textContent     = Math.max(0, allCount - subCount);
   q('gainThreshold').textContent = threshold;
-  q('fbNext').textContent      = d.next_filter_text || '—';
 
   // Parpadeo del ciclo de filtrado
   const fc = n(d.filter_cycle_count);
@@ -2014,7 +2098,7 @@ function render(d) {
   const closed = Array.isArray(d.closed_trades) ? d.closed_trades : [];
   q('tbClosed').innerHTML = tb(closed.map(t => `<tr>
     <td style="font-weight:700">${t.symbol || ''}</td>
-    <td class="positive">${money(t.pnl)}</td>
+    <td class="${cls(t.pnl)}">${money(t.pnl)}</td>
     <td>${money(t.target ?? t.tp_target ?? 0)}</td>
     <td>${fx(t.avg_entry)}</td>
     <td>${fx(t.close_price)}</td>
@@ -2023,6 +2107,11 @@ function render(d) {
   </tr>`), 'Sin cierres aún', 7);
 
   q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
+
+  // Refresca inmediatamente las cuentas regresivas (cooldowns y próximo
+  // ciclo) con los datos recién llegados, en vez de esperar al próximo
+  // tick de 1s — evita un parpadeo de valores desfasados justo tras el poll.
+  tickTimers();
 }
 
 async function closePosition(symbol, btn) {
