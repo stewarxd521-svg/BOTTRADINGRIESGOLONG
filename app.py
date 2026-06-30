@@ -236,7 +236,7 @@ DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
 DEFAULT_GLOBAL_CLOSE_PNL_USD = float(os.getenv("GLOBAL_CLOSE_PNL_USD", "40.0"))
 
 # ── Executor externo ──────────────────────────────────────────────────────────
-EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
+EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executorlong.onrender.com")
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 
 
