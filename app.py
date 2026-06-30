@@ -169,7 +169,7 @@ def tp_target_for (notional :float )->float :
 
 
 
-EXECUTOR_URL =os .getenv ("EXECUTOR_URL","https://executor-5lu0.onrender.com/").strip ().rstrip ("/")
+EXECUTOR_URL =os .getenv ("EXECUTOR_URL","https://executorlong.onrender.com/").strip ().rstrip ("/")
 EXECUTOR_SIGNAL_SECRET =os .getenv ("EXECUTOR_SIGNAL_SECRET",os .getenv ("SIGNAL_SECRET","clave-secreta-aleatoria"))
 EXECUTOR_POLL_SECS =int (os .getenv ("EXECUTOR_POLL_SECS","5"))
 
