@@ -230,9 +230,7 @@ TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 # Valor de respaldo (legacy) usado solo si por algún motivo no hay notional aún.
 DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
 
-# Cierre global por PnL no realizado acumulado (USD). Si la suma del PnL no
-# realizado de TODAS las posiciones abiertas alcanza/supera este valor, el bot
-# cierra todas las posiciones automáticamente. Configurable en caliente desde
+# Cierre global por PnL no realizado acumulado (USD).
 # el dashboard web (POST /api/set-global-close); el valor de aquí es solo el
 # valor inicial por defecto.
 DEFAULT_GLOBAL_CLOSE_PNL_USD = float(os.getenv("GLOBAL_CLOSE_PNL_USD", "40.0"))
