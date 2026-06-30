@@ -1,740 +1,807 @@
-"""Bot LONG para ganadores de Binance Futures. Detecta símbolos >40% de
-cambio 24h y abre por tramos en 50%, 75% y 100% de cambio.
-
-Gestión de riesgo:
-- 1ra entrada (50%): protegida con SL_FRACTION (stop loss normal en USDT).
-- 2da y 3ra entrada (75% / 100%): una vez se abren, el stop deja de ser el
-  SL_FRACTION y pasa a ser BREAKEVEN (cierra en PnL ~0 si el precio cae).
-- TP: solo cierra por Take Profit cuando el PnL no realizado de la posición
-  alcanza TAKE_PROFIT_USDT (por defecto 10 USDT), sin importar el nivel."""
-
-from __future__ import annotations 
-
-import asyncio 
-import hashlib 
-import hmac 
-import json 
-import os 
-import sys 
-import tempfile 
-import threading 
-import time 
-from dataclasses import dataclass ,field 
-from datetime import datetime ,timezone 
-from math import floor 
-from typing import Any ,Dict ,List ,Optional 
-from urllib .parse import urlencode 
-import urllib .error 
-import urllib .request 
-
-from flask import Flask ,jsonify ,make_response ,render_template_string 
-
-_HERE =os .path .dirname (os .path .abspath (__file__ ))
-if _HERE not in sys .path :
-    sys .path .insert (0 ,_HERE )
-
-try :
-    from WS import SymbolWebSocketPriceCache 
-except Exception :
-    class SymbolWebSocketPriceCache :
-        def __init__ (self ,symbols ,symbols_per_connection =30 ):
-            self .symbols =list (symbols or [])
-            self .symbols_per_connection =symbols_per_connection 
-
-        def start (self ):
-            return None 
-
-        def stop (self ):
-            return None 
-
-        def get_all_prices (self ):
-            return {}
-
-        def get_all_tickers (self ):
-            return {}
-
-        def get_stats (self ):
-            return {
-            "active_prices":0 ,
-            "active_tickers":0 ,
-            "total_symbols":len (self .symbols ),
-            "stale_symbols":0 ,
-            }
-
-try :
-    from KlineWebSocketCache_v4 import KlineWebSocketCache 
-except Exception :
-    class _EmptyDF :
-        empty =True 
-
-        def __len__ (self ):
-            return 0 
-
-        @property 
-        def iloc (self ):
-            return self 
-
-        def __getitem__ (self ,item ):
-            raise IndexError ("empty dataframe")
-
-    class KlineWebSocketCache :
-        def __init__ (self ,*args ,**kwargs ):
-            pass 
-
-        def start (self ):
-            return None 
-
-        def stop (self ):
-            return None 
-
-        def get_dataframe (self ,*args ,**kwargs ):
-            return _EmptyDF ()
-
-        def get_stats (self ):
-            return {
-            "pairs_with_data":0 ,
-            "total_messages":0 ,
-            "active_connections":0 ,
-            }
-
-
-
-
-
-
-BASE_URL =os .getenv ("BASE_URL","https://fapi.binance.com")
-QUOTE_ASSET =os .getenv ("QUOTE_ASSET","USDT")
-PAPER_MODE =os .getenv ("PAPER_MODE","true").lower ()=="true"
-LIVE_TRADING =os .getenv ("LIVE_TRADING","false").lower ()=="true"
-API_KEY =os .getenv ("BINANCE_API_KEY","")
-API_SECRET =os .getenv ("BINANCE_API_SECRET","")
-LEVERAGE =int (os .getenv ("LEVERAGE","1"))
-STATE_FILE =os .getenv ("STATE_FILE",os .path .join (tempfile .gettempdir (),"botshort_state.json"))
-
-INITIAL_SYMBOLS =[s .strip ()for s in os .getenv ("INITIAL_SYMBOLS","").split (",")if s .strip ()]
-
-
-SYMBOLS_CACHE_FILE =os .getenv (
-"SYMBOLS_CACHE_FILE",
-os .path .join (tempfile .gettempdir (),"futures_symbols_cache.json")
-)
-SYMBOL_REFRESH_HOURS =int (os .getenv ("SYMBOL_REFRESH_HOURS","12"))
-
-FILTER_CYCLE_SECS =int (os .getenv ("FILTER_CYCLE_SECS","300"))
-MIN_GAIN_FILTER =float (os .getenv ("MIN_GAIN_FILTER","30"))
-FULL_SUBSCRIBE_WAIT_SECS =int (os .getenv ("FULL_SUBSCRIBE_WAIT_SECS","30"))
-
-
-FILTER_BATCH_SIZE =int (os .getenv ("FILTER_BATCH_SIZE","527"))
-FILTER_BATCH_WAIT_SECS =int (os .getenv ("FILTER_BATCH_WAIT_SECS","10"))
-FILTER_BATCH_PAUSE =float (os .getenv ("FILTER_BATCH_PAUSE","1.5"))
-
-
-WS_TICKER_UPDATE_SECS =float (os .getenv ("WS_TICKER_UPDATE_SECS","5.0"))
-
-
-SCAN_INTERVAL_SECS =int (os .getenv ("SCAN_INTERVAL_SECS","2"))
-MIN_GAIN_TO_SHOW =float (os .getenv ("MIN_GAIN_TO_SHOW","0"))
-COOLDOWN_SECONDS =int (os .getenv ("COOLDOWN_SECONDS","86400"))
-
-
-WS_STOP_GRACE =float (os .getenv ("WS_STOP_GRACE","0.8"))
-
-
-MAX_PRICE_BLOCK =float (os .getenv ("MAX_PRICE_BLOCK","1.5"))
-
-ENTRY_LEVELS =[float (x )for x in os .getenv ("ENTRY_LEVELS","50,75,100").split (",")]
-ENTRY_NOTIONALS =[float (x )for x in os .getenv ("ENTRY_NOTIONALS","5.1,5.1,5.1").split (",")]
-# ENTRY_MAX_LEVEL debe quedar por ENCIMA del último nivel de entrada (100%)
-# para que la entrada del 100% no quede bloqueada por overshoot del cambio.
-ENTRY_MAX_LEVEL =float (os .getenv ("ENTRY_MAX_LEVEL","110"))
-MAX_ENTRY_LEVEL =ENTRY_MAX_LEVEL 
-TP_TRIGGER_LEVEL =float (os .getenv ("TP_TRIGGER_LEVEL","100"))
-
-SL_FRACTION =float (os .getenv ("SL_FRACTION",os .getenv ("TAKE_PROFIT_FRACTION","0.14284")))
-
-# El TP ahora es un objetivo FIJO en USDT de PnL no realizado de la posición
-# (no depende del nivel de cambio ni del notional). Por defecto: 10 USDT.
-TAKE_PROFIT_USDT =float (os .getenv ("TAKE_PROFIT_USDT","10"))
-
-# Buffer (en USDT) para considerar "breakeven". 0.0 = cierra exactamente en
-# PnL <= 0. Puede subirse un poco (ej. 0.05) para cubrir comisiones.
-BREAKEVEN_BUFFER_USDT =float (os .getenv ("BREAKEVEN_BUFFER_USDT","0.0"))
-
-def tp_target_for (notional :float )->float :
-    """Objetivo de TP en USDT. Ya no depende del notional: siempre es
-    TAKE_PROFIT_USDT (cierre por TP únicamente cuando el PnL llega a ese
-    valor en dólares)."""
-    return TAKE_PROFIT_USDT 
-
-
-
-EXECUTOR_URL =os .getenv ("EXECUTOR_URL","https://executorlong.onrender.com/").strip ().rstrip ("/")
-EXECUTOR_SIGNAL_SECRET =os .getenv ("EXECUTOR_SIGNAL_SECRET",os .getenv ("SIGNAL_SECRET","clave-secreta-aleatoria"))
-EXECUTOR_POLL_SECS =int (os .getenv ("EXECUTOR_POLL_SECS","5"))
-
-
-
-
-
-
-@dataclass 
-class Fill :
-    level :float 
-    notional :float 
-    entry_price :float 
-    qty :float 
-    opened_at :float =field (default_factory =time .time )
-
-
-@dataclass 
-class BotPosition :
-    symbol :str 
-    fills :List [Fill ]=field (default_factory =list )
-    realized_pnl :float =0.0 
-    status :str ="OPEN"
-    trade_id :int =0 
-    tp_armed :bool =False 
-
-    @property 
-    def qty (self )->float :
-        return sum (f .qty for f in self .fills )
-
-    @property 
-    def notional (self )->float :
-        return sum (f .notional for f in self .fills )
-
-    @property 
-    def avg_entry (self )->float :
-        if self .qty <=0 :
-            return 0.0 
-        return sum (f .entry_price *f .qty for f in self .fills )/self .qty 
-
-    def unrealized_pnl (self ,mark_price :float )->float :
-        """PnL no realizado para una posición LONG."""
-        if mark_price <=0 :
-            return 0.0 
-        return sum ((mark_price -f .entry_price )*f .qty for f in self .fills )
-
-    def opened_levels (self )->set :
-        return {f .level for f in self .fills }
-
-
-
-
-
-
-class BinanceFuturesClient :
-    def __init__ (self )->None :
-        self .exchange_filters :Dict [str ,Dict [str ,float ]]={}
-
-    async def start (self )->None :
-        await self .load_exchange_info ()
-
-    async def request (self ,method :str ,path :str ,
-    params :Optional [dict ]=None ,signed :bool =False )->Any :
-        return await asyncio .to_thread (
-        self ._sync_request ,BASE_URL ,method ,path ,params ,signed 
+from __future__ import annotations
+import asyncio
+import concurrent.futures
+import hashlib
+import hmac
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from math import floor
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
+import urllib.error
+import urllib.request
+
+from flask import Flask, jsonify, make_response, render_template_string, request
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from WS import SymbolWebSocketPriceCache                    # noqa: E402
+from KlineWebSocketCache_v4 import KlineWebSocketCache      # noqa: E402
+
+# ── ExecutorBridge (señales al Executor externo) ─────────────────────────────
+import urllib.error
+import urllib.request
+from dataclasses import dataclass as _dataclass_eb
+
+
+@_dataclass_eb
+class _ExecutorSignalConfig:
+    executor_url:   str = ""
+    signal_secret:   str = "clave-secreta-aleatoria"
+    poll_secs:       int = 5
+    timeout_signal:  int = 8
+    timeout_state:   int = 8
+
+
+class ExecutorBridge:
+    """Envía señales de apertura/cierre al Executor y consulta su estado."""
+
+    def __init__(
+        self,
+        executor_url: str = "",
+        signal_secret: str = "clave-secreta-aleatoria",
+        poll_secs: int = 5,
+        logger=None,
+    ) -> None:
+        self.config = _ExecutorSignalConfig(
+            executor_url=executor_url.strip().rstrip("/"),
+            signal_secret=signal_secret,
+            poll_secs=int(poll_secs),
+        )
+        self.logger = logger or print
+
+    def _log(self, message: str) -> None:
+        try:
+            self.logger(message)
+        except Exception:
+            pass
+
+    def _build_signal_request(self, payload: dict) -> urllib.request.Request:
+        body = json.dumps(payload).encode("utf-8")
+        return urllib.request.Request(
+            f"{self.config.executor_url}/signal",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Signal-Secret": self.config.signal_secret,
+            },
+            method="POST",
         )
 
-    def _sync_request (self ,base_url :str ,method :str ,path :str ,
-    params :Optional [dict ]=None ,signed :bool =False )->Any :
-        params =dict (params or {})
-        headers ={"User-Agent":"BOTSHORT/2.0"}
-        if signed :
-            if not API_KEY or not API_SECRET :
-                raise RuntimeError ("Faltan BINANCE_API_KEY / BINANCE_API_SECRET")
-            params ["timestamp"]=int (time .time ()*1000 )
-            params ["recvWindow"]=5000 
-            query =urlencode (params ,doseq =True )
-            signature =hmac .new (API_SECRET .encode (),query .encode (),hashlib .sha256 ).hexdigest ()
-            params ["signature"]=signature 
-            headers ["X-MBX-APIKEY"]=API_KEY 
-        elif API_KEY :
-            headers ["X-MBX-APIKEY"]=API_KEY 
-
-        query =urlencode (params ,doseq =True )
-        url =f"{base_url }{path }"+(f"?{query }"if query else "")
-        req =urllib .request .Request (url ,headers =headers ,method =method .upper ())
-        try :
-            with urllib .request .urlopen (req ,timeout =15 )as resp :
-                return json .loads (resp .read ().decode ("utf-8"))
-        except urllib .error .HTTPError as exc :
-            body =exc .read ().decode ("utf-8",errors ="replace")
-            raise RuntimeError (f"Binance HTTP {exc .code }: {body [:300 ]}")from exc 
-
-    async def load_exchange_info (self )->None :
-        data =await self .request ("GET","/fapi/v1/exchangeInfo")
-        filters :Dict [str ,Dict [str ,float ]]={}
-        for sym in data .get ("symbols",[]):
-            if sym .get ("quoteAsset")!=QUOTE_ASSET :continue 
-            if sym .get ("contractType")!="PERPETUAL":continue 
-            if sym .get ("status")!="TRADING":continue 
-            row ={"stepSize":0.001 ,"minQty":0.0 ,"minNotional":5.0 }
-            for f in sym .get ("filters",[]):
-                if f .get ("filterType")=="LOT_SIZE":
-                    row ["stepSize"]=float (f .get ("stepSize",row ["stepSize"]))
-                    row ["minQty"]=float (f .get ("minQty",row ["minQty"]))
-                if f .get ("filterType")=="MIN_NOTIONAL":
-                    row ["minNotional"]=float (f .get ("notional",row ["minNotional"]))
-            filters [sym ["symbol"]]=row 
-        self .exchange_filters =filters 
-
-    def normalize_qty (self ,symbol :str ,qty :float )->float :
-        info =self .exchange_filters .get (symbol ,{"stepSize":0.001 ,"minQty":0.0 })
-        step =info ["stepSize"]
-        norm =floor (qty /step )*step 
-        decs =max (0 ,len (f"{step :.12f}".rstrip ("0").split (".")[-1 ]))
-        norm =round (norm ,decs )
-        return norm if norm >=info .get ("minQty",0.0 )else 0.0 
-
-    async def set_leverage (self ,symbol :str )->None :
-        if LEVERAGE >0 and LIVE_TRADING and not PAPER_MODE :
-            await self .request (
-            "POST","/fapi/v1/leverage",
-            {"symbol":symbol ,"leverage":LEVERAGE },signed =True 
+    def send_signal_sync(self, payload: dict) -> None:
+        """Envía una señal al Executor. No lanza excepción: solo registra el error."""
+        if not self.config.executor_url:
+            return
+        try:
+            req = self._build_signal_request(payload)
+            with urllib.request.urlopen(req, timeout=self.config.timeout_signal) as resp:
+                resp.read()
+                self._log(
+                    f"[executor] ✓ señal enviada: {payload.get('action')} {payload.get('symbol')}"
+                )
+        except Exception as exc:
+            self._log(
+                f"[executor] error enviando {payload.get('action')} "
+                f"{payload.get('symbol')}: {exc}"
             )
 
-    async def market_long (self ,symbol :str ,notional :float ,price :float )->float :
-        min_notional =self .exchange_filters .get (symbol ,{}).get ("minNotional",5.0 )
-        effective =max (notional ,min_notional )
-        qty =self .normalize_qty (symbol ,effective /price )
-        if qty <=0 :
-            raise RuntimeError (f"Qty inválida {symbol }: notional={effective } price={price }")
-        if PAPER_MODE or not LIVE_TRADING :
-            return qty 
-        await self .set_leverage (symbol )
-        await self .request ("POST","/fapi/v1/order",
-        {"symbol":symbol ,"side":"BUY","type":"MARKET","quantity":qty },
-        signed =True )
-        return qty 
+    async def send_signal_async(self, payload: dict) -> None:
+        """Versión no bloqueante para usar desde el event loop."""
+        await asyncio.to_thread(self.send_signal_sync, payload)
 
-    async def close_long (self ,symbol :str ,qty :float )->None :
-        qty =self .normalize_qty (symbol ,qty )
-        if qty <=0 or PAPER_MODE or not LIVE_TRADING :
-            return 
-        await self .request ("POST","/fapi/v1/order",
-        {"symbol":symbol ,"side":"SELL","type":"MARKET",
-        "quantity":qty ,"reduceOnly":"true"},
-        signed =True )
+    def fetch_state_sync(self) -> Optional[dict]:
+        """Lee /api/state del Executor."""
+        if not self.config.executor_url:
+            return None
+        try:
+            req = urllib.request.Request(
+                f"{self.config.executor_url}/api/state", method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=self.config.timeout_state) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def notify_open(
+        self,
+        trade_id: int,
+        symbol: str,
+        direction: str,
+        price: float,
+        quantity: float,
+        notional: float = 0.0,
+        level: float = 0.0,
+    ) -> None:
+        """Notifica apertura de posición al Executor sin bloquear el loop."""
+        payload = {
+            "action":    "open",
+            "trade_id":  trade_id,
+            "symbol":    symbol,
+            "direction": direction,
+            "price":     price,
+            "quantity":  quantity,
+            "notional":  notional,
+            "level":     level,
+        }
+        self.notify_async(payload)
+
+    def notify_close(
+        self,
+        trade_id: int,
+        symbol: str,
+        direction: str,
+        reason: str,
+        close_price: float,
+        pnl: float = 0.0,
+    ) -> None:
+        """Notifica cierre de posición al Executor sin bloquear el loop."""
+        payload = {
+            "action":      "close",
+            "trade_id":    trade_id,
+            "symbol":      symbol,
+            "direction":   direction,
+            "reason":      reason,
+            "close_price": close_price,
+            "pnl":         pnl,
+        }
+        self.notify_async(payload)
+
+    def notify_async(self, payload: dict) -> None:
+        """Dispara el envío sin bloquear el event loop."""
+        if not self.config.executor_url:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            threading.Thread(
+                target=self.send_signal_sync,
+                args=(payload,),
+                daemon=True,
+            ).start()
+            return
+        loop.create_task(self.send_signal_async(payload))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN
+# ─────────────────────────────────────────────────────────────────────────────
+
+BASE_URL      = os.getenv("BASE_URL",    "https://fapi.binance.com")
+QUOTE_ASSET   = os.getenv("QUOTE_ASSET", "USDT")
+PAPER_MODE    = os.getenv("PAPER_MODE",   "true").lower() == "true"
+LIVE_TRADING  = os.getenv("LIVE_TRADING", "false").lower() == "true"
+API_KEY       = os.getenv("BINANCE_API_KEY",    "")
+API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
+LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
+STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botlong_state.json"))
+# ── Gestión de símbolos ───────────────────────────────────────────────────────
+INITIAL_SYMBOLS = [ s.strip() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip() ]
+# ── Gestión de símbolos ───────────────────────────────────────────────────────
+# Lista completa de símbolos: REST inicial + caché en disco + refresh cada 12 h
+SYMBOLS_CACHE_FILE   = os.getenv(
+    "SYMBOLS_CACHE_FILE",
+    os.path.join(tempfile.gettempdir(), "futures_symbols_cache.json")
+)
+SYMBOL_REFRESH_HOURS = int(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
+
+# ── Ciclo de filtrado ─────────────────────────────────────────────────────────
+# Cada FILTER_CYCLE_SECS: suscribir todos → esperar ticker → filtrar → desuscribir resto
+FILTER_CYCLE_SECS        = int(os.getenv("FILTER_CYCLE_SECS",        "300"))  # 5 min
+MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "20"))  # >=15% para quedar suscrito
+FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # (legacy) espera ticker sub ALL
+
+# En vez de suscribir todos al mismo tiempo, se crean WS temporales por lote
+FILTER_BATCH_SIZE      = int(os.getenv("FILTER_BATCH_SIZE",      "527"))   # símbolos por lote
+FILTER_BATCH_WAIT_SECS = int(os.getenv("FILTER_BATCH_WAIT_SECS", "10"))   # segundos de espera por lote
+FILTER_BATCH_PAUSE     = float(os.getenv("FILTER_BATCH_PAUSE",   "1.5"))  # pausa entre lotes (segundos)
+
+# ── Actualización en tiempo real del ranking (entre ciclos de filtrado) ───────
+WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "5.0"))
+
+# ── Resto de parámetros operativos ────────────────────────────────────────────
+SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "2"))
+MIN_GAIN_TO_SHOW     = float(os.getenv("MIN_GAIN_TO_SHOW",   "0"))
+COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
+
+# Tiempo de gracia al detener un cache WS antes de arrancar el nuevo (segundos)
+WS_STOP_GRACE        = float(os.getenv("WS_STOP_GRACE", "0.8"))
+
+# Precio máximo permitido para abrir nuevas entradas (bloqueo permanente si supera)
+MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
+
+ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150,200,250").split(",")]
+ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
+TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
+
+# Stop loss por defecto: en vez de un valor fijo en USD, se calcula como una
+# fracción del notional ACTUAL de cada posición (se reactualiza automáticamente
+# cada vez que se añade un nuevo fill / nivel a la posición). Si el usuario lo
+# sobreescribe manualmente desde el dashboard (POST /api/set-sl/<symbol>), deja
+# de autoactualizarse para esa posición concreta.
+DEFAULT_STOP_LOSS_FRACTION = float(os.getenv("DEFAULT_STOP_LOSS_FRACTION", "0.99"))  # 20% del notional
+# Valor de respaldo (legacy) usado solo si por algún motivo no hay notional aún.
+DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
+
+# Cierre global por PnL no realizado acumulado (USD). Si la suma del PnL no
+# realizado de TODAS las posiciones abiertas alcanza/supera este valor, el bot
+# cierra todas las posiciones automáticamente. Configurable en caliente desde
+# el dashboard web (POST /api/set-global-close); el valor de aquí es solo el
+# valor inicial por defecto.
+DEFAULT_GLOBAL_CLOSE_PNL_USD = float(os.getenv("GLOBAL_CLOSE_PNL_USD", "40.0"))
+
+# ── Executor externo ──────────────────────────────────────────────────────────
+EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executorlong.onrender.com/")
+EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MODELOS DE DATOS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Fill:
+    level:       float
+    notional:    float
+    entry_price: float
+    qty:         float
+    opened_at:   float = field(default_factory=time.time)
 
 
-def _executor_send_signal_sync (payload :dict )->None :
-    """Envía una señal (open/close) al Executor. Falla en silencio (solo log)
-    si el Executor no está configurado o no responde — nunca debe tumbar
-    el bot principal."""
-    if not EXECUTOR_URL :
-        return 
-    try :
-        body =json .dumps (payload ).encode ("utf-8")
-        req =urllib .request .Request (
-        f"{EXECUTOR_URL }/signal",
-        data =body ,
-        headers ={
-        "Content-Type":"application/json",
-        "X-Signal-Secret":EXECUTOR_SIGNAL_SECRET ,
-        },
-        method ="POST",
+@dataclass
+class BotPosition:
+    symbol:       str
+    fills:        List[Fill] = field(default_factory=list)
+    realized_pnl: float = 0.0
+    status:       str   = "OPEN"
+    trade_id:     int   = 0
+    # Stop loss configurable en USD (pérdida absoluta, valor negativo).
+    # Por defecto se calcula como -(notional * DEFAULT_STOP_LOSS_FRACTION) y se
+    # reactualiza automáticamente cada vez que crece el notional (nuevo nivel),
+    # salvo que el usuario lo haya fijado manualmente desde el dashboard
+    # (sl_manual=True), en cuyo caso deja de autoactualizarse.
+    sl_usd:       float = DEFAULT_STOP_LOSS_USD
+    sl_manual:    bool  = False
+
+    @property
+    def qty(self) -> float:
+        return sum(f.qty for f in self.fills)
+
+    @property
+    def notional(self) -> float:
+        return sum(f.notional for f in self.fills)
+
+    @property
+    def avg_entry(self) -> float:
+        if self.qty <= 0:
+            return 0.0
+        return sum(f.entry_price * f.qty for f in self.fills) / self.qty
+
+    def unrealized_pnl(self, mark_price: float) -> float:
+        # LONG: se gana cuando el precio sube por encima del precio de entrada.
+        if mark_price <= 0:
+            return 0.0
+        return sum((mark_price - f.entry_price) * f.qty for f in self.fills)
+
+    def refresh_default_sl(self) -> None:
+        """Recalcula sl_usd en función del notional actual, solo si no fue
+        fijado manualmente por el usuario desde el dashboard."""
+        if self.sl_manual:
+            return
+        notional = self.notional
+        if notional > 0:
+            self.sl_usd = -(notional * DEFAULT_STOP_LOSS_FRACTION)
+
+    def opened_levels(self) -> set:
+        return {f.level for f in self.fills}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLIENTE BINANCE FUTURES
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BinanceFuturesClient:
+    def __init__(self) -> None:
+        self.exchange_filters: Dict[str, Dict[str, float]] = {}
+
+    async def start(self) -> None:
+        await self.load_exchange_info()
+
+    async def request(self, method: str, path: str,
+                      params: Optional[dict] = None, signed: bool = False,
+                      timeout: int = 15) -> Any:
+        return await asyncio.to_thread(
+            self._sync_request, BASE_URL, method, path, params, signed, timeout
         )
-        with urllib .request .urlopen (req ,timeout =8 )as resp :
-            resp .read ()
-    except Exception as exc :
-        print (
-        f"[executor-signal] error enviando {payload .get ('action')} "
-        f"{payload .get ('symbol')}: {exc }",
-        flush =True ,
+
+    def _sync_request(self, base_url: str, method: str, path: str,
+                      params: Optional[dict] = None, signed: bool = False,
+                      timeout: int = 15) -> Any:
+        params  = dict(params or {})
+        headers = {"User-Agent": "BOTLONG/2.0"}
+        if signed:
+            if not API_KEY or not API_SECRET:
+                raise RuntimeError("Faltan BINANCE_API_KEY / BINANCE_API_SECRET")
+            params["timestamp"]  = int(time.time() * 1000)
+            params["recvWindow"] = 5000
+            query     = urlencode(params, doseq=True)
+            signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+            params["signature"] = signature
+            headers["X-MBX-APIKEY"] = API_KEY
+        elif API_KEY:
+            headers["X-MBX-APIKEY"] = API_KEY
+
+        query = urlencode(params, doseq=True)
+        url   = f"{base_url}{path}" + (f"?{query}" if query else "")
+        req   = urllib.request.Request(url, headers=headers, method=method.upper())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Binance HTTP {exc.code}: {body[:300]}") from exc
+
+    async def load_exchange_info(self) -> None:
+        data    = await self.request("GET", "/fapi/v1/exchangeInfo")
+        filters: Dict[str, Dict[str, float]] = {}
+        for sym in data.get("symbols", []):
+            if sym.get("quoteAsset")    != QUOTE_ASSET:  continue
+            if sym.get("contractType")  != "PERPETUAL":  continue
+            if sym.get("status")        != "TRADING":    continue
+            row = {"stepSize": 0.001, "minQty": 0.0, "minNotional": 5.0}
+            for f in sym.get("filters", []):
+                if f.get("filterType") == "LOT_SIZE":
+                    row["stepSize"] = float(f.get("stepSize", row["stepSize"]))
+                    row["minQty"]   = float(f.get("minQty",   row["minQty"]))
+                if f.get("filterType") == "MIN_NOTIONAL":
+                    row["minNotional"] = float(f.get("notional", row["minNotional"]))
+            filters[sym["symbol"]] = row
+        self.exchange_filters = filters
+
+    def normalize_qty(self, symbol: str, qty: float) -> float:
+        info = self.exchange_filters.get(symbol, {"stepSize": 0.001, "minQty": 0.0})
+        step = info["stepSize"]
+        norm = floor(qty / step) * step
+        decs = max(0, len(f"{step:.12f}".rstrip("0").split(".")[-1]))
+        norm = round(norm, decs)
+        return norm if norm >= info.get("minQty", 0.0) else 0.0
+
+    async def set_leverage(self, symbol: str) -> None:
+        if LEVERAGE > 0 and LIVE_TRADING and not PAPER_MODE:
+            await self.request(
+                "POST", "/fapi/v1/leverage",
+                {"symbol": symbol, "leverage": LEVERAGE}, signed=True
+            )
+
+    async def market_long(self, symbol: str, notional: float, price: float) -> float:
+        min_notional = self.exchange_filters.get(symbol, {}).get("minNotional", 5.0)
+        effective    = max(notional, min_notional)
+        qty          = self.normalize_qty(symbol, effective / price)
+        if qty <= 0:
+            raise RuntimeError(f"Qty inválida {symbol}: notional={effective} price={price}")
+        if PAPER_MODE or not LIVE_TRADING:
+            return qty
+        await self.set_leverage(symbol)
+        await self.request("POST", "/fapi/v1/order",
+            {"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": qty},
+            signed=True)
+        return qty
+
+    async def close_long(self, symbol: str, qty: float) -> None:
+        qty = self.normalize_qty(symbol, qty)
+        if qty <= 0 or PAPER_MODE or not LIVE_TRADING:
+            return
+        # Timeout 10 s: debe completarse antes del timeout de Flask (30 s)
+        await self.request("POST", "/fapi/v1/order",
+            {"symbol": symbol, "side": "SELL", "type": "MARKET",
+             "quantity": qty, "reduceOnly": "true"},
+            signed=True, timeout=10)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOT PRINCIPAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TradingBot:
+    def __init__(self) -> None:
+        self.client   = BinanceFuturesClient()
+        self.positions: Dict[str, BotPosition] = {}
+        self.winners:   List[dict] = []
+        self.closed_trades: List[dict] = []
+        self.events:        List[str]  = []
+        self.lock = threading.Lock()
+        self._trade_id_lock = threading.Lock()
+
+        # Cooldown: symbol → timestamp hasta el que está bloqueado
+        self.symbol_cooldown: Dict[str, float] = {}
+
+        # Bloqueo permanente por precio
+        self.price_blocked: set = set()
+
+        # ── Lista completa de símbolos (cargada en init, refresh c/12h) ──
+        self.all_symbols:              List[str] = []
+        self.last_symbols_refresh_at:  float     = 0.0
+
+        # ── WS caches ─────────────────────────────────────────────────────
+        self.price_cache:        Optional[SymbolWebSocketPriceCache] = None
+        self.kline_cache:        Optional[KlineWebSocketCache]       = None
+        self.subscribed_symbols: List[str] = []
+
+        # ── Métricas ──────────────────────────────────────────────────────
+        self.running              = False
+        self.scan_count           = 0
+        self.last_scan_at         = 0.0
+        self.filter_cycle_count   = 0           # cuántos ciclos de filtrado se han ejecutado
+        self.last_filter_cycle_at = 0.0         # timestamp del último ciclo de filtrado
+        self.last_ws_ticker_at    = 0.0         # timestamp de última actualización WS ranking
+        self.ws_ticker_update_count = 0
+        self.last_error           = ""
+        self.last_startup_err     = ""
+        self.exchange_symbols     = 0
+        self.started_at           = time.time()
+        self._sse_snapshot: str   = "{}"
+
+        self.loop:   Optional[asyncio.AbstractEventLoop] = None
+        self.thread: Optional[threading.Thread] = None
+
+        # ── Persistencia asíncrona ────────────────────────────────────────
+        self._persist_event: Optional[asyncio.Event] = None
+        self._persist_debounce_secs: float = 0.35
+
+        # ── Guardia anti doble cierre ─────────────────────────────────────
+        self._closing_symbols: set[str] = set()
+
+        # ── Executor bridge ───────────────────────────────────────────────
+        self._trade_id_seq: int = 0
+        self.executor = ExecutorBridge(
+            executor_url=EXECUTOR_URL,
+            signal_secret=EXECUTOR_SECRET,
         )
+        # total PnL realizado acumulado (suma de todos los cierres)
+        self.total_realized_pnl: float = 0.0
 
+        # ── Cierre global configurable ─────────────────────────────────────
+        # Si la suma del PnL no realizado de todas las posiciones abiertas
+        # alcanza este valor, se cierran TODAS las posiciones automáticamente.
+        # Configurable en caliente vía POST /api/set-global-close.
+        self.global_close_pnl: float = DEFAULT_GLOBAL_CLOSE_PNL_USD
+        self._global_closing: bool = False
 
-def _executor_fetch_state_sync ()->Optional [dict ]:
-    """Lee /api/state del Executor (balance, PnL realizado real, etc.)."""
-    if not EXECUTOR_URL :
-        return None 
-    try :
-        req =urllib .request .Request (f"{EXECUTOR_URL }/api/state",method ="GET")
-        with urllib .request .urlopen (req ,timeout =8 )as resp :
-            return json .loads (resp .read ().decode ("utf-8"))
-    except Exception :
-        return None 
+    # ── Logging ───────────────────────────────────────────────────────────────
 
+    def log(self, msg: str) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        line  = f"{stamp} | {msg}"
+        print(line, flush=True)
+        with self.lock:
+            self.events = [line, *self.events[:99]]
 
+    # ── Start / Stop ──────────────────────────────────────────────────────────
 
-
-
-
-class TradingBot :
-    def __init__ (self )->None :
-        self .client =BinanceFuturesClient ()
-        self .positions :Dict [str ,BotPosition ]={}
-        self .winners :List [dict ]=[]
-        self .closed_trades :List [dict ]=[]
-        self .events :List [str ]=[]
-        # RLock evita deadlocks si un método con lock llama a self.log() o a otro método que también usa el mismo lock.
-        self .lock =threading .RLock ()
-
-
-        self .symbol_cooldown :Dict [str ,float ]={}
-
-
-        self .price_blocked :set =set ()
-
-
-        self .change_blocked :set =set ()
-
-
-        self .total_realized_pnl :float =0.0 
-
-
-        self ._trade_id_seq :int =0 
-
-
-        self .executor_state :Dict [str ,Any ]={}
-
-
-        self .all_symbols :List [str ]=[]
-        self .last_symbols_refresh_at :float =0.0 
-
-
-        self .price_cache :Optional [SymbolWebSocketPriceCache ]=None 
-        self .kline_cache :Optional [KlineWebSocketCache ]=None 
-        self .subscribed_symbols :List [str ]=[]
-
-
-        self .running =False 
-        self .scan_count =0 
-        self .last_scan_at =0.0 
-        self .filter_cycle_count =0 
-        self .last_filter_cycle_at =0.0 
-        self .last_ws_ticker_at =0.0 
-        self .ws_ticker_update_count =0 
-        self .last_error =""
-        self .last_startup_err =""
-        self .exchange_symbols =0 
-        self .started_at =time .time ()
-        self ._sse_snapshot :str ="{}"
-
-        self .loop :Optional [asyncio .AbstractEventLoop ]=None 
-        self .thread :Optional [threading .Thread ]=None 
-
-
-
-    def log (self ,msg :str )->None :
-        stamp =datetime .now (timezone .utc ).strftime ("%Y-%m-%d %H:%M:%S UTC")
-        line =f"{stamp } | {msg }"
-        print (line ,flush =True )
-        with self .lock :
-            self .events =[line ,*self .events [:99 ]]
-
-
-
-    def start (self )->None :
-        if self .running :
-            return 
-        self .running =True 
-        self .thread =threading .Thread (
-        target =self ._run_loop ,daemon =True ,name ="BotLoop"
+    def start(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        self.thread  = threading.Thread(
+            target=self._run_loop, daemon=True, name="BotLoop"
         )
-        self .thread .start ()
+        self.thread.start()
 
-    def stop (self )->None :
-        self .log ("Deteniendo bot...")
-        self .running =False 
-        self ._stop_price_cache ()
-        self ._stop_kline_cache ()
+    def stop(self) -> None:
+        self.log("Deteniendo bot...")
+        self.running = False
+        self._stop_price_cache()
+        self._stop_kline_cache()
 
-    def _run_loop (self )->None :
-        self .loop =asyncio .new_event_loop ()
-        asyncio .set_event_loop (self .loop )
-        try :
-            self .loop .run_until_complete (self ._main ())
-        except Exception as exc :
-            self .running =False 
-            self .last_error =str (exc )
-            self .log (f"Bot detenido por error no controlado: {exc }")
+    def _run_loop(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self._persist_event = asyncio.Event()
+        try:
+            self.loop.run_until_complete(self._main())
+        except Exception as exc:
+            self.running    = False
+            self.last_error = str(exc)
+            self.log(f"Bot detenido por error no controlado: {exc}")
 
+    # ── Supervisor ────────────────────────────────────────────────────────────
 
-
-    async def _supervised (self ,coro_factory ,name :str ,restart_delay :float =2.0 ):
+    async def _supervised(self, coro_factory, name: str, restart_delay: float = 2.0):
         """Envuelve una corrutina con reinicio automático."""
-        while self .running :
-            try :
-                await coro_factory ()
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
-                self .log (f"[supervisor] {name }: CancelledError — relanzando en {restart_delay }s...")
-            except Exception as exc :
-                if not self .running :
-                    break 
-                self .last_error =str (exc )
-                self .log (f"[supervisor] {name }: excepción '{exc }' — relanzando en {restart_delay }s...")
-            else :
-                if not self .running :
-                    break 
-                self .log (f"[supervisor] {name }: retornó inesperadamente — relanzando en {restart_delay }s...")
+        while self.running:
+            try:
+                await coro_factory()
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+                self.log(f"[supervisor] {name}: CancelledError — relanzando en {restart_delay}s...")
+            except Exception as exc:
+                if not self.running:
+                    break
+                self.last_error = str(exc)
+                self.log(f"[supervisor] {name}: excepción '{exc}' — relanzando en {restart_delay}s...")
+            else:
+                if not self.running:
+                    break
+                self.log(f"[supervisor] {name}: retornó inesperadamente — relanzando en {restart_delay}s...")
 
-            try :
-                await asyncio .sleep (restart_delay )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
+            try:
+                await asyncio.sleep(restart_delay)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
 
+    # ── Main ──────────────────────────────────────────────────────────────────
 
+    def _next_trade_id(self) -> int:
+        """Genera un trade_id único e incremental sin reentrar en self.lock."""
+        with self._trade_id_lock:
+            self._trade_id_seq += 1
+            return self._trade_id_seq
 
-    async def _main (self )->None :
-        self .log ("Bot iniciado — modo "+(
-        "PAPER"if PAPER_MODE or not LIVE_TRADING else "REAL"
+    async def _main(self) -> None:
+        # Conectar el logger del executor al sistema de log del bot
+        self.executor.logger = self.log
+        if EXECUTOR_URL:
+            self.log(f"[executor] Bridge configurado → {EXECUTOR_URL}")
+        else:
+            self.log("[executor] EXECUTOR_URL no configurado — señales desactivadas")
+
+        self.log("Bot iniciado — modo " + (
+            "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL"
         ))
-        try :
-            await self .client .start ()
-            self .exchange_symbols =len (self .client .exchange_filters )
-            self .log (f"ExchangeInfo: {self .exchange_symbols } contratos USDT-M perpetuos")
-        except Exception as exc :
-            self .last_startup_err =str (exc )
-            self .log (f"ExchangeInfo falló ({exc }). Continúo con filtros mínimos.")
+        try:
+            await self.client.start()
+            self.exchange_symbols = len(self.client.exchange_filters)
+            self.log(f"ExchangeInfo: {self.exchange_symbols} contratos USDT-M perpetuos")
+        except Exception as exc:
+            self.last_startup_err = str(exc)
+            self.log(f"ExchangeInfo falló ({exc}). Continúo con filtros mínimos.")
 
+        # Cargar lista completa de símbolos (caché en disco o REST)
+        await self._init_all_symbols()
 
-        await self ._init_all_symbols ()
+        tasks = [
+            asyncio.create_task(self._supervised(self._all_symbols_refresh_loop,  "_all_symbols_refresh_loop")),
+            asyncio.create_task(self._supervised(self._filter_cycle_loop,          "_filter_cycle_loop")),
+            asyncio.create_task(self._supervised(self._ws_ticker_update_loop,      "_ws_ticker_update_loop")),
+            asyncio.create_task(self._supervised(self._scanner,                    "_scanner")),
+            asyncio.create_task(self._supervised(self._realtime_price_loop,        "_realtime_price_loop")),
+            asyncio.create_task(self._supervised(self._snapshot_loop,              "_snapshot_loop")),
+            asyncio.create_task(self._supervised(self._persist_state_loop,         "_persist_state_loop")),
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        await asyncio .gather (
-        self ._supervised (self ._all_symbols_refresh_loop ,"_all_symbols_refresh_loop"),
-        self ._supervised (self ._filter_cycle_loop ,"_filter_cycle_loop"),
-        self ._supervised (self ._ws_ticker_update_loop ,"_ws_ticker_update_loop"),
-        self ._supervised (self ._scanner ,"_scanner"),
-        self ._supervised (self ._realtime_price_loop ,"_realtime_price_loop"),
-        self ._supervised (self ._snapshot_loop ,"_snapshot_loop"),
-        self ._supervised (self ._executor_poll_loop ,"_executor_poll_loop"),
-        return_exceptions =True ,
-        )
+    # ── Gestión de WS caches ──────────────────────────────────────────────────
 
+    def _stop_price_cache(self) -> None:
+        if self.price_cache:
+            try:
+                self.price_cache.stop()
+            except Exception:
+                pass
+            time.sleep(WS_STOP_GRACE)
+            self.price_cache = None
 
+    def _stop_kline_cache(self) -> None:
+        if self.kline_cache:
+            try:
+                self.kline_cache.stop()
+            except Exception:
+                pass
+            time.sleep(WS_STOP_GRACE)
+            self.kline_cache = None
 
-    def _stop_price_cache (self )->None :
-        if self .price_cache :
-            try :
-                self .price_cache .stop ()
-            except Exception :
-                pass 
-            time .sleep (WS_STOP_GRACE )
-            self .price_cache =None 
-
-    def _stop_kline_cache (self )->None :
-        if self .kline_cache :
-            try :
-                self .kline_cache .stop ()
-            except Exception :
-                pass 
-            time .sleep (WS_STOP_GRACE )
-            self .kline_cache =None 
-
-    def _open_position_symbols (self )->List [str ]:
-        with self .lock :
+    def _open_position_symbols(self) -> List[str]:
+        with self.lock:
             return [
-            sym for sym ,pos in self .positions .items ()
-            if pos .status =="OPEN"and pos .fills 
+                sym for sym, pos in self.positions.items()
+                if pos.status == "OPEN" and pos.fills
             ]
 
-    def _start_price_cache (self ,symbols :List [str ])->None :
-        self ._stop_price_cache ()
-        if not symbols :
-            return 
-        self .price_cache =SymbolWebSocketPriceCache (
-        symbols ,
-        symbols_per_connection =30 ,
+    def _start_price_cache(self, symbols: List[str]) -> None:
+        self._stop_price_cache()
+        if not symbols:
+            return
+        self.price_cache = SymbolWebSocketPriceCache(
+            symbols,
+            symbols_per_connection=30,
         )
-        self .price_cache .start ()
-        self .log (f"PriceCache iniciado con {len (symbols )} símbolos (markPrice + @ticker)")
+        self.price_cache.start()
+        self.log(f"PriceCache iniciado con {len(symbols)} símbolos (markPrice + @ticker)")
 
-    def _start_kline_cache (self ,symbols :List [str ])->None :
-        self ._stop_kline_cache ()
-        if not symbols :
-            return 
-        pairs ={sym :["1m"]for sym in symbols }
-        self .kline_cache =KlineWebSocketCache (
-        pairs =pairs ,
-        max_candles =1 ,
-        include_open_candle =True ,
-        backfill_on_start =False ,
-        streams_per_connection =30 ,
-        rest_concurrency =5 ,
-        rest_retries =3 ,
-        backfill_batch_size =3 ,
-        backfill_batch_delay =0.25 ,
-        safety_refresh_interval_seconds =1500 ,
+    def _start_kline_cache(self, symbols: List[str]) -> None:
+        self._stop_kline_cache()
+        if not symbols:
+            return
+        pairs = {sym: ["1m"] for sym in symbols}
+        self.kline_cache = KlineWebSocketCache(
+            pairs                           = pairs,
+            max_candles                     = 1,
+            include_open_candle             = True,
+            backfill_on_start               = False,
+            streams_per_connection          = 30,
+            rest_concurrency                = 5,
+            rest_retries                    = 3,
+            backfill_batch_size             = 3,
+            backfill_batch_delay            = 0.25,
+            safety_refresh_interval_seconds = 1500,
         )
-        self .kline_cache .start ()
-        self .log (f"KlineCache iniciado con {len (symbols )} símbolos (1m)")
+        self.kline_cache.start()
+        self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
 
+    # ── Caché de símbolos en disco ─────────────────────────────────────────────
 
-
-    def _load_symbols_from_cache (self )->List [str ]:
+    def _load_symbols_from_cache(self) -> List[str]:
         """Lee la lista de símbolos desde el archivo de caché en disco."""
-        try :
-            if not os .path .exists (SYMBOLS_CACHE_FILE ):
+        try:
+            if not os.path.exists(SYMBOLS_CACHE_FILE):
                 return []
-            with open (SYMBOLS_CACHE_FILE ,"r",encoding ="utf-8")as fh :
-                data =json .load (fh )
-            symbols =data .get ("symbols",[])
-            saved_at =data .get ("saved_at",0 )
-            age_hours =(time .time ()-saved_at )/3600 
-            if symbols :
-                self .log (
-                f"Caché de símbolos cargado: {len (symbols )} símbolos "
-                f"(guardado hace {age_hours :.1f} h)"
+            with open(SYMBOLS_CACHE_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            symbols   = data.get("symbols", [])
+            saved_at  = data.get("saved_at", 0)
+            age_hours = (time.time() - saved_at) / 3600
+            if symbols:
+                self.log(
+                    f"Caché de símbolos cargado: {len(symbols)} símbolos "
+                    f"(guardado hace {age_hours:.1f} h)"
                 )
-            return symbols if isinstance (symbols ,list )else []
-        except Exception as exc :
-            self .log (f"No pude leer caché de símbolos: {exc }")
+            return symbols if isinstance(symbols, list) else []
+        except Exception as exc:
+            self.log(f"No pude leer caché de símbolos: {exc}")
             return []
 
-    def _save_symbols_to_cache (self ,symbols :List [str ])->None :
+    def _save_symbols_to_cache(self, symbols: List[str]) -> None:
         """Guarda la lista de símbolos en disco para recuperación ante bloqueos."""
-        tmp =f"{SYMBOLS_CACHE_FILE }.tmp"
-        try :
-            with open (tmp ,"w",encoding ="utf-8")as fh :
-                json .dump ({"symbols":symbols ,"saved_at":time .time ()},fh )
-            os .replace (tmp ,SYMBOLS_CACHE_FILE )
-            self .log (f"Caché de símbolos guardado: {len (symbols )} símbolos → {SYMBOLS_CACHE_FILE }")
-        except Exception as exc :
-            self .log (f"No pude guardar caché de símbolos: {exc }")
+        tmp = f"{SYMBOLS_CACHE_FILE}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"symbols": symbols, "saved_at": time.time()}, fh)
+            os.replace(tmp, SYMBOLS_CACHE_FILE)
+            self.log(f"Caché de símbolos guardado: {len(symbols)} símbolos → {SYMBOLS_CACHE_FILE}")
+        except Exception as exc:
+            self.log(f"No pude guardar caché de símbolos: {exc}")
 
+    # ── REST: obtención de todos los símbolos ─────────────────────────────────
 
-
-    async def _refresh_all_symbols (self )->bool :
+    async def _refresh_all_symbols(self) -> bool:
         """
         Obtiene todos los símbolos USDT-M perpetuos vía REST (exchangeInfo).
         Guarda el resultado en SYMBOLS_CACHE_FILE como respaldo.
         Devuelve True si tuvo éxito.
         """
-        try :
-            self .log ("REST: obteniendo lista completa de símbolos de futuros USDT-M...")
-            data =await self .client .request ("GET","/fapi/v1/exchangeInfo")
-            filters =self .client .exchange_filters 
+        try:
+            self.log("REST: obteniendo lista completa de símbolos de futuros USDT-M...")
+            data    = await self.client.request("GET", "/fapi/v1/exchangeInfo")
+            filters = self.client.exchange_filters
 
-            symbols :List [str ]=[]
-            for sym_info in data .get ("symbols",[]):
-                if sym_info .get ("quoteAsset")!=QUOTE_ASSET :continue 
-                if sym_info .get ("contractType")!="PERPETUAL":continue 
-                if sym_info .get ("status")!="TRADING":continue 
-                s =sym_info ["symbol"]
+            symbols: List[str] = []
+            for sym_info in data.get("symbols", []):
+                if sym_info.get("quoteAsset")   != QUOTE_ASSET:  continue
+                if sym_info.get("contractType") != "PERPETUAL":  continue
+                if sym_info.get("status")       != "TRADING":    continue
+                s = sym_info["symbol"]
+                # Si exchange_filters ya está cargado, usarlo como filtro extra
+                if filters and s not in filters:
+                    continue
+                symbols.append(s)
 
-                if filters and s not in filters :
-                    continue 
-                symbols .append (s )
+            if not symbols:
+                self.log("REST: respuesta vacía al obtener símbolos")
+                return False
 
-            if not symbols :
-                self .log ("REST: respuesta vacía al obtener símbolos")
-                return False 
+            self.all_symbols             = symbols
+            self.last_symbols_refresh_at = time.time()
+            self._save_symbols_to_cache(symbols)
+            self.log(f"REST: {len(symbols)} símbolos cargados y guardados en caché")
 
-            self .all_symbols =symbols 
-            self .last_symbols_refresh_at =time .time ()
-            self ._save_symbols_to_cache (symbols )
-            self .log (f"REST: {len (symbols )} símbolos cargados y guardados en caché")
+            if symbols:
+               with self.lock:
+                   self.price_blocked.clear()   # ← agregar esto al refrescar
+               self.log("price_blocked reseteado con el refresh de símbolos")
+             
+            return True
 
-            if symbols :
-               with self .lock :
-                   self .price_blocked .clear ()
-                   self .change_blocked .clear ()
-               self .log ("price_blocked y change_blocked reseteados con el refresh de símbolos")
-
-            return True 
-
-        except RuntimeError as exc :
-            msg =str (exc )
-            if "418"in msg :
-                self .log (
-                f"REST 418 (IP rate-limit Binance) al obtener símbolos — "
-                f"usando caché si está disponible"
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "418" in msg:
+                self.log(
+                    f"REST 418 (IP rate-limit Binance) al obtener símbolos — "
+                    f"usando caché si está disponible"
                 )
-                self .last_error ="HTTP 418 – rate-limit Binance REST al cargar símbolos"
-            else :
-                self .last_error =msg 
-                self .log (f"REST _refresh_all_symbols falló: {msg }")
-            return False 
-        except Exception as exc :
-            self .last_error =str (exc )
-            self .log (f"REST _refresh_all_symbols error: {exc }")
-            return False 
+                self.last_error = "HTTP 418 – rate-limit Binance REST al cargar símbolos"
+            else:
+                self.last_error = msg
+                self.log(f"REST _refresh_all_symbols falló: {msg}")
+            return False
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"REST _refresh_all_symbols error: {exc}")
+            return False
 
-    async def _init_all_symbols (self )->None :
+    async def _init_all_symbols(self) -> None:
         """
         Carga inicial de símbolos:
           1. Intenta leer desde caché en disco (rápido, sin REST).
           2. Si el caché está vacío o falla, hace REST a exchangeInfo.
           3. Si el REST también falla, usa exchange_filters como último recurso.
         """
+        # Intento 1: caché en disco
+        cached = self._load_symbols_from_cache()
+        if cached:
+            self.all_symbols             = cached
+            self.last_symbols_refresh_at = time.time()  # no forzar refresh inmediato
+            # Lanzar refresh en background para actualizar si el caché es viejo
+            asyncio.ensure_future(self._maybe_refresh_symbols_cache())
+            return
 
-        cached =self ._load_symbols_from_cache ()
-        if cached :
-            self .all_symbols =cached 
-            self .last_symbols_refresh_at =time .time ()
+        # Intento 2: REST
+        success = await self._refresh_all_symbols()
+        if success:
+            return
 
-            asyncio .ensure_future (self ._maybe_refresh_symbols_cache ())
-            return 
-
-
-        success =await self ._refresh_all_symbols ()
-        if success :
-            return 
-
-
-        if self .client .exchange_filters :
-            self .all_symbols =list (self .client .exchange_filters .keys ())
-            self .log (
-            f"Usando exchange_filters como fallback: {len (self .all_symbols )} símbolos"
+        # Intento 3: exchange_filters (cargados al inicio desde exchangeInfo)
+        if self.client.exchange_filters:
+            self.all_symbols = list(self.client.exchange_filters.keys())
+            self.log(
+                f"Usando exchange_filters como fallback: {len(self.all_symbols)} símbolos"
+            )
+            
+            return
+        
+        # Intento 4: lista inicial fija
+        if INITIAL_SYMBOLS:
+            self.all_symbols = INITIAL_SYMBOLS.copy()
+            self.last_symbols_refresh_at = time.time()
+            self.log(
+                f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
+            )
+            return
+        
+        else:
+            self.log(
+                "ADVERTENCIA: No hay símbolos disponibles. "
+                "El bot esperará hasta que se obtenga la lista."
             )
 
-            return 
-
-
-        if INITIAL_SYMBOLS :
-            self .all_symbols =INITIAL_SYMBOLS .copy ()
-            self .last_symbols_refresh_at =time .time ()
-            self .log (
-            f"Usando lista inicial fija: {len (self .all_symbols )} símbolos"
-            )
-            return 
-
-        else :
-            self .log (
-            "ADVERTENCIA: No hay símbolos disponibles. "
-            "El bot esperará hasta que se obtenga la lista."
+            self.all_symbols = INITIAL_SYMBOLS.copy()
+            self.last_symbols_refresh_at = time.time()
+            self.log(
+                f"Usando lista inicial fija: {len(self.all_symbols)} símbolos"
             )
 
-            self .all_symbols =INITIAL_SYMBOLS .copy ()
-            self .last_symbols_refresh_at =time .time ()
-            self .log (
-            f"Usando lista inicial fija: {len (self .all_symbols )} símbolos"
-            )
-
-    async def _maybe_refresh_symbols_cache (self )->None :
+    async def _maybe_refresh_symbols_cache(self) -> None:
         """Refresca el caché si tiene más de SYMBOL_REFRESH_HOURS horas."""
-        age =time .time ()-self .last_symbols_refresh_at 
-        if age >SYMBOL_REFRESH_HOURS *3600 :
-            await self ._refresh_all_symbols ()
+        age = time.time() - self.last_symbols_refresh_at
+        if age > SYMBOL_REFRESH_HOURS * 3600:
+            await self._refresh_all_symbols()
 
-    async def _all_symbols_refresh_loop (self )->None :
+    async def _all_symbols_refresh_loop(self) -> None:
         """Refresca la lista completa de símbolos cada SYMBOL_REFRESH_HOURS."""
-        while self .running :
-            await asyncio .sleep (SYMBOL_REFRESH_HOURS *3600 )
-            if not self .running :
-                break 
-            self .log (
-            f"Refresh de símbolos programado (cada {SYMBOL_REFRESH_HOURS } h)..."
+        while self.running:
+            await asyncio.sleep(SYMBOL_REFRESH_HOURS * 3600)
+            if not self.running:
+                break
+            self.log(
+                f"Refresh de símbolos programado (cada {SYMBOL_REFRESH_HOURS} h)..."
             )
-            await self ._refresh_all_symbols ()
+            await self._refresh_all_symbols()
 
+    # ── Ciclo de filtrado: núcleo de la nueva arquitectura ────────────────────
 
-
-    async def _filter_cycle_loop (self )->None :
+    async def _filter_cycle_loop(self) -> None:
         """
         Cada FILTER_CYCLE_SECS (5 min):
 
-          Suscribir los ~500 símbolos de golpe (pico de RAM),
+          En lugar de suscribir los ~500 símbolos de golpe (pico de RAM),
           los procesa en lotes de FILTER_BATCH_SIZE para mantener el uso
           de memoria bajo y constante durante todo el ciclo.
 
@@ -752,161 +819,160 @@ class TradingBot :
         Con FILTER_BATCH_SIZE=50 y 500 símbolos: 10 lotes × (10s + 1.5s) ≈ 2 min.
         Máximo activo simultáneo: 50 símbolos (~2 conexiones WS) en vez de 500 (~100).
         """
+        # Esperar hasta que all_symbols esté poblado
+        for _ in range(120):
+            if not self.running:
+                return
+            if self.all_symbols:
+                break
+            await asyncio.sleep(1.0)
 
-        for _ in range (120 ):
-            if not self .running :
-                return 
-            if self .all_symbols :
-                break 
-            await asyncio .sleep (1.0 )
+        if not self.all_symbols:
+            self.log("[filter_cycle] No hay símbolos disponibles. Abortando ciclo.")
+            return
 
-        if not self .all_symbols :
-            self .log ("[filter_cycle] No hay símbolos disponibles. Abortando ciclo.")
-            return 
+        while self.running:
+            open_syms       = set(self._open_position_symbols())
+            symbols_to_scan = list(dict.fromkeys([*self.all_symbols, *open_syms]))
+            n_total         = len(symbols_to_scan)
+            n_batches       = (n_total + FILTER_BATCH_SIZE - 1) // FILTER_BATCH_SIZE
 
-        while self .running :
-            open_syms =set (self ._open_position_symbols ())
-            symbols_to_scan =list (dict .fromkeys ([*self .all_symbols ,*open_syms ]))
-            n_total =len (symbols_to_scan )
-            n_batches =(n_total +FILTER_BATCH_SIZE -1 )//FILTER_BATCH_SIZE 
-
-            self .log (
-            f"[filter_cycle] Ciclo #{self .filter_cycle_count +1 }: "
-            f"{n_total } símbolos → {n_batches } lotes de {FILTER_BATCH_SIZE } "
-            f"({FILTER_BATCH_WAIT_SECS }s/lote | posiciones abiertas: {len (open_syms )})"
+            self.log(
+                f"[filter_cycle] Ciclo #{self.filter_cycle_count + 1}: "
+                f"{n_total} símbolos → {n_batches} lotes de {FILTER_BATCH_SIZE} "
+                f"({FILTER_BATCH_WAIT_SECS}s/lote | posiciones abiertas: {len(open_syms)})"
             )
 
+            # ── Fases 1-2-3: Recoger tickers lote por lote ───────────────
+            all_tickers_collected: Dict[str, dict] = {}
 
-            all_tickers_collected :Dict [str ,dict ]={}
-
-            batches =[
-            symbols_to_scan [i :i +FILTER_BATCH_SIZE ]
-            for i in range (0 ,n_total ,FILTER_BATCH_SIZE )
+            batches = [
+                symbols_to_scan[i : i + FILTER_BATCH_SIZE]
+                for i in range(0, n_total, FILTER_BATCH_SIZE)
             ]
 
-            for batch_idx ,batch in enumerate (batches ,1 ):
-                if not self .running :
-                    break 
+            for batch_idx, batch in enumerate(batches, 1):
+                if not self.running:
+                    break
 
-                self .log (
-                f"[filter_cycle]   Lote {batch_idx }/{n_batches }: "
-                f"{len (batch )} símbolos "
-                f"({batch [0 ]} … {batch [-1 ]})"
+                self.log(
+                    f"[filter_cycle]   Lote {batch_idx}/{n_batches}: "
+                    f"{len(batch)} símbolos "
+                    f"({batch[0]} … {batch[-1]})"
                 )
 
-
-                temp_cache =SymbolWebSocketPriceCache (
-                batch ,symbols_per_connection =10 
+                # WS temporal — completamente aislado de self.price_cache
+                temp_cache = SymbolWebSocketPriceCache(
+                    batch, symbols_per_connection=10
                 )
-                temp_cache .start ()
+                temp_cache.start()
 
+                # Esperar datos de @ticker
+                try:
+                    await asyncio.sleep(FILTER_BATCH_WAIT_SECS)
+                except asyncio.CancelledError:
+                    await asyncio.to_thread(temp_cache.stop)
+                    if not self.running:
+                        return
+                    raise
 
-                try :
-                    await asyncio .sleep (FILTER_BATCH_WAIT_SECS )
-                except asyncio .CancelledError :
-                    await asyncio .to_thread (temp_cache .stop )
-                    if not self .running :
-                        return 
-                    raise 
-
-
-                try :
-                    tickers =temp_cache .get_all_tickers ()
-                    all_tickers_collected .update (tickers )
-                except Exception as exc :
-                    self .log (
-                    f"[filter_cycle]   Error al leer tickers lote {batch_idx }: {exc }"
+                # Recoger tickers de este lote
+                try:
+                    tickers = temp_cache.get_all_tickers()
+                    all_tickers_collected.update(tickers)
+                except Exception as exc:
+                    self.log(
+                        f"[filter_cycle]   Error al leer tickers lote {batch_idx}: {exc}"
                     )
 
+                # Destruir WS temporal → libera conexiones y RAM inmediatamente
+                await asyncio.to_thread(temp_cache.stop)
 
-                await asyncio .to_thread (temp_cache .stop )
+                # Pausa entre lotes para no saturar el event loop ni Binance
+                if batch_idx < n_batches and self.running:
+                    try:
+                        await asyncio.sleep(FILTER_BATCH_PAUSE)
+                    except asyncio.CancelledError:
+                        if not self.running:
+                            return
+                        raise
 
+            if not self.running:
+                break
 
-                if batch_idx <n_batches and self .running :
-                    try :
-                        await asyncio .sleep (FILTER_BATCH_PAUSE )
-                    except asyncio .CancelledError :
-                        if not self .running :
-                            return 
-                        raise 
+            # ── Fase 4: Filtrar con los tickers acumulados ────────────────
+            open_syms        = set(self._open_position_symbols())  # refrescar
+            tickers_received = len(all_tickers_collected)
+            filtered_entries: List[dict] = []
 
-            if not self .running :
-                break 
+            for sym in symbols_to_scan:
+                ticker  = all_tickers_collected.get(sym)
+                in_open = sym in open_syms
 
+                change = 0.0
+                price  = 0.0
+                if ticker:
+                    change = ticker.get("change_pct", 0.0)
+                    price  = ticker.get("last_price",  0.0)
 
-            open_syms =set (self ._open_position_symbols ())
-            tickers_received =len (all_tickers_collected )
-            filtered_entries :List [dict ]=[]
-
-            for sym in symbols_to_scan :
-                ticker =all_tickers_collected .get (sym )
-                in_open =sym in open_syms 
-
-                change =0.0 
-                price =0.0 
-                if ticker :
-                    change =ticker .get ("change_pct",0.0 )
-                    price =ticker .get ("last_price",0.0 )
-
-
-                if change >=MIN_GAIN_FILTER or in_open :
-                    if price >0 or in_open :
-                        filtered_entries .append ({
-                        "symbol":sym ,
-                        "change":change ,
-                        "price":price ,
-                        "market":"futures",
-                        "can_long":True ,
-                        "can_short":False ,
+                # Criterio: cambio >= umbral O posición abierta
+                if change >= MIN_GAIN_FILTER or in_open:
+                    if price > 0 or in_open:  # evitar entradas sin precio real
+                        filtered_entries.append({
+                            "symbol":    sym,
+                            "change":    change,
+                            "price":     price,
+                            "market":    "futures",
+                            "can_short": True,
                         })
 
+            # Ordenar de mayor a menor cambio
+            filtered_entries.sort(key=lambda x: x["change"], reverse=True)
+            filtered_symbols = [e["symbol"] for e in filtered_entries]
 
-            filtered_entries .sort (key =lambda x :x ["change"],reverse =True )
-            filtered_symbols =[e ["symbol"]for e in filtered_entries ]
-
-            n_filtered =len (filtered_entries )
-            n_by_gain =sum (1 for e in filtered_entries if e ["change"]>=MIN_GAIN_FILTER )
-            n_by_pos =len (open_syms )
-            top_info =(
-            f"{filtered_entries [0 ]['symbol']} {filtered_entries [0 ]['change']:.1f}%"
-            if filtered_entries else "ninguno"
+            n_filtered = len(filtered_entries)
+            n_by_gain  = sum(1 for e in filtered_entries if e["change"] >= MIN_GAIN_FILTER)
+            n_by_pos   = len(open_syms)
+            top_info   = (
+                f"{filtered_entries[0]['symbol']} {filtered_entries[0]['change']:.1f}%"
+                if filtered_entries else "ninguno"
             )
 
-            self .log (
-            f"[filter_cycle] {tickers_received }/{n_total } tickers recibidos | "
-            f"{n_filtered } clasificados: "
-            f">={MIN_GAIN_FILTER :.0f}%={n_by_gain }, posiciones={n_by_pos } | "
-            f"top={top_info }"
+            self.log(
+                f"[filter_cycle] {tickers_received}/{n_total} tickers recibidos | "
+                f"{n_filtered} clasificados: "
+                f">={MIN_GAIN_FILTER:.0f}%={n_by_gain}, posiciones={n_by_pos} | "
+                f"top={top_info}"
             )
 
-
-
-            active_list =filtered_symbols if filtered_symbols else (
-            list (open_syms )or self .all_symbols [:10 ]
+            # ── Fase 5: Iniciar WS permanente solo con los filtrados ──────
+            # Si no hay ningún clasificado (mercado plano), mantener mínimo
+            active_list = filtered_symbols if filtered_symbols else (
+                list(open_syms) or self.all_symbols[:10]
             )
 
-            await asyncio .to_thread (self ._start_price_cache ,active_list )
-            await asyncio .to_thread (self ._start_kline_cache ,active_list )
+            await asyncio.to_thread(self._start_price_cache, active_list)
+            await asyncio.to_thread(self._start_kline_cache,  active_list)
 
+            # ── Fase 6: Actualizar winners y métricas ─────────────────────
+            with self.lock:
+                self.winners              = filtered_entries
+                self.subscribed_symbols   = list(active_list)
+                self.last_filter_cycle_at = time.time()
+                self.filter_cycle_count  += 1
 
-            with self .lock :
-                self .winners =filtered_entries 
-                self .subscribed_symbols =list (active_list )
-                self .last_filter_cycle_at =time .time ()
-                self .filter_cycle_count +=1 
+            self.persist_state()
 
-            self .persist_state ()
+            # ── Esperar siguiente ciclo ───────────────────────────────────
+            try:
+                await asyncio.sleep(FILTER_CYCLE_SECS)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
 
+    # ── WS Ticker: actualización en tiempo real del ranking entre ciclos ──────
 
-            try :
-                await asyncio .sleep (FILTER_CYCLE_SECS )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
-
-
-
-    async def _ws_ticker_update_loop (self )->None :
+    async def _ws_ticker_update_loop(self) -> None:
         """
         Mantiene self.winners actualizado entre ciclos de filtrado.
 
@@ -914,706 +980,915 @@ class TradingBot :
         price_cache (que solo cubre los símbolos actualmente suscritos)
         y actualiza el campo 'change' de cada winner.
         """
-        self .log (
-        f"[ws_ticker] Loop de ranking en tiempo real iniciado "
-        f"(intervalo={WS_TICKER_UPDATE_SECS :.0f}s)"
+        self.log(
+            f"[ws_ticker] Loop de ranking en tiempo real iniciado "
+            f"(intervalo={WS_TICKER_UPDATE_SECS:.0f}s)"
         )
 
+        # Esperar hasta que el WS tenga sus primeros datos
+        for _ in range(60):
+            if not self.running:
+                return
+            try:
+                if self.price_cache and self.price_cache.get_all_tickers():
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
 
-        for _ in range (60 ):
-            if not self .running :
-                return 
-            try :
-                if self .price_cache and self .price_cache .get_all_tickers ():
-                    break 
-            except Exception :
-                pass 
-            await asyncio .sleep (1.0 )
+        while self.running:
+            try:
+                if self.price_cache:
+                    all_tickers: Dict[str, dict] = {}
+                    try:
+                        all_tickers = self.price_cache.get_all_tickers()
+                    except Exception:
+                        pass
 
-        while self .running :
-            try :
-                if self .price_cache :
-                    all_tickers :Dict [str ,dict ]={}
-                    try :
-                        all_tickers =self .price_cache .get_all_tickers ()
-                    except Exception :
-                        pass 
+                    if all_tickers:
+                        ws_updated = 0
+                        with self.lock:
+                            new_winners: List[dict] = []
+                            for w in self.winners:
+                                sym    = w["symbol"]
+                                ticker = all_tickers.get(sym)
+                                if ticker:
+                                    new_w            = dict(w)
+                                    new_w["change"]  = ticker["change_pct"]
+                                    new_w["price"]   = ticker.get("last_price", w.get("price", 0.0))
+                                    new_winners.append(new_w)
+                                    ws_updated += 1
+                                else:
+                                    new_winners.append(dict(w))
 
-                    if all_tickers :
-                        ws_updated =0 
-                        with self .lock :
-                            new_winners :List [dict ]=[]
-                            for w in self .winners :
-                                sym =w ["symbol"]
-                                ticker =all_tickers .get (sym )
-                                if ticker :
-                                    new_w =dict (w )
-                                    new_w ["change"]=ticker ["change_pct"]
-                                    new_w ["price"]=ticker .get ("last_price",w .get ("price",0.0 ))
-                                    new_winners .append (new_w )
-                                    ws_updated +=1 
-                                else :
-                                    new_winners .append (dict (w ))
+                            if ws_updated:
+                                new_winners.sort(key=lambda x: x["change"], reverse=True)
+                                self.winners              = new_winners
+                                self.last_ws_ticker_at    = time.time()
+                                self.ws_ticker_update_count += 1
 
-                            if ws_updated :
-                                new_winners .sort (key =lambda x :x ["change"],reverse =True )
-                                self .winners =new_winners 
-                                self .last_ws_ticker_at =time .time ()
-                                self .ws_ticker_update_count +=1 
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"[ws_ticker] Error actualizando ranking: {exc}")
 
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
-            except Exception as exc :
-                self .last_error =str (exc )
-                self .log (f"[ws_ticker] Error actualizando ranking: {exc }")
+            try:
+                await asyncio.sleep(WS_TICKER_UPDATE_SECS)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
 
-            try :
-                await asyncio .sleep (WS_TICKER_UPDATE_SECS )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
+    # ── Condición kline ───────────────────────────────────────────────────────
 
-
-
-    def _kline_entry_ok (self ,symbol :str )->bool :
+    def _kline_entry_ok(self, symbol: str) -> bool:
         """True si la última vela 1m cerrada es alcista (o sin datos)."""
-        if not self .kline_cache :
-            return True 
-        try :
-            df =self .kline_cache .get_dataframe (symbol ,"1m",only_closed =True )
-            if df .empty or len (df )<2 :
-                return True 
-            last =df .iloc [-1 ]
-            return float (last ["close"])>=float (last ["open"])
-        except Exception :
-            return True 
+        if not self.kline_cache:
+            return True
+        try:
+            df = self.kline_cache.get_dataframe(symbol, "1m", only_closed=True)
+            if df.empty or len(df) < 2:
+                return True
+            last = df.iloc[-1]
+            return float(last["close"]) >= float(last["open"])
+        except Exception:
+            return True
 
+    # ── Cooldown helpers ──────────────────────────────────────────────────────
 
+    def _cooldown_remaining(self, symbol: str) -> float:
+        unblock_at = self.symbol_cooldown.get(symbol, 0.0)
+        return max(0.0, unblock_at - time.time())
 
-    def _cooldown_remaining (self ,symbol :str )->float :
-        unblock_at =self .symbol_cooldown .get (symbol ,0.0 )
-        return max (0.0 ,unblock_at -time .time ())
+    @staticmethod
+    def _fmt_cooldown(seconds: float) -> str:
+        s = int(seconds)
+        h = s // 3600
+        m = (s % 3600) // 60
+        r = s % 60
+        if h > 0:  return f"{h}h {m:02d}m"
+        if m > 0:  return f"{m}m {r:02d}s"
+        return f"{r}s"
 
-    @staticmethod 
-    def _fmt_cooldown (seconds :float )->str :
-        s =int (seconds )
-        h =s //3600 
-        m =(s %3600 )//60 
-        r =s %60 
-        if h >0 :return f"{h }h {m :02d}m"
-        if m >0 :return f"{m }m {r :02d}s"
-        return f"{r }s"
+    # ── Scanner ───────────────────────────────────────────────────────────────
 
-
-
-    async def _scanner (self )->None :
+    async def _scanner(self) -> None:
         """
         Bucle de entradas. Lee change desde self.winners (actualizado por
         _ws_ticker_update_loop vía WS @ticker en tiempo real).
         """
-        self .log ("Scanner: esperando datos de price_cache...")
-        for _ in range (120 ):
-            if not self .running :
-                return 
-            try :
-                if self .price_cache and len (self .price_cache .get_all_prices ())>0 :
-                    break 
-            except Exception :
-                pass 
-            await asyncio .sleep (1.0 )
-        self .log ("Scanner: price_cache con datos — iniciando escaneos")
+        self.log("Scanner: esperando datos de price_cache...")
+        for _ in range(120):
+            if not self.running:
+                return
+            try:
+                if self.price_cache and len(self.price_cache.get_all_prices()) > 0:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+        self.log("Scanner: price_cache con datos — iniciando escaneos")
 
-        while self .running :
-            try :
-                with self .lock :
-                    winners =[dict (w )for w in self .winners ]
+        while self.running:
+            try:
+                with self.lock:
+                    winners = [dict(w) for w in self.winners]
 
-                all_prices :Dict [str ,float ]={}
-                try :
-                    all_prices =self .price_cache .get_all_prices ()if self .price_cache else {}
-                except Exception :
-                    pass 
+                all_prices: Dict[str, float] = {}
+                try:
+                    all_prices = self.price_cache.get_all_prices() if self.price_cache else {}
+                except Exception:
+                    pass
 
-                for row in winners :
-                    if not row .get ("can_long",True ):
-                        continue 
+                for row in winners:
+                    if not row.get("can_short", True):
+                        continue
+                    symbol = row["symbol"]
+                    change = row["change"]
+                    price  = all_prices.get(symbol) or row.get("price", 0.0)
+                    if price <= 0:
+                        continue
 
-                    symbol =row ["symbol"]
-                    change =row ["change"]
-                    price =all_prices .get (symbol )or row .get ("price",0.0 )
-                    if price <=0 :
-                        continue 
+                    with self.lock:
+                        if symbol in self.price_blocked:
+                            continue
 
-                    blocked_for_entry =False 
-                    with self .lock :
-                        if symbol in self .price_blocked or symbol in self .change_blocked :
-                            blocked_for_entry =True 
+                    kline_ok = self._kline_entry_ok(symbol)
 
-                    if change >ENTRY_MAX_LEVEL :
-                        should_log_block =False
-                        with self .lock :
-                            if symbol not in self .change_blocked :
-                                self .change_blocked .add (symbol )
-                                should_log_block =True
-                        if should_log_block :
-                            self .log (
-                            f"BLOQUEADO permanente {symbol }: cambio {change :.2f}% > "
-                            f"{ENTRY_MAX_LEVEL :.0f}% (nivel máximo de entrada)"
-                            )
-                        blocked_for_entry =True 
+                    for level, notional in zip(ENTRY_LEVELS, ENTRY_NOTIONALS):
+                        if change >= level and kline_ok:
+                            await self._ensure_long(symbol, level, notional, price, change)
 
-                    if not blocked_for_entry :
-                        kline_ok =self ._kline_entry_ok (symbol )
+                    await self._maybe_stop_loss(symbol, price)
+                    await self._maybe_take_profit(symbol, price)
 
-                        for level ,notional in zip (ENTRY_LEVELS ,ENTRY_NOTIONALS ):
-                            if change >=level and kline_ok :
-                                await self ._ensure_long (symbol ,level ,notional ,price ,change )
+                # TP/SL de posiciones que ya no están en winners
+                with self.lock:
+                    pos_syms = list(self.positions.keys())
+                winner_syms = {w["symbol"] for w in winners}
+                for symbol in pos_syms:
+                    if symbol not in winner_syms:
+                        price = all_prices.get(symbol)
+                        if price:
+                            await self._maybe_stop_loss(symbol, price)
+                            await self._maybe_take_profit(symbol, price)
 
-                    await self ._maybe_close_position (symbol ,price ,change )
+                # ── Cierre global por PnL no realizado acumulado ──────────────
+                await self._maybe_global_close(all_prices)
 
-
-                with self .lock :
-                    pos_syms =list (self .positions .keys ())
-                winner_syms ={w ["symbol"]for w in winners }
-                for symbol in pos_syms :
-                    if symbol not in winner_syms :
-                        price =all_prices .get (symbol )
-                        if price :
-                            await self ._maybe_close_position (symbol ,price ,None )
-
-                with self .lock :
-                    self .scan_count +=1 
-                    self .last_scan_at =time .time ()
-                    now =time .time ()
-                    self .symbol_cooldown ={
-                    sym :ts for sym ,ts in self .symbol_cooldown .items ()
-                    if ts >now 
+                with self.lock:
+                    self.scan_count  += 1
+                    self.last_scan_at = time.time()
+                    now = time.time()
+                    self.symbol_cooldown = {
+                        sym: ts for sym, ts in self.symbol_cooldown.items()
+                        if ts > now
                     }
-                    n_cool =len (self .symbol_cooldown )
+                    n_cool = len(self.symbol_cooldown)
 
-                n_high =sum (1 for w in winners if w ["change"]>=ENTRY_LEVELS [0 ])
-                self .log (
-                f"Escan #{self .scan_count }: {len (winners )} activos | "
-                f">={ENTRY_LEVELS [0 ]:.0f}%: {n_high } | "
-                f"posiciones: {len (self .positions )} | cooldown: {n_cool }"
+                n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
+                self.log(
+                    f"Escan #{self.scan_count}: {len(winners)} activos | "
+                    f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
+                    f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
                 )
-                self .persist_state ()
+                self.persist_state()
 
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
-                self .log ("Scanner: CancelledError inesperado, continuando...")
-                await asyncio .sleep (1.0 )
-            except Exception as exc :
-                self .last_error =str (exc )
-                self .log (f"Error en scanner: {exc }")
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+                self.log("Scanner: CancelledError inesperado, continuando...")
+                await asyncio.sleep(1.0)
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"Error en scanner: {exc}")
 
-            try :
-                await asyncio .sleep (SCAN_INTERVAL_SECS )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
+            try:
+                await asyncio.sleep(SCAN_INTERVAL_SECS)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
 
+    # ── Realtime TP loop ──────────────────────────────────────────────────────
 
+    async def _realtime_price_loop(self) -> None:
+        """Comprueba TP y SL cada 0.25 s usando precios markPrice WS."""
+        while self.running:
+            try:
+                if self.price_cache and self.positions:
+                    try:
+                        all_prices = self.price_cache.get_all_prices()
+                    except Exception:
+                        all_prices = {}
+                    with self.lock:
+                        pos_syms = list(self.positions.keys())
+                    for symbol in pos_syms:
+                        price = all_prices.get(symbol)
+                        if price and price > 0:
+                            await self._maybe_stop_loss(symbol, price)
+                            await self._maybe_take_profit(symbol, price)
+                        # Ceder el event loop en cada símbolo para no bloquearlo
+                        await asyncio.sleep(0)
+                    await self._maybe_global_close(all_prices)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+            except Exception as exc:
+                self.last_error = str(exc)
+            try:
+                await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
 
-    async def _realtime_price_loop (self )->None :
-        """Comprueba TP/SL cada 0.25 s usando precios markPrice WS."""
-        while self .running :
-            try :
-                if self .price_cache and self .positions :
-                    all_prices =self .price_cache .get_all_prices ()
-                    with self .lock :
-                        pos_syms =list (self .positions .keys ())
-                    for symbol in pos_syms :
-                        price =all_prices .get (symbol )
-                        if price and price >0 :
-                            await self ._maybe_close_position (symbol ,price ,None )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
-            except Exception as exc :
-                self .last_error =str (exc )
-            try :
-                await asyncio .sleep (0.25 )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
+    # ── Snapshot loop ─────────────────────────────────────────────────────────
 
-
-
-    async def _snapshot_loop (self )->None :
+    async def _snapshot_loop(self) -> None:
         """Reconstruye el snapshot JSON cada segundo para /api/status."""
-        while self .running :
-            try :
-                snap =self ._build_snapshot ()
-                self ._sse_snapshot =json .dumps (snap ,ensure_ascii =False ,default =str )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
-            except Exception as exc :
-                self .log (f"Error construyendo snapshot: {exc }")
-            try :
-                await asyncio .sleep (1.0 )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
+        while self.running:
+            try:
+                snap = self._build_snapshot()
+                self._sse_snapshot = json.dumps(snap, ensure_ascii=False, default=str)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+            except Exception as exc:
+                self.log(f"Error construyendo snapshot: {exc}")
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
 
+    def _begin_close_guard(self, symbol: str) -> bool:
+        """Evita cierres duplicados del mismo símbolo."""
+        with self.lock:
+            if symbol in self._closing_symbols:
+                return False
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return False
+            self._closing_symbols.add(symbol)
+            return True
 
+    def _end_close_guard(self, symbol: str) -> None:
+        with self.lock:
+            self._closing_symbols.discard(symbol)
 
-    async def _executor_poll_loop (self )->None :
-        """Consulta /api/state del Executor cada EXECUTOR_POLL_SECS para traer
-        el PnL realizado/no realizado de las operaciones REALES."""
-        if not EXECUTOR_URL :
-            self .log ("[executor] EXECUTOR_URL no configurado — PnL real no disponible")
-            return 
-        self .log (f"[executor] Polling de estado activo → {EXECUTOR_URL }")
-        while self .running :
-            try :
-                data =await asyncio .to_thread (_executor_fetch_state_sync )
-                if data is not None :
-                    with self .lock :
-                        self .executor_state =data 
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
-            except Exception as exc :
-                self .log (f"[executor] Error consultando estado: {exc }")
-            try :
-                await asyncio .sleep (EXECUTOR_POLL_SECS )
-            except asyncio .CancelledError :
-                if not self .running :
-                    break 
+    # ── Estrategia ────────────────────────────────────────────────────────────
 
-    def _notify_executor (self ,payload :dict )->None :
-        """Dispara una señal open/close hacia el Executor sin bloquear el loop."""
-        if not EXECUTOR_URL :
-            return 
-        try :
-            asyncio .create_task (asyncio .to_thread (_executor_send_signal_sync ,payload ))
-        except RuntimeError :
-            pass 
+    async def _ensure_long(self, symbol: str, level: float, notional: float,
+                            price: float, change: float) -> None:
 
+        should_log = False
+        with self.lock:
+            if price > MAX_PRICE_BLOCK:
+                if symbol not in self.price_blocked:
+                    self.price_blocked.add(symbol)
+                    should_log = True
+                return
 
+            if self._cooldown_remaining(symbol) > 0:
+                return
+            if symbol in self._closing_symbols:
+                return
+            pos = self.positions.setdefault(symbol, BotPosition(symbol=symbol))
+            if level in pos.opened_levels() or pos.status != "OPEN":
+                return
+            # Asignar trade_id la primera vez que se abre la posición
+            if pos.trade_id == 0:
+                pos.trade_id = self._next_trade_id()
+            trade_id = pos.trade_id
 
-    async def _ensure_long (self ,symbol :str ,level :float ,notional :float ,
-    price :float ,change :float )->None :
-
-        should_log =False 
-        with self .lock :
-            if price >MAX_PRICE_BLOCK :
-                if symbol not in self .price_blocked :
-                    self .price_blocked .add (symbol )
-                    should_log =True 
-                return 
-
-            if self ._cooldown_remaining (symbol )>0 :
-                return 
-            pos =self .positions .setdefault (symbol ,BotPosition (symbol =symbol ))
-            if level in pos .opened_levels ()or pos .status !="OPEN":
-                return 
-
-        try :
-            if should_log :
-               self .log (f"BLOQUEADO permanente {symbol }: precio {price :.4f} > {MAX_PRICE_BLOCK } USD")
-               should_log =False 
-            qty =await self .client .market_long (symbol ,notional ,price )
-            fill =Fill (level =level ,notional =notional ,entry_price =price ,qty =qty )
-            with self .lock :
-                pos =self .positions [symbol ]
-                if pos .trade_id ==0 :
-                    self ._trade_id_seq +=1 
-                    pos .trade_id =self ._trade_id_seq 
-                pos .fills .append (fill )
-                trade_id =pos .trade_id 
-            self .log (
-            f"LONG {symbol }: nivel {level :.0f}% | {notional :.2f} USDT | "
-            f"qty={qty } | px={price :.6f} | cambio(WS)={change :.2f}%"
+        try:
+            if should_log:
+               self.log(f"BLOQUEADO permanente {symbol}: precio {price:.4f} > {MAX_PRICE_BLOCK} USD")
+               should_log = False
+            qty  = await self.client.market_long(symbol, notional, price)
+            fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
+            with self.lock:
+                self.positions[symbol].fills.append(fill)
+                # Actualizar el stop loss por defecto al notional ACTUAL de la
+                # posición (suma de todos los fills), salvo que el usuario lo
+                # haya fijado manualmente desde el dashboard.
+                self.positions[symbol].refresh_default_sl()
+                new_sl = self.positions[symbol].sl_usd
+            self.log(
+                f"LONG {symbol}: nivel {level:.0f}% | {notional:.2f} USDT | "
+                f"qty={qty} | px={price:.6f} | cambio(WS)={change:.2f}% | "
+                f"trade_id={trade_id} | SL auto={new_sl:.4f}"
             )
-            self ._notify_executor ({
-            "action":"open",
-            "trade_id":trade_id ,
-            "symbol":symbol ,
-            "direction":"LONG",
-            "price":price ,
-            "quantity":qty ,
+            # Notificar apertura al Executor
+            self.executor.notify_open(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="LONG",
+                price=price,
+                quantity=qty,
+                notional=notional,
+                level=level,
+            )
+            self.persist_state()
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"Error abriendo long {symbol} nivel {level}: {exc}")
+
+    async def _maybe_take_profit(self, symbol: str, price: float) -> None:
+        # ── Pre-verificación sin guard (caso más común: TP no alcanzado) ──────
+        # Esto evita bloquear close_position_manual con el guard innecesariamente
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return
+            pnl    = pos.unrealized_pnl(price)
+            target = pos.notional * TAKE_PROFIT_FRACTION
+
+        if pnl < target:
+            return  # Caso normal: sin TP todavía, sin tocar el guard
+
+        # ── TP alcanzado: adquirir guard y cerrar ─────────────────────────────
+        if not self._begin_close_guard(symbol):
+            return
+
+        try:
+            # Re-verificar tras adquirir el guard (condición puede haber cambiado)
+            with self.lock:
+                pos = self.positions.get(symbol)
+                if not pos or pos.status != "OPEN" or not pos.fills:
+                    return
+                pnl      = pos.unrealized_pnl(price)
+                target   = pos.notional * TAKE_PROFIT_FRACTION
+                if pnl < target:
+                    return
+                qty      = pos.qty
+                avg_ent  = pos.avg_entry
+                notional = pos.notional
+                trade_id = pos.trade_id
+
+            try:
+                await self.client.close_long(symbol, qty)
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"Error cerrando long {symbol}: {exc}")
+                return
+
+            unblock_str = ""
+            with self.lock:
+                pos = self.positions.pop(symbol, None)
+                if pos:
+                    pos.status       = "CLOSED"
+                    pos.realized_pnl = pnl
+                    self.total_realized_pnl += pnl
+
+                    unblock_ts  = time.time() + COOLDOWN_SECONDS
+                    self.symbol_cooldown[symbol] = unblock_ts
+                    unblock_str = datetime.fromtimestamp(
+                        unblock_ts, timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+
+                    self.closed_trades.insert(0, {
+                        "symbol":      symbol,
+                        "pnl":         pnl,
+                        "target":      target,
+                        "qty":         qty,
+                        "avg_entry":   avg_ent,
+                        "close_price": price,
+                        "notional":    notional,
+                        "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "unblock_at":  unblock_str,
+                        "reason":      "TP",
+                    })
+                    self.closed_trades = self.closed_trades[:500]
+
+            self.executor.notify_close(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="LONG",
+                reason="TP",
+                close_price=price,
+                pnl=pnl,
+            )
+            self.log(
+                f"CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
+                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+            )
+            self.persist_state()
+        finally:
+            self._end_close_guard(symbol)
+
+    async def _maybe_stop_loss(self, symbol: str, price: float) -> None:
+        """Cierra la posición si la pérdida no realizada >= stop loss configurado
+        para esa posición (pos.sl_usd, por defecto DEFAULT_STOP_LOSS_USD)."""
+        # ── Pre-verificación sin guard ────────────────────────────────────────
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return
+            pnl      = pos.unrealized_pnl(price)
+            notional = pos.notional
+            sl_usd   = pos.sl_usd
+
+        if pnl > sl_usd:
+            return  # Caso normal: sin SL todavía, sin tocar el guard
+
+        # ── SL alcanzado: adquirir guard y cerrar ─────────────────────────────
+        if not self._begin_close_guard(symbol):
+            return
+
+        try:
+            # Re-verificar tras adquirir el guard
+            with self.lock:
+                pos = self.positions.get(symbol)
+                if not pos or pos.status != "OPEN" or not pos.fills:
+                    return
+                pnl      = pos.unrealized_pnl(price)
+                notional = pos.notional
+                sl_usd   = pos.sl_usd
+                if pnl > sl_usd:
+                    return
+                qty      = pos.qty
+                avg_ent  = pos.avg_entry
+                trade_id = pos.trade_id
+
+            try:
+                await self.client.close_long(symbol, qty)
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"Error cerrando STOP LOSS {symbol}: {exc}")
+                return
+
+            unblock_str = ""
+            with self.lock:
+                pos = self.positions.pop(symbol, None)
+                if pos:
+                    pos.status       = "CLOSED"
+                    pos.realized_pnl = pnl
+                    self.total_realized_pnl += pnl
+
+                    unblock_ts  = time.time() + COOLDOWN_SECONDS
+                    self.symbol_cooldown[symbol] = unblock_ts
+                    unblock_str = datetime.fromtimestamp(
+                        unblock_ts, timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+
+                    self.closed_trades.insert(0, {
+                        "symbol":      symbol,
+                        "pnl":         pnl,
+                        "target":      notional * TAKE_PROFIT_FRACTION,
+                        "qty":         qty,
+                        "avg_entry":   avg_ent,
+                        "close_price": price,
+                        "notional":    notional,
+                        "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "unblock_at":  unblock_str,
+                        "reason":      "SL",
+                    })
+                    self.closed_trades = self.closed_trades[:500]
+
+            self.executor.notify_close(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="LONG",
+                reason="SL",
+                close_price=price,
+                pnl=pnl,
+            )
+            self.log(
+                f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
+                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+            )
+            self.persist_state()
+        finally:
+            self._end_close_guard(symbol)
+
+    def set_stop_loss(self, symbol: str, sl_usd: float) -> bool:
+        """Establece el stop loss (en USD, valor negativo) para una posición
+        abierta específica. Se puede llamar desde el dashboard en cualquier
+        momento mientras la posición esté abierta. A partir de este punto el
+        SL deja de autoactualizarse según el notional (queda fijo en manual)."""
+        symbol = symbol.upper().strip()
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN":
+                return False
+            pos.sl_usd    = sl_usd
+            pos.sl_manual = True
+        self.log(f"Stop loss actualizado manualmente para {symbol}: {sl_usd:.4f} USD")
+        self.persist_state()
+        return True
+
+    async def close_position_manual(self, symbol: str, reason: str = "MANUAL") -> bool:
+        """Cierre manual (o por cierre global) de una posición abierta."""
+        if not self._begin_close_guard(symbol):
+            return False
+
+        try:
+            with self.lock:
+                pos = self.positions.get(symbol)
+                if not pos or pos.status != "OPEN" or not pos.fills:
+                    return False
+                qty      = pos.qty
+                avg_ent  = pos.avg_entry
+                notional = pos.notional
+                trade_id = pos.trade_id
+
+            price = 0.0
+            try:
+                if self.price_cache:
+                    price = self.price_cache.get_all_prices().get(symbol, 0.0)
+            except Exception:
+                pass
+
+            try:
+                await self.client.close_long(symbol, qty)
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"Error en cierre manual {symbol}: {exc}")
+                return False
+
+            pnl = 0.0
+            unblock_str = ""
+            with self.lock:
+                pos = self.positions.pop(symbol, None)
+                if pos:
+                    pnl = pos.unrealized_pnl(price) if price > 0 else 0.0
+                    pos.status       = "CLOSED"
+                    pos.realized_pnl = pnl
+                    self.total_realized_pnl += pnl
+
+                    unblock_ts  = time.time() + COOLDOWN_SECONDS
+                    self.symbol_cooldown[symbol] = unblock_ts
+                    unblock_str = datetime.fromtimestamp(
+                        unblock_ts, timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+
+                    self.closed_trades.insert(0, {
+                        "symbol":      symbol,
+                        "pnl":         pnl,
+                        "target":      notional * TAKE_PROFIT_FRACTION,
+                        "qty":         qty,
+                        "avg_entry":   avg_ent,
+                        "close_price": price,
+                        "notional":    notional,
+                        "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "unblock_at":  unblock_str,
+                        "reason":      reason,
+                    })
+                    self.closed_trades = self.closed_trades[:500]
+
+            self.executor.notify_close(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="LONG",
+                reason=reason,
+                close_price=price,
+                pnl=pnl,
+            )
+            self.log(
+                f"✋ CIERRE {reason} {symbol}: PnL={pnl:.4f} | "
+                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+            )
+            self.persist_state()
+            return True
+        finally:
+            self._end_close_guard(symbol)
+
+    # ── Cierre global por PnL no realizado ───────────────────────────────────
+
+    def set_global_close(self, pnl_usd: float) -> bool:
+        """Configura el umbral de PnL no realizado (USD) agregado de TODAS las
+        posiciones abiertas, a partir del cual se cierran todas de golpe.
+        Configurable en caliente desde el dashboard (POST /api/set-global-close)."""
+        with self.lock:
+            self.global_close_pnl = float(pnl_usd)
+        self.log(f"Cierre global configurado: {pnl_usd:.2f} USD de PnL no realizado")
+        self.persist_state()
+        return True
+
+    async def _maybe_global_close(self, all_prices: Dict[str, float]) -> None:
+        """Si el PnL no realizado SUMADO de todas las posiciones abiertas
+        alcanza/supera el umbral configurable (self.global_close_pnl), cierra
+        TODAS las posiciones abiertas a mercado."""
+        if self._global_closing:
+            return
+
+        with self.lock:
+            threshold = self.global_close_pnl
+            pos_items = list(self.positions.items())
+
+        if threshold <= 0 or not pos_items:
+            return
+
+        total_unreal = 0.0
+        for symbol, pos in pos_items:
+            if pos.status != "OPEN" or not pos.fills:
+                continue
+            price = all_prices.get(symbol, 0.0)
+            if price > 0:
+                total_unreal += pos.unrealized_pnl(price)
+
+        if total_unreal < threshold:
+            return
+
+        self._global_closing = True
+        try:
+            symbols = [s for s, p in pos_items if p.status == "OPEN" and p.fills]
+            self.log(
+                f"🎯 CIERRE GLOBAL activado: PnL no realizado total={total_unreal:.4f} "
+                f">= umbral={threshold:.2f}. Cerrando {len(symbols)} posiciones..."
+            )
+            for symbol in symbols:
+                try:
+                    await self.close_position_manual(symbol, reason="GLOBAL")
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    self.log(f"Error cerrando {symbol} en cierre global: {exc}")
+            self.log("🎯 CIERRE GLOBAL completado.")
+        finally:
+            self._global_closing = False
+
+    # ── Snapshot ──────────────────────────────────────────────────────────────
+
+    def _build_snapshot(self) -> dict:
+        all_prices: Dict[str, float] = {}
+        ws_stats:   dict = {}
+        kl_stats:   dict = {}
+        try:
+            if self.price_cache:
+                all_prices = self.price_cache.get_all_prices()
+                ws_stats   = self.price_cache.get_stats()
+        except Exception:
+            pass
+        try:
+            if self.kline_cache:
+                kl_stats = self.kline_cache.get_stats()
+        except Exception:
+            pass
+
+        with self.lock:
+            winners_raw        = [dict(w) for w in self.winners]
+            positions_raw      = dict(self.positions)
+            closed             = list(self.closed_trades[:130])
+            events             = list(self.events[:50])
+            cooldown_snap      = dict(self.symbol_cooldown)
+            price_blocked_snap = set(self.price_blocked)
+            last_ws_ticker_at  = self.last_ws_ticker_at
+            ws_ticker_updates  = self.ws_ticker_update_count
+            filter_cycle_count = self.filter_cycle_count
+            last_filter_at     = self.last_filter_cycle_at
+            all_symbols_count  = len(self.all_symbols)
+            total_realized_pnl = self.total_realized_pnl
+            global_close_pnl   = self.global_close_pnl
+
+        now = time.time()
+
+        winners_out = []
+        for w in winners_raw:
+            sym       = w["symbol"]
+            price     = all_prices.get(sym) or w.get("price", 0.0)
+            remaining = max(0.0, cooldown_snap.get(sym, 0.0) - now)
+            winners_out.append({
+                **w,
+                "price":              price,
+                "cooldown_remaining": remaining,
+                "cooldown_str":       self._fmt_cooldown(remaining) if remaining > 0 else "",
+                "price_blocked":      sym in price_blocked_snap,
             })
-            self .persist_state ()
-        except Exception as exc :
-            self .last_error =str (exc )
-            self .log (f"Error abriendo long {symbol } nivel {level }: {exc }")
 
-    async def _maybe_close_position (self ,symbol :str ,price :float ,change :Optional [float ]=None )->None :
-        with self .lock :
-            pos =self .positions .get (symbol )
-            if not pos or pos .status !="OPEN"or not pos .fills :
-                return 
-
-            if change is not None and change >=TP_TRIGGER_LEVEL :
-                pos .tp_armed =True 
-
-            pnl =pos .unrealized_pnl (price )
-            num_fills =len (pos .fills )
-            first_fill_notional =pos .fills [0 ].notional 
-            tp_armed =pos .tp_armed 
-
-        # --- Stop loss / Breakeven ---
-        # Mientras solo exista la 1ra entrada (50%), el stop es el SL_FRACTION
-        # normal calculado sobre el notional de esa 1ra entrada.
-        # En el momento en que se abre la 2da (75%) y/o 3ra (100%) entrada,
-        # el stop deja de ser el SL_FRACTION y pasa a ser BREAKEVEN: si el
-        # precio cae y el PnL combinado de la posición vuelve a <= 0 (o al
-        # buffer configurado), se cierra todo en breakeven.
-        reason =None 
-        if num_fills <=1 :
-            sl_target =first_fill_notional *SL_FRACTION 
-            if pnl <=-sl_target :
-                reason ="SL"
-        else :
-            if pnl <=BREAKEVEN_BUFFER_USDT :
-                reason ="BE"
-
-        # --- Take Profit ---
-        # El TP SOLO ocurre cuando el PnL no realizado de la posición llega
-        # a TAKE_PROFIT_USDT (en dólares), sin importar el nivel de cambio.
-        if reason is None and pnl >=TAKE_PROFIT_USDT :
-            reason ="TP"
-
-        if reason is None :
-            return 
-
-        await self ._close_position (symbol ,price ,reason )
-
-    async def _close_position (self ,symbol :str ,price :float ,reason :str )->bool :
-        """Cierra una posición (TP, SL o MANUAL) y notifica al Executor."""
-        with self .lock :
-            pos =self .positions .get (symbol )
-            if not pos or pos .status !="OPEN"or not pos .fills :
-                return False 
-            pnl =pos .unrealized_pnl (price )
-            qty =pos .qty 
-            avg_ent =pos .avg_entry 
-            notional =pos .notional 
-            trade_id =pos .trade_id 
-
-        try :
-            await self .client .close_long (symbol ,qty )
-        except Exception as exc :
-            self .last_error =str (exc )
-            self .log (f"Error cerrando long {symbol }: {exc }")
-            return False 
-
-        unblock_str =""
-        with self .lock :
-            pos =self .positions .pop (symbol ,None )
-            if pos :
-                pos .status ="CLOSED"
-                pos .realized_pnl =pnl 
-                self .total_realized_pnl +=pnl 
-
-                unblock_ts =time .time ()+COOLDOWN_SECONDS 
-                self .symbol_cooldown [symbol ]=unblock_ts 
-                unblock_str =datetime .fromtimestamp (
-                unblock_ts ,timezone .utc 
-                ).strftime ("%Y-%m-%d %H:%M UTC")
-
-                self .closed_trades .insert (0 ,{
-                "symbol":symbol ,
-                "reason":reason ,
-                "pnl":pnl ,
-                "qty":qty ,
-                "avg_entry":avg_ent ,
-                "close_price":price ,
-                "notional":notional ,
-                "target":tp_target_for (notional ),
-                "closed_at":datetime .now (timezone .utc ).strftime ("%Y-%m-%d %H:%M:%S UTC"),
-                "unblock_at":unblock_str ,
-                })
-                self .closed_trades =self .closed_trades [:100 ]
-
-        self .log (
-        f"CIERRE {symbol } [{reason }]: PnL={pnl :.4f} | px={price :.6f} | "
-        f"bloqueado {COOLDOWN_SECONDS //3600 }h hasta {unblock_str }"
-        )
-        self ._notify_executor ({
-        "action":"close",
-        "trade_id":trade_id ,
-        "symbol":symbol ,
-        "direction":"LONG",
-        "reason":reason ,
-        "close_price":price ,
-        })
-        self .persist_state ()
-        return True 
-
-
-
-    async def _manual_close (self ,symbol :str )->dict :
-        with self .lock :
-            pos =self .positions .get (symbol )
-            if not pos or pos .status !="OPEN"or not pos .fills :
-                return {"ok":False ,"error":f"No hay posición abierta para {symbol }"}
-
-        price =0.0 
-        try :
-            if self .price_cache :
-                price =self .price_cache .get_all_prices ().get (symbol ,0.0 )
-        except Exception :
-            price =0.0 
-        if not price or price <=0 :
-            with self .lock :
-                pos =self .positions .get (symbol )
-                price =pos .avg_entry if pos else 0.0 
-        if not price or price <=0 :
-            return {"ok":False ,"error":f"No hay precio disponible para {symbol }"}
-
-        closed =await self ._close_position (symbol ,price ,"MANUAL")
-        if not closed :
-            return {"ok":False ,"error":f"No se pudo cerrar {symbol }"}
-        return {"ok":True ,"symbol":symbol ,"close_price":price }
-
-    def request_manual_close (self ,symbol :str )->dict :
-        """Pensado para ser llamado desde el hilo de Flask: agenda el cierre
-        en el loop asyncio del bot y espera el resultado."""
-        symbol =symbol .upper ()
-        if not self .loop or not self .running :
-            return {"ok":False ,"error":"El bot no está corriendo"}
-        try :
-            fut =asyncio .run_coroutine_threadsafe (self ._manual_close (symbol ),self .loop )
-            return fut .result (timeout =15 )
-        except Exception as exc :
-            return {"ok":False ,"error":str (exc )}
-
-
-
-    def _build_snapshot (self )->dict :
-        all_prices :Dict [str ,float ]={}
-        ws_stats :dict ={}
-        kl_stats :dict ={}
-        try :
-            if self .price_cache :
-                all_prices =self .price_cache .get_all_prices ()
-                ws_stats =self .price_cache .get_stats ()
-        except Exception :
-            pass 
-        try :
-            if self .kline_cache :
-                kl_stats =self .kline_cache .get_stats ()
-        except Exception :
-            pass 
-
-        with self .lock :
-            winners_raw =[dict (w )for w in self .winners ]
-            positions_raw =dict (self .positions )
-            closed =list (self .closed_trades [:30 ])
-            events =list (self .events [:50 ])
-            cooldown_snap =dict (self .symbol_cooldown )
-            price_blocked_snap =set (self .price_blocked )
-            change_blocked_snap =set (self .change_blocked )
-            total_realized_paper =self .total_realized_pnl 
-            executor_state_snap =dict (self .executor_state )
-            last_ws_ticker_at =self .last_ws_ticker_at 
-            ws_ticker_updates =self .ws_ticker_update_count 
-            filter_cycle_count =self .filter_cycle_count 
-            last_filter_at =self .last_filter_cycle_at 
-            all_symbols_count =len (self .all_symbols )
-
-        now =time .time ()
-
-        winners_out =[]
-        for w in winners_raw :
-            sym =w ["symbol"]
-            price =all_prices .get (sym )or w .get ("price",0.0 )
-            remaining =max (0.0 ,cooldown_snap .get (sym ,0.0 )-now )
-            winners_out .append ({
-            **w ,
-            "price":price ,
-            "cooldown_remaining":remaining ,
-            "cooldown_str":self ._fmt_cooldown (remaining )if remaining >0 else "",
-            "price_blocked":sym in price_blocked_snap ,
-            "change_blocked":sym in change_blocked_snap ,
+        open_positions = []
+        total_unreal   = 0.0
+        total_notional = 0.0
+        for symbol, pos in positions_raw.items():
+            price = all_prices.get(symbol) or 0.0
+            pnl   = pos.unrealized_pnl(price)
+            total_unreal   += pnl
+            total_notional += pos.notional
+            # Precio al que se activa el Stop Loss configurado para esta posición
+            # LONG SL: (sl_price - avg_entry) * qty = sl_usd → sl_price = avg_entry + sl_usd/qty
+            sl_price = (pos.avg_entry + pos.sl_usd / pos.qty) if pos.qty > 0 else 0.0
+            open_positions.append({
+                "symbol":         symbol,
+                "mark_price":     price,
+                "avg_entry":      pos.avg_entry,
+                "qty":            pos.qty,
+                "notional":       pos.notional,
+                "target":         pos.notional * TAKE_PROFIT_FRACTION,
+                "unrealized_pnl": pnl,
+                "stop_loss_price": sl_price,
+                "stop_loss_usd":   pos.sl_usd,
+                "stop_loss_manual": pos.sl_manual,
+                "trade_id":       pos.trade_id,
+                "fills":          [f.__dict__ for f in pos.fills],
+                "change":         next(
+                    (w["change"] for w in winners_raw if w["symbol"] == symbol), 0.0
+                ),
             })
 
-        open_positions =[]
-        total_unreal =0.0 
-        total_notional =0.0 
-        for symbol ,pos in positions_raw .items ():
-            price =all_prices .get (symbol )or 0.0 
-            pnl =pos .unrealized_pnl (price )
-            total_unreal +=pnl 
-            total_notional +=pos .notional 
-            tp_target =tp_target_for (pos .notional )
-            num_fills =len (pos .fills )
-            if num_fills <=1 :
-                sl_target =pos .fills [0 ].notional *SL_FRACTION if pos .fills else pos .notional *SL_FRACTION 
-                stop_mode ="SL"
-            else :
-                sl_target =BREAKEVEN_BUFFER_USDT 
-                stop_mode ="BE"
-            open_positions .append ({
-            "symbol":symbol ,
-            "mark_price":price ,
-            "avg_entry":pos .avg_entry ,
-            "qty":pos .qty ,
-            "notional":pos .notional ,
-            "tp_target":tp_target ,
-            "target":tp_target ,
-            "sl_target":sl_target ,
-            "stop_mode":stop_mode ,
-            "unrealized_pnl":pnl ,
-            "tp_armed":pos .tp_armed ,
-            "fills":[f .__dict__ for f in pos .fills ],
-            "change":next (
-            (w ["change"]for w in winners_raw if w ["symbol"]==symbol ),0.0 
-            ),
-            })
-
-        active_cooldowns ={
-        sym :{
-        "remaining_s":round (ts -now ,0 ),
-        "remaining_str":self ._fmt_cooldown (ts -now ),
-        "unblock_utc":datetime .fromtimestamp (ts ,timezone .utc ).strftime (
-        "%Y-%m-%d %H:%M UTC"
-        ),
+        active_cooldowns = {
+            sym: {
+                "remaining_s":   round(ts - now, 0),
+                "remaining_str": self._fmt_cooldown(ts - now),
+                "unblock_utc":   datetime.fromtimestamp(ts, timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                ),
+            }
+            for sym, ts in cooldown_snap.items() if ts > now
         }
-        for sym ,ts in cooldown_snap .items ()if ts >now 
-        }
 
-        last_scan_text =(
-        datetime .fromtimestamp (self .last_scan_at ,timezone .utc )
-        .strftime ("%Y-%m-%d %H:%M:%S UTC")
-        if self .last_scan_at else "pendiente"
+        last_scan_text = (
+            datetime.fromtimestamp(self.last_scan_at, timezone.utc)
+            .strftime("%Y-%m-%d %H:%M:%S UTC")
+            if self.last_scan_at else "pendiente"
         )
-        last_filter_text =(
-        datetime .fromtimestamp (last_filter_at ,timezone .utc )
-        .strftime ("%H:%M:%S UTC")
-        if last_filter_at else "pendiente"
+        last_filter_text = (
+            datetime.fromtimestamp(last_filter_at, timezone.utc)
+            .strftime("%H:%M:%S UTC")
+            if last_filter_at else "pendiente"
         )
-        last_ws_ticker_text =(
-        datetime .fromtimestamp (last_ws_ticker_at ,timezone .utc )
-        .strftime ("%H:%M:%S UTC")
-        if last_ws_ticker_at else "pendiente"
+        last_ws_ticker_text = (
+            datetime.fromtimestamp(last_ws_ticker_at, timezone.utc)
+            .strftime("%H:%M:%S UTC")
+            if last_ws_ticker_at else "pendiente"
         )
-        next_filter_text =(
-        self ._fmt_cooldown (FILTER_CYCLE_SECS -(now -last_filter_at ))
-        if last_filter_at and (now -last_filter_at )<FILTER_CYCLE_SECS 
-        else "pronto"
+        next_filter_text = (
+            self._fmt_cooldown(FILTER_CYCLE_SECS - (now - last_filter_at))
+            if last_filter_at and (now - last_filter_at) < FILTER_CYCLE_SECS
+            else "pronto"
         )
 
         return {
-        "mode":"PAPER"if PAPER_MODE or not LIVE_TRADING else "REAL",
-        "running":self .running ,
-        "thread_alive":bool (self .thread and self .thread .is_alive ()),
-        "started_at":self .started_at ,
-        "uptime_seconds":round (now -self .started_at ,1 ),
-        "scan_count":self .scan_count ,
-        "last_scan_text":last_scan_text ,
-
-        "filter_cycle_count":filter_cycle_count ,
-        "last_filter_cycle_at":last_filter_at ,
-        "last_filter_text":last_filter_text ,
-        "next_filter_text":next_filter_text ,
-        "filter_cycle_secs":FILTER_CYCLE_SECS ,
-        "min_gain_filter":MIN_GAIN_FILTER ,
-        "full_subscribe_wait":FULL_SUBSCRIBE_WAIT_SECS ,
-
-        "all_symbols_count":all_symbols_count ,
-        "subscribed_count":len (self .subscribed_symbols ),
-        "subscribed_symbols":self .subscribed_symbols ,
-
-        "last_ws_ticker_text":last_ws_ticker_text ,
-        "ws_ticker_updates":ws_ticker_updates ,
-
-        "last_error":self .last_error ,
-        "last_startup_err":self .last_startup_err ,
-        "exchange_symbols":self .exchange_symbols ,
-        "entry_levels":ENTRY_LEVELS ,
-        "entry_notionals":ENTRY_NOTIONALS ,
-        "max_entry_level":ENTRY_MAX_LEVEL ,
-        "tp_trigger_level":TP_TRIGGER_LEVEL ,
-        "sl_pct":SL_FRACTION *100 ,
-        "take_profit_usdt":TAKE_PROFIT_USDT ,
-        "tp_usdt_full":tp_target_for (total_notional ),
-        "total_unrealized":total_unreal ,
-        "total_notional":total_notional ,
-
-        "total_realized_paper":total_realized_paper ,
-        "total_realized_real":executor_state_snap .get ("realized_pnl",0.0 )or 0.0 ,
-        "total_realized_combined":total_realized_paper +(executor_state_snap .get ("realized_pnl",0.0 )or 0.0 ),
-        "executor_connected":bool (executor_state_snap ),
-        "executor_unrealized":executor_state_snap .get ("unrealized_pnl",0.0 ),
-        "executor_open_count":executor_state_snap .get ("open_count",0 ),
-        "executor_url_set":bool (EXECUTOR_URL ),
-        "positions":open_positions ,
-        "winners":winners_out ,
-        "closed_trades":closed ,
-        "events":events ,
-        "cooldown_count":len (active_cooldowns ),
-        "cooldowns":active_cooldowns ,
-        "cooldown_hours":COOLDOWN_SECONDS /3600 ,
-        "price_blocked":sorted (price_blocked_snap ),
-        "price_blocked_count":len (price_blocked_snap ),
-        "max_price_block":MAX_PRICE_BLOCK ,
-        "change_blocked":sorted (change_blocked_snap ),
-        "change_blocked_count":len (change_blocked_snap ),
-        "price_ws":{
-        "active_prices":ws_stats .get ("active_prices",0 ),
-        "active_tickers":ws_stats .get ("active_tickers",0 ),
-        "total":ws_stats .get ("total_symbols",0 ),
-        "stale":ws_stats .get ("stale_symbols",0 ),
-        },
-        "kline_ws":{
-        "pairs_with_data":kl_stats .get ("pairs_with_data",0 ),
-        "total_messages":kl_stats .get ("total_messages",0 ),
-        "active_conns":kl_stats .get ("active_connections",0 ),
-        },
-        "ts":now ,
+            "mode":              "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL",
+            "running":           self.running,
+            "thread_alive":      bool(self.thread and self.thread.is_alive()),
+            "started_at":        self.started_at,
+            "uptime_seconds":    round(now - self.started_at, 1),
+            "scan_count":        self.scan_count,
+            "last_scan_text":    last_scan_text,
+            # Ciclo de filtrado
+            "filter_cycle_count":   filter_cycle_count,
+            "last_filter_text":     last_filter_text,
+            "next_filter_text":     next_filter_text,
+            "filter_cycle_secs":    FILTER_CYCLE_SECS,
+            "min_gain_filter":      MIN_GAIN_FILTER,
+            "full_subscribe_wait":  FULL_SUBSCRIBE_WAIT_SECS,
+            # Símbolos
+            "all_symbols_count":    all_symbols_count,
+            "subscribed_count":     len(self.subscribed_symbols),
+            "subscribed_symbols":   self.subscribed_symbols,
+            # WS ticker (actualizaciones entre ciclos)
+            "last_ws_ticker_text":  last_ws_ticker_text,
+            "ws_ticker_updates":    ws_ticker_updates,
+            # Resto
+            "last_error":        self.last_error,
+            "last_startup_err":  self.last_startup_err,
+            "exchange_symbols":  self.exchange_symbols,
+            "entry_levels":      ENTRY_LEVELS,
+            "entry_notionals":   ENTRY_NOTIONALS,
+            "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
+            "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
+            "default_stop_loss_fraction_pct": DEFAULT_STOP_LOSS_FRACTION * 100,
+            "global_close_pnl_usd": global_close_pnl,
+            "total_unrealized":   total_unreal,
+            "total_realized_pnl": total_realized_pnl,
+            "total_notional":    total_notional,
+            "executor_url":      EXECUTOR_URL or "",
+            "positions":         open_positions,
+            "winners":           winners_out,
+            "closed_trades":     closed,
+            "events":            events,
+            "cooldown_count":    len(active_cooldowns),
+            "cooldowns":         active_cooldowns,
+            "cooldown_hours":    COOLDOWN_SECONDS / 3600,
+            "price_blocked":     sorted(price_blocked_snap),
+            "price_blocked_count": len(price_blocked_snap),
+            "max_price_block":   MAX_PRICE_BLOCK,
+            "price_ws": {
+                "active_prices":  ws_stats.get("active_prices",  0),
+                "active_tickers": ws_stats.get("active_tickers", 0),
+                "total":          ws_stats.get("total_symbols",  0),
+                "stale":          ws_stats.get("stale_symbols",  0),
+            },
+            "kline_ws": {
+                "pairs_with_data": kl_stats.get("pairs_with_data", 0),
+                "total_messages":  kl_stats.get("total_messages",  0),
+                "active_conns":    kl_stats.get("active_connections", 0),
+            },
+            "ts": now,
         }
 
 
+    def _write_state_file(self, snap: dict) -> None:
+        '''Escribe el estado en disco de forma atómica.'''
+        if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
+            return
 
-    def persist_state (self )->None :
-        snap =self ._build_snapshot ()
-        if not snap ["positions"]and not snap ["closed_trades"]and snap ["scan_count"]<=0 :
-            return 
-        tmp =f"{STATE_FILE }.tmp"
-        try :
-            with open (tmp ,"w",encoding ="utf-8")as fh :
-                json .dump (snap ,fh ,ensure_ascii =False ,default =str )
-            os .replace (tmp ,STATE_FILE )
-        except Exception as exc :
-            self .log (f"No pude persistir estado: {exc }")
+        tmp = f"{STATE_FILE}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(snap, fh, ensure_ascii=False, default=str)
+            os.replace(tmp, STATE_FILE)
+        except Exception as exc:
+            self.log(f"No pude persistir estado: {exc}")
 
-    def snapshot (self )->dict :
-        live =self ._build_snapshot ()
-        if not live ["positions"]and not live ["winners"]and os .path .exists (STATE_FILE ):
-            try :
-                with open (STATE_FILE ,"r",encoding ="utf-8")as fh :
-                    persisted =json .load (fh )
-                if isinstance (persisted ,dict )and persisted .get ("scan_count",0 )>live .get ("scan_count",0 ):
-                    persisted ["state_source"]="persisted"
-                    return persisted 
-            except Exception :
-                pass 
-        live ["state_source"]="memory"
-        return live 
+    async def _persist_state_loop(self) -> None:
+        '''Flusher en segundo plano para persistir estado sin bloquear el loop.'''
+        if self._persist_event is None:
+            self._persist_event = asyncio.Event()
+
+        while self.running:
+            try:
+                await self._persist_event.wait()
+                self._persist_event.clear()
+
+                # Debounce: agrupa ráfagas de cambios consecutivos.
+                try:
+                    await asyncio.sleep(self._persist_debounce_secs)
+                except asyncio.CancelledError:
+                    if not self.running:
+                        break
+                    raise
+
+                while self._persist_event.is_set():
+                    self._persist_event.clear()
+                    try:
+                        await asyncio.sleep(self._persist_debounce_secs)
+                    except asyncio.CancelledError:
+                        if not self.running:
+                            break
+                        raise
+
+                if not self.running:
+                    break
+
+                snap = self._build_snapshot()
+                if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
+                    continue
+
+                await asyncio.to_thread(self._write_state_file, snap)
+
+            except asyncio.CancelledError:
+                if not self.running:
+                    break
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log(f"No pude persistir estado en background: {exc}")
+                try:
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    if not self.running:
+                        break
+                    raise
+
+    # ── Persistencia ──────────────────────────────────────────────────────────
+
+    def persist_state(self) -> None:
+        """Solicita persistencia asíncrona del estado sin bloquear el loop."""
+        if self._persist_event is None:
+            snap = self._build_snapshot()
+            self._write_state_file(snap)
+            return
+
+        try:
+            if self.loop and self.loop.is_running():
+                self.loop.call_soon_threadsafe(self._persist_event.set)
+            else:
+                self._persist_event.set()
+        except Exception:
+            snap = self._build_snapshot()
+            self._write_state_file(snap)
+
+    def snapshot(self) -> dict:
+        live = self._build_snapshot()
+        if not live["positions"] and not live["winners"] and os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as fh:
+                    persisted = json.load(fh)
+                if isinstance(persisted, dict) and \
+                   persisted.get("scan_count", 0) > live.get("scan_count", 0):
+                    persisted["state_source"] = "persisted"
+                    return persisted
+            except Exception:
+                pass
+        live["state_source"] = "memory"
+        return live
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FLASK APP
+# ─────────────────────────────────────────────────────────────────────────────
+
+bot = TradingBot()
+bot.start()
+
+app = Flask(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML + JS
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-bot =TradingBot ()
-bot .start ()
-
-app =Flask (__name__ )
-
-
-
-
-
-
-HTML =r"""<!doctype html>
+HTML = r"""<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8">
@@ -1684,11 +1959,27 @@ HTML =r"""<!doctype html>
                   display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; }
     .filter-bar span { color: var(--muted); }
     .filter-bar b   { color: var(--purple); }
-    .close-btn { background: #7f1d1d; color: #fecaca; border: 1px solid #ef4444;
-                 border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
-                 font-weight: 600; }
-    .close-btn:hover { background: #991b1b; }
-    .close-btn:disabled { opacity: .5; cursor: default; }
+    /* Botón de cierre manual */
+    .btn-close {
+      background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444;
+      border-radius: 6px; padding: 3px 10px; font-size: 11px; font-weight: 700;
+      cursor: pointer; transition: background .2s;
+    }
+    .btn-close:hover  { background: #991b1b; }
+    .btn-close:active { background: #b91c1c; }
+    .btn-close:disabled { opacity: .45; cursor: not-allowed; }
+    /* Badge de SL */
+    .sl-badge { display: inline-block; padding: 2px 7px; border-radius: 6px;
+                background: #1c1917; color: #fb923c;
+                border: 1px solid #78350f; font-size: 11px; white-space: nowrap; }
+    /* Badge de razón de cierre */
+    .reason-tp     { color: var(--green);  font-weight: 700; }
+    .reason-sl     { color: var(--red);    font-weight: 700; }
+    .reason-manual { color: var(--yellow); font-weight: 700; }
+    /* Executor status chip */
+    .executor-chip { background: #0f2027; border: 1px solid var(--teal);
+                     border-radius: 8px; padding: 4px 12px; font-size: 12px;
+                     color: var(--teal); display: inline-block; }
   </style>
 </head>
 <body>
@@ -1710,10 +2001,23 @@ HTML =r"""<!doctype html>
   <div class="cards">
     <div class="card"><div class="label">Modo</div><div id="mode" class="value warn sm">—</div></div>
     <div class="card"><div class="label">PnL no realizado</div><div id="pnl" class="value">—</div></div>
-    <div class="card"><div class="label">PnL realizado (Paper)</div><div id="pnlRealPaper" class="value">—</div></div>
-    <div class="card"><div class="label">PnL realizado (Real · Executor)</div><div id="pnlRealReal" class="value">—</div></div>
-    <div class="card"><div class="label">PnL combinado (Paper + Real)</div><div id="pnlCombined" class="value">—</div></div>
+    <div class="card" style="border-color:#22c55e55">
+      <div class="label">✅ PnL Realizado Total</div>
+      <div id="realizedPnl" class="value positive">—</div>
+    </div>
     <div class="card"><div class="label">Capital en posiciones</div><div id="notional" class="value">—</div></div>
+    <div class="card" style="border-color:#f59e0b55">
+      <div class="label">🎯 Cierre global (PnL no realizado total)</div>
+      <div style="display:flex; align-items:center; gap:6px;">
+        <input id="globalCloseInput" type="number" step="0.5" min="0.5"
+               style="width:80px; background:#0b1220; color:var(--txt); border:1px solid var(--border);
+                      border-radius:6px; padding:4px 6px; font-size:13px;">
+        <button id="globalCloseSave" onclick="saveGlobalClose()"
+                style="background:#92400e; color:#fde68a; border:none; border-radius:6px;
+                       padding:5px 10px; font-size:12px; cursor:pointer;">Guardar</button>
+      </div>
+      <div id="globalCloseError" style="color:var(--red); font-size:11px; margin-top:4px; display:none;"></div>
+    </div>
     <div class="card"><div class="label">Último escaneo</div><div id="scan" class="value sm">—</div></div>
     <div class="card"><div class="label">Escaneos totales</div><div id="scanCount" class="value">—</div></div>
     <div class="card">
@@ -1740,6 +2044,10 @@ HTML =r"""<!doctype html>
     <div class="card">
       <div class="label">En cooldown (24h)</div>
       <div id="cooldownCount" class="value warn">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Executor</div>
+      <div id="executorStatus" class="value sm">—</div>
     </div>
   </div>
 
@@ -1788,15 +2096,20 @@ HTML =r"""<!doctype html>
 
   <!-- Posiciones abiertas -->
   <section>
-    <h2>Posiciones abiertas (LONG)</h2>
+    <h2>Posiciones abiertas
+      <span style="color:var(--muted);font-size:12px;font-weight:400;margin-left:8px">
+        ⛔ SL configurable por posición (por defecto $-5.00)
+      </span>
+    </h2>
     <table>
       <thead><tr>
         <th>Símbolo</th><th>Cambio 24h (WS)</th><th>Entrada media</th>
-        <th>Precio WS</th><th>Notional</th><th>TP</th><th>SL</th>
-        <th>PnL tiempo real</th><th>Tramos</th><th>Acción</th>
+        <th>Precio WS</th><th>Notional</th><th>Objetivo TP</th>
+        <th>Stop Loss (precio)</th><th>Stop Loss (USD)</th><th>PnL tiempo real</th><th>Tramos</th>
+        <th>Cerrar</th>
       </tr></thead>
       <tbody id="tbPositions">
-        <tr><td colspan="10" style="color:var(--muted)">Sin posiciones</td></tr>
+        <tr><td colspan="11" style="color:var(--muted)">Sin posiciones</td></tr>
       </tbody>
     </table>
   </section>
@@ -1816,7 +2129,7 @@ HTML =r"""<!doctype html>
         <th>Cambio 24h (WS)</th>
         <th>Precio (markPrice)</th>
         <th>Cond. kline</th>
-        <th>Long</th>
+        <th>Short</th>
         <th>Estado</th>
       </tr></thead>
       <tbody id="tbWinners">
@@ -1827,15 +2140,17 @@ HTML =r"""<!doctype html>
 
   <!-- Cierres -->
   <section>
-    <h2>Operaciones cerradas</h2>
+    <h2>Operaciones cerradas
+      <span id="totalRealizedBadge" style="margin-left:10px;font-size:13px;font-weight:400"></span>
+    </h2>
     <table>
       <thead><tr>
-        <th>Símbolo</th><th>PnL realizado</th><th>Objetivo</th>
+        <th>Símbolo</th><th>Motivo</th><th>PnL realizado</th><th>Objetivo TP</th>
         <th>Entrada media</th><th>Precio cierre</th>
         <th>Bloqueado hasta</th><th>Fecha cierre</th>
       </tr></thead>
       <tbody id="tbClosed">
-        <tr><td colspan="7" style="color:var(--muted)">Sin cierres aún</td></tr>
+        <tr><td colspan="8" style="color:var(--muted)">Sin cierres aún</td></tr>
       </tbody>
     </table>
   </section>
@@ -1847,6 +2162,30 @@ HTML =r"""<!doctype html>
   </section>
 
 </main>
+
+<!-- Modal: editar Stop Loss -->
+<div id="slModalOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6);
+     z-index:1000; align-items:center; justify-content:center;">
+  <div style="background:var(--card); border:1px solid var(--border); border-radius:12px;
+       padding:20px; width:320px; max-width:90vw;">
+    <h3 style="margin:0 0 4px 0; font-size:16px;">Editar Stop Loss</h3>
+    <p style="margin:0 0 14px 0; color:var(--muted); font-size:13px;">
+      Símbolo: <strong id="slModalSymbol" style="color:var(--txt)">—</strong>
+    </p>
+    <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:6px;">
+      Pérdida máxima en USD (valor negativo, ej. -5)
+    </label>
+    <input id="slModalInput" type="number" step="0.1"
+           style="width:100%; box-sizing:border-box; background:#0f172a; color:var(--txt);
+           border:1px solid var(--border); border-radius:6px; padding:8px; font-size:14px;
+           margin-bottom:6px;">
+    <p id="slModalError" style="display:none; color:var(--red); font-size:12px; margin:0 0 10px 0;"></p>
+    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:10px;">
+      <button id="slModalCancel" class="btn-close" style="background:#334155;">Cancelar</button>
+      <button id="slModalSave" class="btn-close" style="background:#166534;">Guardar</button>
+    </div>
+  </div>
+</div>
 
 <script>
 // ── Utilidades ──────────────────────────────────────────────────────────────
@@ -1878,7 +2217,8 @@ let _cdData       = {};
 let _lastFetch    = 0;
 let _prevFilter   = 0;
 let _prevWsTicker = 0;
-let _filterDeadlineMs = 0;
+let _filterAt     = 0;
+let _filterCycle  = 300;
 
 // Decrementa cooldowns y cuenta regresiva del ciclo de filtrado
 function tickTimers() {
@@ -1905,13 +2245,9 @@ function tickTimers() {
     }
   });
 
-  // Cuenta regresiva del próximo ciclo de filtrado.
-  // Usamos un "deadline" absoluto (timestamp de cuando termina el ciclo)
-  // calculado UNA sola vez por ciclo, en vez de restar el tiempo transcurrido
-  // desde el último poll contra la duración total del ciclo (eso causaba que
-  // el contador se reiniciara visualmente cada vez que llegaba un nuevo poll).
-  if (_filterDeadlineMs > 0) {
-    const nextIn = Math.max(0, (_filterDeadlineMs - Date.now()) / 1000);
+  // Cuenta regresiva del próximo ciclo de filtrado
+  if (_filterAt > 0) {
+    const nextIn = Math.max(0, _filterCycle - elapsed);
     q('nextFilter').textContent = nextIn > 0 ? `en ${fmtCd(nextIn)}` : 'pronto…';
     q('fbNext').textContent     = nextIn > 0 ? fmtCd(nextIn) : 'pronto…';
   }
@@ -1922,17 +2258,8 @@ setInterval(tickTimers, 1000);
 function render(d) {
   if (!d) return;
   _lastFetch    = Date.now();
-
-  // Deadline absoluto del próximo ciclo de filtrado (timestamp en ms en el
-  // que debe terminar el ciclo). Se recalcula en cada poll a partir del
-  // momento real en que comenzó el ciclo (last_filter_cycle_at, en
-  // segundos epoch) + su duración total. Así el contador nunca "salta" ni
-  // se reinicia visualmente entre polls: solo se mueve hacia 0 de forma
-  // continua y se vuelve a fijar un nuevo deadline cuando el ciclo real
-  // cambia.
-  const filterAtSecs  = n(d.last_filter_cycle_at || 0);
-  const filterCycle   = n(d.filter_cycle_secs || 300);
-  _filterDeadlineMs    = filterAtSecs > 0 ? (filterAtSecs + filterCycle) * 1000 : 0;
+  _filterAt     = n(d.last_filter_cycle_at || 0);  // no viene en snapshot directamente, usamos texto
+  _filterCycle  = n(d.filter_cycle_secs || 300);
 
   const mode = d.mode || '—';
   q('mode').textContent      = mode;
@@ -1942,24 +2269,32 @@ function render(d) {
   const pu = n(d.total_unrealized);
   q('pnl').textContent            = money(pu);
   q('pnl').className              = 'value ' + cls(pu);
+
+  const rp = n(d.total_realized_pnl);
+  q('realizedPnl').textContent    = money(rp);
+  q('realizedPnl').className      = 'value ' + cls(rp);
+
+  // Executor status
+  const exUrl = d.executor_url || '';
+  const exEl  = q('executorStatus');
+  if (exUrl) {
+    exEl.innerHTML = `<span class="executor-chip">🔗 ${exUrl.replace('https://','').split('/')[0]}</span>`;
+  } else {
+    exEl.innerHTML = `<span style="color:var(--muted);font-size:12px">No configurado</span>`;
+  }
+
   q('notional').textContent       = money(d.total_notional);
-
-  const prPaper = n(d.total_realized_paper);
-  const prReal  = n(d.total_realized_real);
-  const prComb  = n(d.total_realized_combined);
-  q('pnlRealPaper').textContent   = money(prPaper);
-  q('pnlRealPaper').className     = 'value ' + cls(prPaper);
-  q('pnlRealReal').textContent    = money(prReal);
-  q('pnlRealReal').className      = 'value ' + cls(prReal);
-  // PnL combinado = no realizado + realizado (paper + real)
-  const pnlCombinedTotal = pu + prComb;
-  q('pnlCombined').textContent    = money(pnlCombinedTotal);
-  q('pnlCombined').className      = 'value ' + cls(pnlCombinedTotal);
-
+  {
+    const gcInput = q('globalCloseInput');
+    if (gcInput && document.activeElement !== gcInput) {
+      gcInput.value = (d.global_close_pnl_usd != null) ? d.global_close_pnl_usd : 40;
+    }
+  }
   q('scan').textContent           = d.last_scan_text         || 'pendiente';
   q('scanCount').textContent      = n(d.scan_count);
   q('filterCycles').textContent   = n(d.filter_cycle_count);
   q('lastFilter').textContent     = d.last_filter_text       || 'pendiente';
+  q('nextFilter').textContent     = d.next_filter_text       || '—';
   q('allSymbols').textContent     = n(d.all_symbols_count);
   q('subCount').textContent       = n(d.subscribed_count);
   q('lastWsTicker').textContent   = d.last_ws_ticker_text    || 'pendiente';
@@ -1975,6 +2310,7 @@ function render(d) {
   q('fbThreshold').textContent = threshold;
   q('fbUnsub').textContent     = Math.max(0, allCount - subCount);
   q('gainThreshold').textContent = threshold;
+  q('fbNext').textContent      = d.next_filter_text || '—';
 
   // Parpadeo del ciclo de filtrado
   const fc = n(d.filter_cycle_count);
@@ -2031,12 +2367,17 @@ function render(d) {
   // ── Posiciones ────────────────────────────────────────────────────────────
   const positions = Array.isArray(d.positions) ? d.positions : [];
   q('tbPositions').innerHTML = tb(positions.map(p => {
-    const pnl   = n(p.unrealized_pnl);
+    const pnl    = n(p.unrealized_pnl);
+    const slPx   = n(p.stop_loss_price);
+    const mrkPx  = n(p.mark_price);
+    // Alerta si el precio está cerca del SL (dentro del 5%)
+    const slDist = slPx > 0 ? ((slPx - mrkPx) / mrkPx * 100) : 999;
+    const slCls  = slDist < 2 ? 'style="color:var(--red);font-weight:700"'
+                 : slDist < 5 ? 'style="color:var(--orange)"' : '';
     const fills = (Array.isArray(p.fills) ? p.fills : [])
       .map(f => `<span class="pill">+${fx(f.level,0)}% / ${fx(f.notional,2)}</span>`)
       .join(' ');
-    const target = n(p.tp_target ?? p.target);
-    const sl     = n(p.sl_target);
+    const slUsd = n(p.stop_loss_usd);
     return `<tr>
       <td><a class="sym-link" href="https://www.binance.com/en/futures/${p.symbol}"
              target="_blank">${p.symbol}</a></td>
@@ -2044,11 +2385,15 @@ function render(d) {
       <td>${fx(p.avg_entry)}</td>
       <td>${fx(p.mark_price)}</td>
       <td>${money(p.notional)}</td>
-      <td>${money(target)}</td>
-      <td>${money(sl)}</td>
+      <td class="positive">${money(p.target)}</td>
+      <td ${slCls}><span class="sl-badge">⛔ ${fx(slPx)}</span></td>
+      <td>
+        <button class="btn-close" style="padding:2px 8px"
+                onclick="editStopLoss('${p.symbol}', ${slUsd}, this)">${money(slUsd)}</button>
+      </td>
       <td class="${cls(pnl)}">${money(pnl)}</td>
       <td>${fills}</td>
-      <td><button class="close-btn" onclick="closePosition('${p.symbol}', this)">Cerrar</button></td>
+      <td><button class="btn-close" onclick="closePosition('${p.symbol}', this)">Cerrar</button></td>
     </tr>`;
   }), 'Sin posiciones abiertas', 10);
 
@@ -2087,7 +2432,7 @@ function render(d) {
       <td>${canTrade
             ? '<span style="color:var(--green)">✓ alcista</span>'
             : '<span style="color:var(--muted)">—</span>'}</td>
-      <td>${w.can_long
+      <td>${w.can_short
             ? '<span style="color:var(--green)">sí</span>'
             : '<span style="color:var(--red)">no</span>'}</td>
       <td>${statusHtml}</td>
@@ -2096,47 +2441,175 @@ function render(d) {
 
   // ── Cierres ───────────────────────────────────────────────────────────────
   const closed = Array.isArray(d.closed_trades) ? d.closed_trades : [];
-  q('tbClosed').innerHTML = tb(closed.map(t => `<tr>
-    <td style="font-weight:700">${t.symbol || ''}</td>
-    <td class="${cls(t.pnl)}">${money(t.pnl)}</td>
-    <td>${money(t.target ?? t.tp_target ?? 0)}</td>
-    <td>${fx(t.avg_entry)}</td>
-    <td>${fx(t.close_price)}</td>
-    <td style="color:var(--orange)">${t.unblock_at || '—'}</td>
-    <td style="color:var(--muted)">${t.closed_at || ''}</td>
-  </tr>`), 'Sin cierres aún', 7);
+
+  // Badge de total realizado en el encabezado de la sección
+  const trBadge = q('totalRealizedBadge');
+  if (trBadge) {
+    const rpv = n(d.total_realized_pnl);
+    const rpCls = rpv >= 0 ? 'positive' : 'negative';
+    trBadge.innerHTML = closed.length
+      ? `— PnL total realizado: <span class="${rpCls}" style="font-weight:700">${money(rpv)}</span>`
+      : '';
+  }
+
+  const reasonLabel = r => {
+    if (!r) return '—';
+    if (r === 'TP')     return '<span class="reason-tp">✅ TP</span>';
+    if (r === 'SL')     return '<span class="reason-sl">⛔ SL</span>';
+    if (r === 'MANUAL') return '<span class="reason-manual">✋ Manual</span>';
+    return `<span style="color:var(--muted)">${r}</span>`;
+  };
+
+  q('tbClosed').innerHTML = tb(closed.map(t => {
+    const pnlVal = n(t.pnl);
+    return `<tr>
+      <td style="font-weight:700">${t.symbol || ''}</td>
+      <td>${reasonLabel(t.reason)}</td>
+      <td class="${cls(pnlVal)}">${money(pnlVal)}</td>
+      <td>${money(t.target)}</td>
+      <td>${fx(t.avg_entry)}</td>
+      <td>${fx(t.close_price)}</td>
+      <td style="color:var(--orange)">${t.unblock_at || '—'}</td>
+      <td style="color:var(--muted)">${t.closed_at || ''}</td>
+    </tr>`;
+  }), 'Sin cierres aún', 8);
 
   q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
-
-  // Refresca inmediatamente las cuentas regresivas (cooldowns y próximo
-  // ciclo) con los datos recién llegados, en vez de esperar al próximo
-  // tick de 1s — evita un parpadeo de valores desfasados justo tras el poll.
-  tickTimers();
 }
 
-async function closePosition(symbol, btn) {
+// ── Modal: editar Stop Loss individual por posición ─────────────────────────
+let _slModalSymbol = null;
+let _slModalBtn    = null;
+
+function editStopLoss(symbol, currentSl, btn) {
+  _slModalSymbol = symbol;
+  _slModalBtn    = btn;
+  q('slModalSymbol').textContent = symbol;
+  q('slModalInput').value        = currentSl;
+  q('slModalError').style.display = 'none';
+  q('slModalError').textContent   = '';
+  q('slModalOverlay').style.display = 'flex';
+  setTimeout(() => q('slModalInput').focus(), 50);
+}
+
+function closeSlModal() {
+  q('slModalOverlay').style.display = 'none';
+  _slModalSymbol = null;
+  _slModalBtn    = null;
+}
+
+async function saveSlModal() {
+  const symbol = _slModalSymbol;
+  const btn    = _slModalBtn;
   if (!symbol) return;
-  const prevText = btn ? btn.textContent : '';
+
+  const raw   = q('slModalInput').value;
+  const slUsd = parseFloat(String(raw).replace(',', '.'));
+  if (isNaN(slUsd) || slUsd >= 0) {
+    q('slModalError').textContent   = 'El Stop Loss debe ser un número negativo (por ejemplo -5).';
+    q('slModalError').style.display = 'block';
+    return;
+  }
+
+  const saveBtn = q('slModalSave');
+  saveBtn.disabled    = true;
+  saveBtn.textContent = '…';
   try {
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '...';
-    }
-    const resp = await fetch(`/api/manual-close/${encodeURIComponent(symbol)}`, {
-      method: 'POST',
-      cache: 'no-store'
+    const resp = await fetch(`/api/set-sl/${symbol}`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ sl_usd: slUsd }),
+      cache:   'no-store',
     });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok || !data.ok) {
-      throw new Error(data.error || `HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (data.ok) {
+      closeSlModal();
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(poll, 300);
+    } else {
+      q('slModalError').textContent   = data.error || `Error HTTP ${resp.status}`;
+      q('slModalError').style.display = 'block';
     }
   } catch (err) {
-    alert(`No se pudo cerrar ${symbol}: ${err.message}`);
+    q('slModalError').textContent   = `Error de red: ${err.message}`;
+    q('slModalError').style.display = 'block';
   } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = prevText || 'Cerrar';
+    saveBtn.disabled    = false;
+    saveBtn.textContent = 'Guardar';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  q('slModalCancel').addEventListener('click', closeSlModal);
+  q('slModalSave').addEventListener('click', saveSlModal);
+  q('slModalOverlay').addEventListener('click', (e) => {
+    if (e.target.id === 'slModalOverlay') closeSlModal();
+  });
+  q('slModalInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveSlModal();
+    if (e.key === 'Escape') closeSlModal();
+  });
+});
+
+// ── Cierre global configurable (PnL no realizado total) ─────────────────────
+async function saveGlobalClose() {
+  const input = q('globalCloseInput');
+  const errEl = q('globalCloseError');
+  const btn   = q('globalCloseSave');
+  errEl.style.display = 'none';
+  const val = parseFloat(input.value);
+  if (isNaN(val) || val <= 0) {
+    errEl.textContent   = 'El valor debe ser un número positivo (ej. 40).';
+    errEl.style.display = 'block';
+    return;
+  }
+  btn.disabled    = true;
+  btn.textContent = '…';
+  try {
+    const resp = await fetch('/api/set-global-close', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ pnl_usd: val }),
+      cache:   'no-store',
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      errEl.textContent   = data.error || `Error HTTP ${resp.status}`;
+      errEl.style.display = 'block';
     }
+  } catch (err) {
+    errEl.textContent   = `Error de red: ${err.message}`;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = 'Guardar';
+  }
+}
+
+// ── Cierre manual de posición ────────────────────────────────────────────────
+async function closePosition(symbol, btn) {
+  if (!confirm(`¿Cerrar posición ${symbol} al precio actual de mercado?\n\nEsta acción es irreversible.`)) return;
+  btn.disabled    = true;
+  btn.textContent = '…';
+  try {
+    const resp = await fetch(`/api/close/${symbol}`, { method: 'POST', cache: 'no-store' });
+    const data = await resp.json();
+    if (data.ok) {
+      btn.textContent   = '✓';
+      btn.style.background = '#14532d';
+      btn.style.color      = '#86efac';
+      // Forzar poll inmediato para actualizar la tabla
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(poll, 300);
+    } else {
+      btn.disabled    = false;
+      btn.textContent = 'Cerrar';
+      alert(`Error al cerrar ${symbol}: ${data.error || `HTTP ${resp.status}`}`);
+    }
+  } catch (err) {
+    btn.disabled    = false;
+    btn.textContent = 'Cerrar';
+    alert(`Error de red al cerrar ${symbol}: ${err.message}`);
   }
 }
 
@@ -2172,48 +2645,128 @@ window.addEventListener('beforeunload', () => { if (pollTimer) clearTimeout(poll
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RUTAS FLASK
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def index():
+    resp = make_response(render_template_string(HTML))
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
+@app.get("/api/status")
+def api_status():
+    resp = jsonify(bot.snapshot())
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
-@app .get ("/")
-def index ():
-    resp =make_response (render_template_string (HTML ))
-    resp .headers ["Cache-Control"]="no-store, max-age=0"
-    return resp 
+@app.post("/api/close/<symbol>")
+def api_close(symbol: str):
+    """Cierre manual de una posición abierta."""
+    symbol = symbol.upper().strip()
+    if not bot.loop or not bot.loop.is_running():
+        return jsonify({"ok": False, "error": "Bot loop no está activo"}), 503
+    future = asyncio.run_coroutine_threadsafe(
+        bot.close_position_manual(symbol), bot.loop
+    )
+    try:
+        ok = future.result(timeout=15)
+    except concurrent.futures.TimeoutError:
+        # La tarea sigue corriendo en el loop del bot; no la cancelamos para
+        # no dejar el cierre a medias, pero avisamos con un mensaje claro.
+        return jsonify({
+            "ok": False,
+            "error": "Tiempo de espera agotado cerrando posición (el cierre puede completarse en segundo plano, revisa en unos segundos)",
+        }), 504
+    except Exception as exc:
+        msg = str(exc).strip() or f"{type(exc).__name__} (timeout esperando respuesta del exchange)"
+        return jsonify({"ok": False, "error": msg}), 500
+    if ok:
+        return jsonify({"ok": True, "symbol": symbol, "msg": "Posición cerrada manualmente"})
+    return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o ya cerrada"}), 404
 
 
-@app .get ("/api/status")
-def api_status ():
-    resp =jsonify (bot .snapshot ())
-    resp .headers ["Cache-Control"]="no-store, max-age=0"
-    return resp 
+@app.post("/api/set-sl/<symbol>")
+def api_set_sl(symbol: str):
+    """Establece el stop loss (en USD, valor negativo) de una posición abierta."""
+    symbol = symbol.upper().strip()
+    data = request.get_json(silent=True) or {}
+    try:
+        sl_usd = float(data.get("sl_usd"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "sl_usd inválido"}), 400
+    if sl_usd >= 0:
+        return jsonify({"ok": False, "error": "sl_usd debe ser un valor negativo (pérdida)"}), 400
+    ok = bot.set_stop_loss(symbol, sl_usd)
+    if ok:
+        return jsonify({"ok": True, "symbol": symbol, "sl_usd": sl_usd})
+    return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o cerrada"}), 404
 
 
-@app .post ("/api/manual-close/<symbol>")
-def api_manual_close (symbol ):
-    result =bot .request_manual_close (symbol )
-    resp =jsonify (result )
-    resp .headers ["Cache-Control"]="no-store, max-age=0"
-    return resp 
+@app.post("/api/set-global-close")
+def api_set_global_close():
+    """Configura el umbral de cierre global (PnL no realizado agregado, USD)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        pnl_usd = float(data.get("pnl_usd"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "pnl_usd inválido"}), 400
+    if pnl_usd <= 0:
+        return jsonify({"ok": False, "error": "pnl_usd debe ser un valor positivo"}), 400
+    bot.set_global_close(pnl_usd)
+    return jsonify({"ok": True, "pnl_usd": pnl_usd})
 
 
-@app .get ("/health")
-def health ():
-    snap =bot .snapshot ()
-    return jsonify ({
-    "ok":True ,
-    "running":bot .running ,
-    "mode":snap ["mode"],
-    "scan_count":snap ["scan_count"],
-    "filter_cycle_count":snap ["filter_cycle_count"],
-    "all_symbols_count":snap ["all_symbols_count"],
-    "subscribed_count":snap ["subscribed_count"],
-    "last_error":snap ["last_error"],
-    "cooldown_count":snap ["cooldown_count"],
+@app.post("/api/force-close/<symbol>")
+def api_force_close(symbol: str):
+    """Cierre de EMERGENCIA: ignora el guard anti-doble-cierre y libera el
+    símbolo aunque haya quedado 'pegado' en _closing_symbols por un timeout
+    o deadlock previo. Úsalo solo si /api/close se queda atascado."""
+    symbol = symbol.upper().strip()
+    if not bot.loop or not bot.loop.is_running():
+        return jsonify({"ok": False, "error": "Bot loop no está activo"}), 503
+
+    # 1) liberar el guard sin esperar a que la tarea vieja termine
+    with bot.lock:
+        bot._closing_symbols.discard(symbol)
+
+    future = asyncio.run_coroutine_threadsafe(
+        bot.close_position_manual(symbol), bot.loop
+    )
+    try:
+        ok = future.result(timeout=20)
+    except concurrent.futures.TimeoutError:
+        return jsonify({
+            "ok": False,
+            "error": "Tiempo de espera agotado en cierre forzado (revisa /api/status en unos segundos)",
+        }), 504
+    except Exception as exc:
+        msg = str(exc).strip() or f"{type(exc).__name__} (timeout esperando respuesta del exchange)"
+        return jsonify({"ok": False, "error": msg}), 500
+    if ok:
+        return jsonify({"ok": True, "symbol": symbol, "msg": "Posición cerrada (forzado)"})
+    return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o ya cerrada"}), 404
+
+
+@app.get("/health")
+def health():
+    snap = bot.snapshot()
+    return jsonify({
+        "ok":                  True,
+        "running":             bot.running,
+        "mode":                snap["mode"],
+        "scan_count":          snap["scan_count"],
+        "filter_cycle_count":  snap["filter_cycle_count"],
+        "all_symbols_count":   snap["all_symbols_count"],
+        "subscribed_count":    snap["subscribed_count"],
+        "last_error":          snap["last_error"],
+        "cooldown_count":      snap["cooldown_count"],
     })
 
 
-if __name__ =="__main__":
-    port =int (os .getenv ("PORT","8000"))
-    app .run (host ="0.0.0.0",port =port ,threaded =True )
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
