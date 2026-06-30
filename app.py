@@ -221,12 +221,12 @@ ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 
-# Stop loss por defecto: en vez de un valor fijo en USD, se calcula como una
-# fracción del notional ACTUAL de cada posición (se reactualiza automáticamente
-# cada vez que se añade un nuevo fill / nivel a la posición). Si el usuario lo
+# Stop loss por defecto: en vez de un valor fijo en USD, se calcula como
+# -(notional ACTUAL de la posición * TAKE_PROFIT_FRACTION) — el mismo factor
+# 0.14284 que antes se usaba para el TP — y se reactualiza automáticamente
+# cada vez que se añade un nuevo fill / nivel a la posición. Si el usuario lo
 # sobreescribe manualmente desde el dashboard (POST /api/set-sl/<symbol>), deja
 # de autoactualizarse para esa posición concreta.
-DEFAULT_STOP_LOSS_FRACTION = float(os.getenv("DEFAULT_STOP_LOSS_FRACTION", "0.99"))  # 20% del notional
 # Valor de respaldo (legacy) usado solo si por algún motivo no hay notional aún.
 DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
 
@@ -238,7 +238,7 @@ DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
 DEFAULT_GLOBAL_CLOSE_PNL_USD = float(os.getenv("GLOBAL_CLOSE_PNL_USD", "40.0"))
 
 # ── Executor externo ──────────────────────────────────────────────────────────
-EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executorlong.onrender.com/")
+EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 
 
@@ -263,10 +263,11 @@ class BotPosition:
     status:       str   = "OPEN"
     trade_id:     int   = 0
     # Stop loss configurable en USD (pérdida absoluta, valor negativo).
-    # Por defecto se calcula como -(notional * DEFAULT_STOP_LOSS_FRACTION) y se
-    # reactualiza automáticamente cada vez que crece el notional (nuevo nivel),
-    # salvo que el usuario lo haya fijado manualmente desde el dashboard
-    # (sl_manual=True), en cuyo caso deja de autoactualizarse.
+    # Por defecto se calcula como -(notional * TAKE_PROFIT_FRACTION), es decir
+    # el mismo factor 0.14284 que antes se usaba para el TP, y se reactualiza
+    # automáticamente cada vez que crece el notional (nuevo nivel), salvo que
+    # el usuario lo haya fijado manualmente desde el dashboard (sl_manual=True),
+    # en cuyo caso deja de autoactualizarse.
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
     sl_manual:    bool  = False
 
@@ -291,13 +292,13 @@ class BotPosition:
         return sum((mark_price - f.entry_price) * f.qty for f in self.fills)
 
     def refresh_default_sl(self) -> None:
-        """Recalcula sl_usd en función del notional actual, solo si no fue
-        fijado manualmente por el usuario desde el dashboard."""
+        """Recalcula sl_usd en función del notional actual (factor 0.14284),
+        solo si no fue fijado manualmente por el usuario desde el dashboard."""
         if self.sl_manual:
             return
         notional = self.notional
         if notional > 0:
-            self.sl_usd = -(notional * DEFAULT_STOP_LOSS_FRACTION)
+            self.sl_usd = -(notional * TAKE_PROFIT_FRACTION)
 
     def opened_levels(self) -> set:
         return {f.level for f in self.fills}
@@ -1302,7 +1303,9 @@ class TradingBot:
             if not pos or pos.status != "OPEN" or not pos.fills:
                 return
             pnl    = pos.unrealized_pnl(price)
-            target = pos.notional * TAKE_PROFIT_FRACTION
+            # TP = notional ACTUAL abierto en la posición (se recalcula en vivo
+            # según vayan entrando más niveles).
+            target = pos.notional
 
         if pnl < target:
             return  # Caso normal: sin TP todavía, sin tocar el guard
@@ -1318,7 +1321,7 @@ class TradingBot:
                 if not pos or pos.status != "OPEN" or not pos.fills:
                     return
                 pnl      = pos.unrealized_pnl(price)
-                target   = pos.notional * TAKE_PROFIT_FRACTION
+                target   = pos.notional
                 if pnl < target:
                     return
                 qty      = pos.qty
@@ -1435,7 +1438,7 @@ class TradingBot:
                     self.closed_trades.insert(0, {
                         "symbol":      symbol,
                         "pnl":         pnl,
-                        "target":      notional * TAKE_PROFIT_FRACTION,
+                        "target":      notional,  # TP = notional actual de la posición
                         "qty":         qty,
                         "avg_entry":   avg_ent,
                         "close_price": price,
@@ -1526,7 +1529,7 @@ class TradingBot:
                     self.closed_trades.insert(0, {
                         "symbol":      symbol,
                         "pnl":         pnl,
-                        "target":      notional * TAKE_PROFIT_FRACTION,
+                        "target":      notional,  # TP = notional actual de la posición
                         "qty":         qty,
                         "avg_entry":   avg_ent,
                         "close_price": price,
@@ -1673,7 +1676,7 @@ class TradingBot:
                 "avg_entry":      pos.avg_entry,
                 "qty":            pos.qty,
                 "notional":       pos.notional,
-                "target":         pos.notional * TAKE_PROFIT_FRACTION,
+                "target":         pos.notional,
                 "unrealized_pnl": pnl,
                 "stop_loss_price": sl_price,
                 "stop_loss_usd":   pos.sl_usd,
@@ -1745,9 +1748,9 @@ class TradingBot:
             "exchange_symbols":  self.exchange_symbols,
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
-            "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
+            "take_profit_pct":   100.0,  # TP = 100% del notional actual de la posición
             "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
-            "default_stop_loss_fraction_pct": DEFAULT_STOP_LOSS_FRACTION * 100,
+            "default_stop_loss_fraction_pct": TAKE_PROFIT_FRACTION * 100,  # SL auto = notional * 0.14284
             "global_close_pnl_usd": global_close_pnl,
             "total_unrealized":   total_unreal,
             "total_realized_pnl": total_realized_pnl,
@@ -1987,7 +1990,7 @@ HTML = r"""<!doctype html>
   <span id="dotPoll"     title="Verde = polling REST activo"></span>
   <span id="dotFilter"   title="Púrpura = ciclo de filtrado completado"></span>
   <span id="dotWsTicker" title="Teal = ranking WS @ticker activo"></span>
-  <h1>Bot Long Ganadores · Binance USDT-M Futures</h1>
+  <h1>Bot Short Ganadores · Binance USDT-M Futures</h1>
   <span id="modeBadge" class="badge badge-yellow">—</span>
   <span class="badge badge-green">markPrice WS en tiempo real</span>
   <span class="badge badge-teal">Ranking 24h WS @ticker</span>
