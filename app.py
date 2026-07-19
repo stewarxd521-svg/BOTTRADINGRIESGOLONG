@@ -218,7 +218,7 @@ WS_STOP_GRACE        = float(os.getenv("WS_STOP_GRACE", "0.8"))
 MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
 
 ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "-25,-50,-80").split(",")]
-ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,").split(",")]
+ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 STOP_LOSS_FRACTION   = float(os.getenv("STOP_LOSS_FRACTION",   "1.0"))
 
