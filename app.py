@@ -195,7 +195,7 @@ SYMBOL_REFRESH_HOURS = int(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
 # ── Ciclo de filtrado ─────────────────────────────────────────────────────────
 # Cada FILTER_CYCLE_SECS: suscribir todos → esperar ticker → filtrar → desuscribir resto
 FILTER_CYCLE_SECS        = int(os.getenv("FILTER_CYCLE_SECS",        "300"))  # 5 min
-MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "20"))  # >=15% para quedar suscrito
+MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "-15"))  # <=-15% para quedar suscrito (perdedores)
 FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # (legacy) espera ticker sub ALL
 
 # En vez de suscribir todos al mismo tiempo, se crean WS temporales por lote
@@ -217,16 +217,17 @@ WS_STOP_GRACE        = float(os.getenv("WS_STOP_GRACE", "0.8"))
 # Precio máximo permitido para abrir nuevas entradas (bloqueo permanente si supera)
 MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
 
-ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150,200,250").split(",")]
-ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
+ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "-25,-50,-80").split(",")]
+ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
+STOP_LOSS_FRACTION   = float(os.getenv("STOP_LOSS_FRACTION",   "1.0"))
 
 # Stop loss por defecto: en vez de un valor fijo en USD, se calcula como
-# -(notional ACTUAL de la posición * TAKE_PROFIT_FRACTION) — el mismo factor
-# 0.14284 que antes se usaba para el TP — y se reactualiza automáticamente
-# cada vez que se añade un nuevo fill / nivel a la posición. Si el usuario lo
-# sobreescribe manualmente desde el dashboard (POST /api/set-sl/<symbol>), deja
-# de autoactualizarse para esa posición concreta.
+# -(notional ACTUAL de la posición * STOP_LOSS_FRACTION) y se reactualiza
+# automáticamente cada vez que se añade un nuevo fill / nivel a la posición.
+# El Take Profit usa TAKE_PROFIT_FRACTION (0.14284 = 14.284% del notional).
+# Si el usuario sobreescribe el SL manualmente desde el dashboard
+# (POST /api/set-sl/<symbol>), deja de autoactualizarse para esa posición.
 # Valor de respaldo (legacy) usado solo si por algún motivo no hay notional aún.
 DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
 
@@ -261,11 +262,10 @@ class BotPosition:
     status:       str   = "OPEN"
     trade_id:     int   = 0
     # Stop loss configurable en USD (pérdida absoluta, valor negativo).
-    # Por defecto se calcula como -(notional * TAKE_PROFIT_FRACTION), es decir
-    # el mismo factor 0.14284 que antes se usaba para el TP, y se reactualiza
-    # automáticamente cada vez que crece el notional (nuevo nivel), salvo que
-    # el usuario lo haya fijado manualmente desde el dashboard (sl_manual=True),
-    # en cuyo caso deja de autoactualizarse.
+    # Por defecto se calcula como -(notional * STOP_LOSS_FRACTION) y se
+    # reactualiza automáticamente cada vez que crece el notional (nuevo
+    # nivel), salvo que el usuario lo haya fijado manualmente desde el
+    # dashboard (sl_manual=True), en cuyo caso deja de autoactualizarse.
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
     sl_manual:    bool  = False
 
@@ -290,13 +290,13 @@ class BotPosition:
         return sum((mark_price - f.entry_price) * f.qty for f in self.fills)
 
     def refresh_default_sl(self) -> None:
-        """Recalcula sl_usd en función del notional actual (factor 0.14284),
+        """Recalcula sl_usd en función del notional actual (STOP_LOSS_FRACTION),
         solo si no fue fijado manualmente por el usuario desde el dashboard."""
         if self.sl_manual:
             return
         notional = self.notional
         if notional > 0:
-            self.sl_usd = -(notional * TAKE_PROFIT_FRACTION)
+            self.sl_usd = -(notional * STOP_LOSS_FRACTION)
 
     def opened_levels(self) -> set:
         return {f.level for f in self.fills}
@@ -811,7 +811,7 @@ class TradingBot:
             Pausa   — FILTER_BATCH_PAUSE segundos antes del siguiente lote.
 
           Cuando todos los lotes están procesados:
-            Fase 4 — Filtrar: change >= MIN_GAIN_FILTER (15%) OR posición abierta.
+            Fase 4 — Filtrar: change <= MIN_GAIN_FILTER (-15%) OR posición abierta.
             Fase 5 — Iniciar WS permanente + klines SOLO con los filtrados.
             Fase 6 — Actualizar self.winners y métricas.
 
@@ -914,8 +914,8 @@ class TradingBot:
                     change = ticker.get("change_pct", 0.0)
                     price  = ticker.get("last_price",  0.0)
 
-                # Criterio: cambio >= umbral O posición abierta
-                if change >= MIN_GAIN_FILTER or in_open:
+                # Criterio: cambio <= umbral (perdedor) O posición abierta
+                if change <= MIN_GAIN_FILTER or in_open:
                     if price > 0 or in_open:  # evitar entradas sin precio real
                         filtered_entries.append({
                             "symbol":    sym,
@@ -925,12 +925,12 @@ class TradingBot:
                             "can_short": True,
                         })
 
-            # Ordenar de mayor a menor cambio
-            filtered_entries.sort(key=lambda x: x["change"], reverse=True)
+            # Ordenar de menor a mayor cambio (los que más caen primero)
+            filtered_entries.sort(key=lambda x: x["change"])
             filtered_symbols = [e["symbol"] for e in filtered_entries]
 
             n_filtered = len(filtered_entries)
-            n_by_gain  = sum(1 for e in filtered_entries if e["change"] >= MIN_GAIN_FILTER)
+            n_by_gain  = sum(1 for e in filtered_entries if e["change"] <= MIN_GAIN_FILTER)
             n_by_pos   = len(open_syms)
             top_info   = (
                 f"{filtered_entries[0]['symbol']} {filtered_entries[0]['change']:.1f}%"
@@ -940,7 +940,7 @@ class TradingBot:
             self.log(
                 f"[filter_cycle] {tickers_received}/{n_total} tickers recibidos | "
                 f"{n_filtered} clasificados: "
-                f">={MIN_GAIN_FILTER:.0f}%={n_by_gain}, posiciones={n_by_pos} | "
+                f"<={MIN_GAIN_FILTER:.0f}%={n_by_gain}, posiciones={n_by_pos} | "
                 f"top={top_info}"
             )
 
@@ -1021,7 +1021,7 @@ class TradingBot:
                                     new_winners.append(dict(w))
 
                             if ws_updated:
-                                new_winners.sort(key=lambda x: x["change"], reverse=True)
+                                new_winners.sort(key=lambda x: x["change"])
                                 self.winners              = new_winners
                                 self.last_ws_ticker_at    = time.time()
                                 self.ws_ticker_update_count += 1
@@ -1116,7 +1116,7 @@ class TradingBot:
                     kline_ok = self._kline_entry_ok(symbol)
 
                     for level, notional in zip(ENTRY_LEVELS, ENTRY_NOTIONALS):
-                        if change >= level and kline_ok:
+                        if change <= level and kline_ok:
                             await self._ensure_long(symbol, level, notional, price, change)
 
                     await self._maybe_stop_loss(symbol, price)
@@ -1146,10 +1146,10 @@ class TradingBot:
                     }
                     n_cool = len(self.symbol_cooldown)
 
-                n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
+                n_high = sum(1 for w in winners if w["change"] <= ENTRY_LEVELS[0])
                 self.log(
                     f"Escan #{self.scan_count}: {len(winners)} activos | "
-                    f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
+                    f"<={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
                     f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
                 )
                 self.persist_state()
@@ -1301,9 +1301,10 @@ class TradingBot:
             if not pos or pos.status != "OPEN" or not pos.fills:
                 return
             pnl    = pos.unrealized_pnl(price)
-            # TP = notional ACTUAL abierto en la posición (se recalcula en vivo
-            # según vayan entrando más niveles).
-            target = pos.notional
+            # TP = fracción configurada (TAKE_PROFIT_FRACTION) del notional
+            # ACTUAL abierto en la posición (se recalcula en vivo según vayan
+            # entrando más niveles).
+            target = pos.notional * TAKE_PROFIT_FRACTION
 
         if pnl < target:
             return  # Caso normal: sin TP todavía, sin tocar el guard
@@ -1319,7 +1320,7 @@ class TradingBot:
                 if not pos or pos.status != "OPEN" or not pos.fills:
                     return
                 pnl      = pos.unrealized_pnl(price)
-                target   = pos.notional
+                target   = pos.notional * TAKE_PROFIT_FRACTION
                 if pnl < target:
                     return
                 qty      = pos.qty
@@ -1746,9 +1747,9 @@ class TradingBot:
             "exchange_symbols":  self.exchange_symbols,
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
-            "take_profit_pct":   100.0,  # TP = 100% del notional actual de la posición
+            "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,  # TP = 14.284% del notional actual
             "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
-            "default_stop_loss_fraction_pct": TAKE_PROFIT_FRACTION * 100,  # SL auto = notional * 0.14284
+            "default_stop_loss_fraction_pct": STOP_LOSS_FRACTION * 100,  # SL auto = notional * 100%
             "global_close_pnl_usd": global_close_pnl,
             "total_unrealized":   total_unreal,
             "total_realized_pnl": total_realized_pnl,
@@ -1894,7 +1895,7 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bot Long Ganadores · Binance Futures</title>
+  <title>Bot Long Perdedores · Binance Futures</title>
   <style>
     :root {
       --bg: #0f172a; --card: #111827; --border: #334155;
@@ -1988,7 +1989,7 @@ HTML = r"""<!doctype html>
   <span id="dotPoll"     title="Verde = polling REST activo"></span>
   <span id="dotFilter"   title="Púrpura = ciclo de filtrado completado"></span>
   <span id="dotWsTicker" title="Teal = ranking WS @ticker activo"></span>
-  <h1>Bot Short Ganadores · Binance USDT-M Futures</h1>
+  <h1>Bot Short Perdedores · Binance USDT-M Futures</h1>
   <span id="modeBadge" class="badge badge-yellow">—</span>
   <span class="badge badge-green">markPrice WS en tiempo real</span>
   <span class="badge badge-teal">Ranking 24h WS @ticker</span>
@@ -2118,7 +2119,7 @@ HTML = r"""<!doctype html>
   <!-- Ganadores -->
   <section>
     <h2>
-      <span id="winnerCount">0</span> símbolos activos (≥<span id="gainThreshold">15</span>% · 24h WS)
+      <span id="winnerCount">0</span> símbolos activos (≤<span id="gainThreshold">-15</span>% · 24h WS)
       <span style="color:var(--muted);font-weight:400;font-size:13px">
         · Filtrado cada 5 min: sub ALL → mantener ≥15% o posición abierta
         &nbsp;|&nbsp; 🟠 = cooldown
@@ -2304,7 +2305,7 @@ function render(d) {
   // Filter bar info
   const subCount  = n(d.subscribed_count);
   const allCount  = n(d.all_symbols_count);
-  const threshold = n(d.min_gain_filter || 15);
+  const threshold = n(d.min_gain_filter ?? -15);
   q('fbAll').textContent       = allCount;
   q('fbWait').textContent      = n(d.full_subscribe_wait || 30);
   q('fbFiltered').textContent  = subCount;
@@ -2398,16 +2399,16 @@ function render(d) {
     </tr>`;
   }), 'Sin posiciones abiertas', 10);
 
-  // ── Ganadores (símbolos activos ≥15%) ────────────────────────────────────
+  // ── Perdedores (símbolos activos ≤-15%) ───────────────────────────────────
   const winners     = Array.isArray(d.winners) ? d.winners : [];
-  const entryLevels = Array.isArray(d.entry_levels) ? d.entry_levels : [50];
+  const entryLevels = Array.isArray(d.entry_levels) ? d.entry_levels : [-25];
   q('winnerCount').textContent = winners.length;
 
   q('tbWinners').innerHTML = tb(winners.map(w => {
     const change     = n(w.change);
     const cdSecs     = n(w.cooldown_remaining);
     const inCooldown = cdSecs > 0;
-    const canTrade   = change >= entryLevels[0] && !inCooldown;
+    const canTrade   = change <= entryLevels[0] && !inCooldown;
     const rowCls     = inCooldown ? 'in-cooldown' : (canTrade ? 'can-trade' : '');
 
     if (inCooldown && !_cdData[w.symbol]) {
