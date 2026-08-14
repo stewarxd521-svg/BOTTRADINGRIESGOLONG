@@ -220,7 +220,7 @@ MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
 ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "-25,-50,-80").split(",")]
 ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10").split(",")]
 TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.1428"))
-STOP_LOSS_FRACTION   = float(os.getenv("STOP_LOSS_FRACTION",   "1.0"))
+STOP_LOSS_FRACTION   = float(os.getenv("STOP_LOSS_FRACTION",   "0.1428"))
 
 # Stop loss por defecto: en vez de un valor fijo en USD, se calcula como
 # -(notional ACTUAL de la posición * STOP_LOSS_FRACTION) y se reactualiza
@@ -229,7 +229,7 @@ STOP_LOSS_FRACTION   = float(os.getenv("STOP_LOSS_FRACTION",   "1.0"))
 # Si el usuario sobreescribe el SL manualmente desde el dashboard
 # (POST /api/set-sl/<symbol>), deja de autoactualizarse para esa posición.
 # Valor de respaldo (legacy) usado solo si por algún motivo no hay notional aún.
-DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
+DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-3"))
 
 # Cierre global por PnL no realizado acumulado (USD).
 # el dashboard web (POST /api/set-global-close); el valor de aquí es solo el
