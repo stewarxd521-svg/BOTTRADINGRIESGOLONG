@@ -181,7 +181,7 @@ LIVE_TRADING  = os.getenv("LIVE_TRADING", "false").lower() == "true"
 API_KEY       = os.getenv("BINANCE_API_KEY",    "")
 API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
 LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
-STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botlong_state.json"))
+STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
 INITIAL_SYMBOLS = [ s.strip() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip() ]
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
@@ -268,6 +268,10 @@ class BotPosition:
     # dashboard (sl_manual=True), en cuyo caso deja de autoactualizarse.
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
     sl_manual:    bool  = False
+    # Máxima excursión a favor (MFE) y en contra (MAE) del PnL no realizado
+    # a lo largo de la vida de la posición, medidas en USD desde breakeven (0.0).
+    mfe:          float = 0.0
+    mae:          float = 0.0
 
     @property
     def qty(self) -> float:
@@ -284,10 +288,22 @@ class BotPosition:
         return sum(f.entry_price * f.qty for f in self.fills) / self.qty
 
     def unrealized_pnl(self, mark_price: float) -> float:
-        # LONG: se gana cuando el precio sube por encima del precio de entrada.
+        # SHORT: se gana cuando el precio cae por debajo del precio de entrada.
         if mark_price <= 0:
             return 0.0
-        return sum((mark_price - f.entry_price) * f.qty for f in self.fills)
+        return sum((f.entry_price - mark_price) * f.qty for f in self.fills)
+
+    def update_excursion(self, mark_price: float) -> None:
+        """Actualiza el máximo a favor (MFE) y el máximo en contra (MAE)
+        alcanzados por el PnL no realizado de esta posición. Se llama en cada
+        tick de precio mientras la posición está abierta."""
+        if mark_price <= 0:
+            return
+        pnl = self.unrealized_pnl(mark_price)
+        if pnl > self.mfe:
+            self.mfe = pnl
+        if pnl < self.mae:
+            self.mae = pnl
 
     def refresh_default_sl(self) -> None:
         """Recalcula sl_usd en función del notional actual (STOP_LOSS_FRACTION),
@@ -324,7 +340,7 @@ class BinanceFuturesClient:
                       params: Optional[dict] = None, signed: bool = False,
                       timeout: int = 15) -> Any:
         params  = dict(params or {})
-        headers = {"User-Agent": "BOTLONG/2.0"}
+        headers = {"User-Agent": "BOTSHORT/2.0"}
         if signed:
             if not API_KEY or not API_SECRET:
                 raise RuntimeError("Faltan BINANCE_API_KEY / BINANCE_API_SECRET")
@@ -379,7 +395,8 @@ class BinanceFuturesClient:
                 {"symbol": symbol, "leverage": LEVERAGE}, signed=True
             )
 
-    async def market_long(self, symbol: str, notional: float, price: float) -> float:
+    async def market_short(self, symbol: str, notional: float, price: float) -> float:
+        """Abre (o amplía) una posición SHORT: vende a mercado sin reduceOnly."""
         min_notional = self.exchange_filters.get(symbol, {}).get("minNotional", 5.0)
         effective    = max(notional, min_notional)
         qty          = self.normalize_qty(symbol, effective / price)
@@ -389,17 +406,18 @@ class BinanceFuturesClient:
             return qty
         await self.set_leverage(symbol)
         await self.request("POST", "/fapi/v1/order",
-            {"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": qty},
+            {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": qty},
             signed=True)
         return qty
 
-    async def close_long(self, symbol: str, qty: float) -> None:
+    async def close_short(self, symbol: str, qty: float) -> None:
+        """Cierra una posición SHORT: compra a mercado con reduceOnly."""
         qty = self.normalize_qty(symbol, qty)
         if qty <= 0 or PAPER_MODE or not LIVE_TRADING:
             return
         # Timeout 10 s: debe completarse antes del timeout de Flask (30 s)
         await self.request("POST", "/fapi/v1/order",
-            {"symbol": symbol, "side": "SELL", "type": "MARKET",
+            {"symbol": symbol, "side": "BUY", "type": "MARKET",
              "quantity": qty, "reduceOnly": "true"},
             signed=True, timeout=10)
 
@@ -1042,7 +1060,8 @@ class TradingBot:
     # ── Condición kline ───────────────────────────────────────────────────────
 
     def _kline_entry_ok(self, symbol: str) -> bool:
-        """True si la última vela 1m cerrada es alcista (o sin datos)."""
+        """True si la última vela 1m cerrada es bajista (o sin datos): confirma
+        continuidad de la caída antes de abrir/ampliar un SHORT."""
         if not self.kline_cache:
             return True
         try:
@@ -1050,7 +1069,7 @@ class TradingBot:
             if df.empty or len(df) < 2:
                 return True
             last = df.iloc[-1]
-            return float(last["close"]) >= float(last["open"])
+            return float(last["close"]) <= float(last["open"])
         except Exception:
             return True
 
@@ -1117,7 +1136,7 @@ class TradingBot:
 
                     for level, notional in zip(ENTRY_LEVELS, ENTRY_NOTIONALS):
                         if change <= level and kline_ok:
-                            await self._ensure_long(symbol, level, notional, price, change)
+                            await self._ensure_short(symbol, level, notional, price, change)
 
                     await self._maybe_stop_loss(symbol, price)
                     await self._maybe_take_profit(symbol, price)
@@ -1185,6 +1204,7 @@ class TradingBot:
                     for symbol in pos_syms:
                         price = all_prices.get(symbol)
                         if price and price > 0:
+                            self._track_excursion(symbol, price)
                             await self._maybe_stop_loss(symbol, price)
                             await self._maybe_take_profit(symbol, price)
                         # Ceder el event loop en cada símbolo para no bloquearlo
@@ -1237,8 +1257,18 @@ class TradingBot:
 
     # ── Estrategia ────────────────────────────────────────────────────────────
 
-    async def _ensure_long(self, symbol: str, level: float, notional: float,
-                            price: float, change: float) -> None:
+    def _track_excursion(self, symbol: str, price: float) -> None:
+        """Registra la máxima excursión a favor (MFE) y en contra (MAE) del
+        PnL no realizado de la posición abierta en `symbol`, según el precio
+        actual. Se llama en cada tick de precio (ver _realtime_price_loop)."""
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return
+            pos.update_excursion(price)
+
+    async def _ensure_short(self, symbol: str, level: float, notional: float,
+                             price: float, change: float) -> None:
 
         should_log = False
         with self.lock:
@@ -1264,7 +1294,7 @@ class TradingBot:
             if should_log:
                self.log(f"BLOQUEADO permanente {symbol}: precio {price:.4f} > {MAX_PRICE_BLOCK} USD")
                should_log = False
-            qty  = await self.client.market_long(symbol, notional, price)
+            qty  = await self.client.market_short(symbol, notional, price)
             fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
             with self.lock:
                 self.positions[symbol].fills.append(fill)
@@ -1274,7 +1304,7 @@ class TradingBot:
                 self.positions[symbol].refresh_default_sl()
                 new_sl = self.positions[symbol].sl_usd
             self.log(
-                f"LONG {symbol}: nivel {level:.0f}% | {notional:.2f} USDT | "
+                f"SHORT {symbol}: nivel {level:.0f}% | {notional:.2f} USDT | "
                 f"qty={qty} | px={price:.6f} | cambio(WS)={change:.2f}% | "
                 f"trade_id={trade_id} | SL auto={new_sl:.4f}"
             )
@@ -1282,7 +1312,7 @@ class TradingBot:
             self.executor.notify_open(
                 trade_id=trade_id,
                 symbol=symbol,
-                direction="LONG",
+                direction="SHORT",
                 price=price,
                 quantity=qty,
                 notional=notional,
@@ -1291,7 +1321,7 @@ class TradingBot:
             self.persist_state()
         except Exception as exc:
             self.last_error = str(exc)
-            self.log(f"Error abriendo long {symbol} nivel {level}: {exc}")
+            self.log(f"Error abriendo short {symbol} nivel {level}: {exc}")
 
     async def _maybe_take_profit(self, symbol: str, price: float) -> None:
         # ── Pre-verificación sin guard (caso más común: TP no alcanzado) ──────
@@ -1319,6 +1349,7 @@ class TradingBot:
                 pos = self.positions.get(symbol)
                 if not pos or pos.status != "OPEN" or not pos.fills:
                     return
+                pos.update_excursion(price)
                 pnl      = pos.unrealized_pnl(price)
                 target   = pos.notional * TAKE_PROFIT_FRACTION
                 if pnl < target:
@@ -1329,10 +1360,10 @@ class TradingBot:
                 trade_id = pos.trade_id
 
             try:
-                await self.client.close_long(symbol, qty)
+                await self.client.close_short(symbol, qty)
             except Exception as exc:
                 self.last_error = str(exc)
-                self.log(f"Error cerrando long {symbol}: {exc}")
+                self.log(f"Error cerrando short {symbol}: {exc}")
                 return
 
             unblock_str = ""
@@ -1353,6 +1384,8 @@ class TradingBot:
                         "symbol":      symbol,
                         "pnl":         pnl,
                         "target":      target,
+                        "mae":         pos.mae,
+                        "mfe":         pos.mfe,
                         "qty":         qty,
                         "avg_entry":   avg_ent,
                         "close_price": price,
@@ -1366,7 +1399,7 @@ class TradingBot:
             self.executor.notify_close(
                 trade_id=trade_id,
                 symbol=symbol,
-                direction="LONG",
+                direction="SHORT",
                 reason="TP",
                 close_price=price,
                 pnl=pnl,
@@ -1404,6 +1437,7 @@ class TradingBot:
                 pos = self.positions.get(symbol)
                 if not pos or pos.status != "OPEN" or not pos.fills:
                     return
+                pos.update_excursion(price)
                 pnl      = pos.unrealized_pnl(price)
                 notional = pos.notional
                 sl_usd   = pos.sl_usd
@@ -1414,7 +1448,7 @@ class TradingBot:
                 trade_id = pos.trade_id
 
             try:
-                await self.client.close_long(symbol, qty)
+                await self.client.close_short(symbol, qty)
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log(f"Error cerrando STOP LOSS {symbol}: {exc}")
@@ -1437,7 +1471,9 @@ class TradingBot:
                     self.closed_trades.insert(0, {
                         "symbol":      symbol,
                         "pnl":         pnl,
-                        "target":      notional,  # TP = notional actual de la posición
+                        "target":      notional * TAKE_PROFIT_FRACTION,  # Objetivo TP de la posición
+                        "mae":         pos.mae,
+                        "mfe":         pos.mfe,
                         "qty":         qty,
                         "avg_entry":   avg_ent,
                         "close_price": price,
@@ -1451,7 +1487,7 @@ class TradingBot:
             self.executor.notify_close(
                 trade_id=trade_id,
                 symbol=symbol,
-                direction="LONG",
+                direction="SHORT",
                 reason="SL",
                 close_price=price,
                 pnl=pnl,
@@ -1503,7 +1539,7 @@ class TradingBot:
                 pass
 
             try:
-                await self.client.close_long(symbol, qty)
+                await self.client.close_short(symbol, qty)
             except Exception as exc:
                 self.last_error = str(exc)
                 self.log(f"Error en cierre manual {symbol}: {exc}")
@@ -1514,6 +1550,8 @@ class TradingBot:
             with self.lock:
                 pos = self.positions.pop(symbol, None)
                 if pos:
+                    if price > 0:
+                        pos.update_excursion(price)
                     pnl = pos.unrealized_pnl(price) if price > 0 else 0.0
                     pos.status       = "CLOSED"
                     pos.realized_pnl = pnl
@@ -1528,7 +1566,9 @@ class TradingBot:
                     self.closed_trades.insert(0, {
                         "symbol":      symbol,
                         "pnl":         pnl,
-                        "target":      notional,  # TP = notional actual de la posición
+                        "target":      notional * TAKE_PROFIT_FRACTION,  # Objetivo TP de la posición
+                        "mae":         pos.mae,
+                        "mfe":         pos.mfe,
                         "qty":         qty,
                         "avg_entry":   avg_ent,
                         "close_price": price,
@@ -1542,7 +1582,7 @@ class TradingBot:
             self.executor.notify_close(
                 trade_id=trade_id,
                 symbol=symbol,
-                direction="LONG",
+                direction="SHORT",
                 reason=reason,
                 close_price=price,
                 pnl=pnl,
@@ -1667,16 +1707,19 @@ class TradingBot:
             total_unreal   += pnl
             total_notional += pos.notional
             # Precio al que se activa el Stop Loss configurado para esta posición
-            # LONG SL: (sl_price - avg_entry) * qty = sl_usd → sl_price = avg_entry + sl_usd/qty
-            sl_price = (pos.avg_entry + pos.sl_usd / pos.qty) if pos.qty > 0 else 0.0
+            # SHORT SL: (avg_entry - sl_price) * qty = sl_usd → sl_price = avg_entry - sl_usd/qty
+            # (sl_usd es negativo, por lo que sl_price queda por ENCIMA de avg_entry)
+            sl_price = (pos.avg_entry - pos.sl_usd / pos.qty) if pos.qty > 0 else 0.0
             open_positions.append({
                 "symbol":         symbol,
                 "mark_price":     price,
                 "avg_entry":      pos.avg_entry,
                 "qty":            pos.qty,
                 "notional":       pos.notional,
-                "target":         pos.notional,
+                "target":         pos.notional * TAKE_PROFIT_FRACTION,
                 "unrealized_pnl": pnl,
+                "mae":            pos.mae,
+                "mfe":            pos.mfe,
                 "stop_loss_price": sl_price,
                 "stop_loss_usd":   pos.sl_usd,
                 "stop_loss_manual": pos.sl_manual,
@@ -1895,7 +1938,7 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bot Long Perdedores · Binance Futures</title>
+  <title>Bot Short Perdedores · Binance Futures</title>
   <style>
     :root {
       --bg: #0f172a; --card: #111827; --border: #334155;
@@ -2107,11 +2150,12 @@ HTML = r"""<!doctype html>
       <thead><tr>
         <th>Símbolo</th><th>Cambio 24h (WS)</th><th>Entrada media</th>
         <th>Precio WS</th><th>Notional</th><th>Objetivo TP</th>
-        <th>Stop Loss (precio)</th><th>Stop Loss (USD)</th><th>PnL tiempo real</th><th>Tramos</th>
+        <th>Stop Loss (precio)</th><th>Stop Loss (USD)</th><th>PnL tiempo real</th>
+        <th>Máx. contra (MAE)</th><th>Máx. a favor (MFE)</th><th>Tramos</th>
         <th>Cerrar</th>
       </tr></thead>
       <tbody id="tbPositions">
-        <tr><td colspan="11" style="color:var(--muted)">Sin posiciones</td></tr>
+        <tr><td colspan="13" style="color:var(--muted)">Sin posiciones</td></tr>
       </tbody>
     </table>
   </section>
@@ -2147,12 +2191,13 @@ HTML = r"""<!doctype html>
     </h2>
     <table>
       <thead><tr>
-        <th>Símbolo</th><th>Motivo</th><th>PnL realizado</th><th>Objetivo TP</th>
+        <th>Símbolo</th><th>Motivo</th><th>PnL realizado</th>
+        <th>Máx. contra (MAE)</th><th>Máx. a favor (MFE)</th><th>Objetivo TP</th>
         <th>Entrada media</th><th>Precio cierre</th>
         <th>Bloqueado hasta</th><th>Fecha cierre</th>
       </tr></thead>
       <tbody id="tbClosed">
-        <tr><td colspan="8" style="color:var(--muted)">Sin cierres aún</td></tr>
+        <tr><td colspan="10" style="color:var(--muted)">Sin cierres aún</td></tr>
       </tbody>
     </table>
   </section>
@@ -2394,10 +2439,12 @@ function render(d) {
                 onclick="editStopLoss('${p.symbol}', ${slUsd}, this)">${money(slUsd)}</button>
       </td>
       <td class="${cls(pnl)}">${money(pnl)}</td>
+      <td class="${cls(n(p.mae))}">${money(n(p.mae))}</td>
+      <td class="${cls(n(p.mfe))}">${money(n(p.mfe))}</td>
       <td>${fills}</td>
       <td><button class="btn-close" onclick="closePosition('${p.symbol}', this)">Cerrar</button></td>
     </tr>`;
-  }), 'Sin posiciones abiertas', 10);
+  }), 'Sin posiciones abiertas', 13);
 
   // ── Perdedores (símbolos activos ≤-15%) ───────────────────────────────────
   const winners     = Array.isArray(d.winners) ? d.winners : [];
@@ -2432,7 +2479,7 @@ function render(d) {
       <td class="${cls(change)}" style="font-weight:600">${pct(change)}</td>
       <td>${fx(n(w.price))}</td>
       <td>${canTrade
-            ? '<span style="color:var(--green)">✓ alcista</span>'
+            ? '<span style="color:var(--green)">✓ bajista</span>'
             : '<span style="color:var(--muted)">—</span>'}</td>
       <td>${w.can_short
             ? '<span style="color:var(--green)">sí</span>'
@@ -2468,13 +2515,15 @@ function render(d) {
       <td style="font-weight:700">${t.symbol || ''}</td>
       <td>${reasonLabel(t.reason)}</td>
       <td class="${cls(pnlVal)}">${money(pnlVal)}</td>
+      <td class="${cls(n(t.mae))}">${money(n(t.mae))}</td>
+      <td class="${cls(n(t.mfe))}">${money(n(t.mfe))}</td>
       <td>${money(t.target)}</td>
       <td>${fx(t.avg_entry)}</td>
       <td>${fx(t.close_price)}</td>
       <td style="color:var(--orange)">${t.unblock_at || '—'}</td>
       <td style="color:var(--muted)">${t.closed_at || ''}</td>
     </tr>`;
-  }), 'Sin cierres aún', 8);
+  }), 'Sin cierres aún', 10);
 
   q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
 }
