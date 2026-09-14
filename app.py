@@ -204,7 +204,7 @@ FILTER_BATCH_WAIT_SECS = int(os.getenv("FILTER_BATCH_WAIT_SECS", "10"))   # segu
 FILTER_BATCH_PAUSE     = float(os.getenv("FILTER_BATCH_PAUSE",   "1.5"))  # pausa entre lotes (segundos)
 
 # ── Actualización en tiempo real del ranking (entre ciclos de filtrado) ───────
-WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "5.0"))
+WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "3.0"))
 
 # ── Resto de parámetros operativos ────────────────────────────────────────────
 SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "2"))
@@ -228,7 +228,7 @@ TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
 # sobreescribe manualmente desde el dashboard (POST /api/set-sl/<symbol>), deja
 # de autoactualizarse para esa posición concreta.
 # Valor de respaldo (legacy) usado solo si por algún motivo no hay notional aún.
-DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-5.0"))
+DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-8.0"))
 
 # Cierre global por PnL no realizado acumulado (USD).
 # el dashboard web (POST /api/set-global-close); el valor de aquí es solo el
