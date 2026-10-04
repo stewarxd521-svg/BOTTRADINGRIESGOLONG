@@ -1,7 +1,9 @@
 from __future__ import annotations
 import asyncio
 import concurrent.futures
+import csv
 import hashlib
+import io
 import hmac
 import json
 import os
@@ -23,7 +25,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from WS import SymbolWebSocketPriceCache                    # noqa: E402
+from WS import SymbolWebSocketPriceCache, _ALL_MARKET_ENABLED  # noqa: E402
 from KlineWebSocketCache_v4 import KlineWebSocketCache      # noqa: E402
 
 # ── ExecutorBridge (señales al Executor externo) ─────────────────────────────
@@ -170,6 +172,7 @@ class ExecutorBridge:
         loop.create_task(self.send_signal_async(payload))
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,63 +184,103 @@ LIVE_TRADING  = os.getenv("LIVE_TRADING", "false").lower() == "true"
 API_KEY       = os.getenv("BINANCE_API_KEY",    "")
 API_SECRET    = os.getenv("BINANCE_API_SECRET", "")
 LEVERAGE      = int(os.getenv("LEVERAGE", "1"))
-STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botlong_state.json"))
+STATE_FILE    = os.getenv("STATE_FILE", os.path.join(tempfile.gettempdir(), "botshort_state.json"))
 # ── Gestión de símbolos ───────────────────────────────────────────────────────
 INITIAL_SYMBOLS = [ s.strip() for s in os.getenv("INITIAL_SYMBOLS", "").split(",") if s.strip() ]
-# ── Gestión de símbolos ───────────────────────────────────────────────────────
-# Lista completa de símbolos: REST inicial + caché en disco + refresh cada 12 h
+# Lista completa de símbolos (solo para saber cuáles son perpetuos operables):
+# REST inicial + caché en disco + refresh cada 12 h
 SYMBOLS_CACHE_FILE   = os.getenv(
     "SYMBOLS_CACHE_FILE",
     os.path.join(tempfile.gettempdir(), "futures_symbols_cache.json")
 )
 SYMBOL_REFRESH_HOURS = int(os.getenv("SYMBOL_REFRESH_HOURS", "12"))
 
-# ── Ciclo de filtrado ─────────────────────────────────────────────────────────
-# Cada FILTER_CYCLE_SECS: suscribir todos → esperar ticker → filtrar → desuscribir resto
-FILTER_CYCLE_SECS        = int(os.getenv("FILTER_CYCLE_SECS",        "300"))  # 5 min
-MIN_GAIN_FILTER          = float(os.getenv("MIN_GAIN_FILTER",        "20"))  # >=15% para quedar suscrito
-FULL_SUBSCRIBE_WAIT_SECS = int(os.getenv("FULL_SUBSCRIBE_WAIT_SECS", "30"))   # (legacy) espera ticker sub ALL
+# ── Vigilancia continua (sin ciclos de filtrado ni sleeps de detección) ───────
+# UNA sola conexión WebSocket permanente (WS.py):
+#   • !ticker@arr    → cambio 24h + open 24h de TODOS los símbolos (~1 s)
+#   • !markPrice@arr → precio de TODOS los símbolos (1 s)
+#   • <sym>@bookTicker (ms) → solo para los símbolos del RADAR
+# Radar = símbolos con cambio >= MIN_GAIN_FILTER (o con posición abierta).
+# Cada tick de un símbolo del radar dispara su evaluación (entradas/TP/SL).
+MIN_GAIN_FILTER        = float(os.getenv("MIN_GAIN_FILTER",        "20"))   # % 24h para entrar al radar
+WATCH_PRUNE_SECS       = float(os.getenv("WATCH_PRUNE_SECS",       "20"))   # limpieza del radar (housekeeping)
+WATCH_PRUNE_HYSTERESIS = float(os.getenv("WATCH_PRUNE_HYSTERESIS", "5"))    # sale al bajar de MIN_GAIN_FILTER-5
+# Red de seguridad: re-evalúa posiciones/radar aunque no lleguen ticks (libro
+# quieto, reintentos tras error, fin de cooldown). NO es la vía principal.
+# 0 = desactivada.
+SAFETY_TICK_SECS       = float(os.getenv("SAFETY_TICK_SECS",       "1.0"))
+PRICE_MAX_AGE_S        = float(os.getenv("PRICE_MAX_AGE_S",        "5"))    # un precio más viejo no se usa para operar
+# true = el % de cambio se recalcula en cada tick con (precio / open24h - 1),
+# en vez de esperar al ticker 24h (que llega cada ~1 s).
+USE_LIVE_CHANGE        = os.getenv("USE_LIVE_CHANGE", "true").lower() == "true"
+# ── Señal de entrada: cruce EMA rápida/lenta sobre las N cripto más activas ──
+EMA_INTERVAL           = os.getenv("EMA_INTERVAL", "1m")
+EMA_FAST               = int(os.getenv("EMA_FAST", "100"))
+EMA_SLOW               = int(os.getenv("EMA_SLOW", "200"))
+EMA_TOP_N              = int(os.getenv("EMA_TOP_N", "200"))
+EMA_UNIVERSE_REFRESH_S = float(os.getenv("EMA_UNIVERSE_REFRESH_S", "900"))
+ENTRY_ERROR_BACKOFF_S  = float(os.getenv("ENTRY_ERROR_BACKOFF_S",  "5"))    # pausa tras fallo al abrir
+CLOSE_ERROR_BACKOFF_S  = float(os.getenv("CLOSE_ERROR_BACKOFF_S",  "3"))    # pausa tras fallo al cerrar
+STATE_PERSIST_SECS     = float(os.getenv("STATE_PERSIST_SECS",     "10"))   # guardado periódico del estado
 
-# En vez de suscribir todos al mismo tiempo, se crean WS temporales por lote
-FILTER_BATCH_SIZE      = int(os.getenv("FILTER_BATCH_SIZE",      "527"))   # símbolos por lote
-FILTER_BATCH_WAIT_SECS = int(os.getenv("FILTER_BATCH_WAIT_SECS", "10"))   # segundos de espera por lote
-FILTER_BATCH_PAUSE     = float(os.getenv("FILTER_BATCH_PAUSE",   "1.5"))  # pausa entre lotes (segundos)
-
-# ── Actualización en tiempo real del ranking (entre ciclos de filtrado) ───────
-WS_TICKER_UPDATE_SECS = float(os.getenv("WS_TICKER_UPDATE_SECS", "3.0"))
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+LIVE_POLL_MS   = int(os.getenv("LIVE_POLL_MS",   "250"))    # el navegador pide precios cada 250 ms (payload mínimo)
+STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "1500"))   # estructura completa de las tablas
 
 # ── Resto de parámetros operativos ────────────────────────────────────────────
-SCAN_INTERVAL_SECS   = int(os.getenv("SCAN_INTERVAL_SECS",   "2"))
-MIN_GAIN_TO_SHOW     = float(os.getenv("MIN_GAIN_TO_SHOW",   "0"))
 COOLDOWN_SECONDS     = int(os.getenv("COOLDOWN_SECONDS",     "86400"))
 
-# Tiempo de gracia al detener un cache WS antes de arrancar el nuevo (segundos)
-WS_STOP_GRACE        = float(os.getenv("WS_STOP_GRACE", "0.8"))
+# Tiempo de gracia al detener un cache WS (segundos)
+WS_STOP_GRACE        = float(os.getenv("WS_STOP_GRACE", "0.4"))
 
 # Precio máximo permitido para abrir nuevas entradas (bloqueo permanente si supera)
-MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "1.5"))
+# 0 = desactivado (con las 200 más activas hay monedas de miles de USD).
+MAX_PRICE_BLOCK = float(os.getenv("MAX_PRICE_BLOCK", "0"))
 
-ENTRY_LEVELS    = [float(x) for x in os.getenv("ENTRY_LEVELS",    "50,75,100,150,200,250").split(",")]
-ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80").split(",")]
-TAKE_PROFIT_FRACTION = float(os.getenv("TAKE_PROFIT_FRACTION", "0.14284"))
+# DCA: el tramo de nivel 0 lo abre el cruce EMA; los siguientes se abren cuando el
+# precio va EN CONTRA de la 1.ª entrada esos % (ajusta DCA_ADVERSE_LEVELS a tu gusto).
+ENTRY_LEVELS    = [float(x) for x in os.getenv("DCA_ADVERSE_LEVELS", "0,2,4,6,8,10,12").split(",")]
+ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,80,160").split(",")]
+# Nombre de variable de entorno NUEVO a propósito: así un TAKE_PROFIT_FRACTION=0.14284
+# viejo en tu hosting no pisa el 0.07.
+TAKE_PROFIT_FRACTION = float(os.getenv("EMA_TAKE_PROFIT_FRACTION", "0.07"))
 
-# Stop loss por defecto: en vez de un valor fijo en USD, se calcula como
-# -(notional ACTUAL de la posición * TAKE_PROFIT_FRACTION) — el mismo factor
-# 0.14284 que antes se usaba para el TP — y se reactualiza automáticamente
-# cada vez que se añade un nuevo fill / nivel a la posición. Si el usuario lo
-# sobreescribe manualmente desde el dashboard (POST /api/set-sl/<symbol>), deja
-# de autoactualizarse para esa posición concreta.
-# Valor de respaldo (legacy) usado solo si por algún motivo no hay notional aún.
+# Stop loss por defecto en USD (pérdida absoluta, valor negativo). Es el SL
+# "estándar": se usa en cuanto la posición tiene 2 o más tramos.
+# Puede sobreescribirse por posición desde el dashboard (POST /api/set-sl/<symbol>).
 DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-8.0"))
 
-# Cierre global por PnL no realizado acumulado (USD).
-# el dashboard web (POST /api/set-global-close); el valor de aquí es solo el
-# valor inicial por defecto.
-DEFAULT_GLOBAL_CLOSE_PNL_USD = float(os.getenv("GLOBAL_CLOSE_PNL_USD", "40.0"))
+# Stop loss del PRIMER tramo: pérdida máxima = notional del primer fill × 0.251.
+# Ej.: primer tramo de 5 USDT → SL = -1.255 USD. Al abrirse el 2.º tramo la
+# posición vuelve al SL estándar (DEFAULT_STOP_LOSS_USD). Un SL fijado a mano
+# desde el dashboard SIEMPRE se respeta.
+FIRST_TRANCHE_SL_FRACTION = float(os.getenv("FIRST_TRANCHE_SL_FRACTION", "0.251"))
 
 # ── Executor externo ──────────────────────────────────────────────────────────
-EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executorlong.onrender.com")
+EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
+
+# ── Persistencia de estadísticas (MFE/MAE) y ajustes editables desde la web ───
+# IMPORTANTE: en hosting con disco efímero (Render free, etc.) apunta estas rutas
+# a un disco persistente (STATS_FILE=/data/trade_stats.jsonl) o se perderán al redeploy.
+STATS_FILE    = os.getenv("STATS_FILE",    os.path.join(_HERE, "trade_stats.jsonl"))
+SETTINGS_FILE = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
+
+
+def _load_settings() -> None:
+    """Restaura el SL global guardado desde la web (sobrescribe el valor de entorno)."""
+    global DEFAULT_STOP_LOSS_USD
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        val = float(data.get("default_stop_loss_usd"))
+        if val < 0:
+            DEFAULT_STOP_LOSS_USD = val
+    except Exception:
+        pass
+
+
+_load_settings()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,14 +303,48 @@ class BotPosition:
     realized_pnl: float = 0.0
     status:       str   = "OPEN"
     trade_id:     int   = 0
-    # Stop loss configurable en USD (pérdida absoluta, valor negativo).
-    # Por defecto se calcula como -(notional * TAKE_PROFIT_FRACTION), es decir
-    # el mismo factor 0.14284 que antes se usaba para el TP, y se reactualiza
-    # automáticamente cada vez que crece el notional (nuevo nivel), salvo que
-    # el usuario lo haya fijado manualmente desde el dashboard (sl_manual=True),
-    # en cuyo caso deja de autoactualizarse.
+    direction:    str   = "SHORT"     # "SHORT" | "LONG"
+    # Stop loss vigente en USD (pérdida absoluta, valor negativo).
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
+    # True si el SL lo fijó el usuario desde el dashboard: el bot NO lo toca más.
     sl_manual:    bool  = False
+    # ── Excursiones de la operación (PnL no realizado, USD y % del notional) ──
+    opened_ts:    float = field(default_factory=time.time)
+    mfe_usd:      float = 0.0    # máximo a favor  (>= 0)
+    mae_usd:      float = 0.0    # máximo en contra (<= 0)
+    mfe_pct:      float = 0.0
+    mae_pct:      float = 0.0
+    mfe_ts:       float = 0.0
+    mae_ts:       float = 0.0
+    low_price:    float = 0.0    # precio mínimo visto (favorable en un short)
+    high_price:   float = 0.0    # precio máximo visto (adverso en un short)
+
+    def update_excursions(self, price: float) -> None:
+        """Actualiza MFE/MAE con el precio actual. Llamar con self.lock tomado."""
+        if price <= 0 or not self.fills:
+            return
+        pnl      = self.unrealized_pnl(price)
+        notional = self.notional
+        pct      = (pnl / notional * 100.0) if notional > 0 else 0.0
+        now      = time.time()
+        if pnl > self.mfe_usd:
+            self.mfe_usd, self.mfe_ts = pnl, now
+        if pnl < self.mae_usd:
+            self.mae_usd, self.mae_ts = pnl, now
+        if pct > self.mfe_pct:
+            self.mfe_pct = pct
+        if pct < self.mae_pct:
+            self.mae_pct = pct
+        if self.low_price <= 0 or price < self.low_price:
+            self.low_price = price
+        if price > self.high_price:
+            self.high_price = price
+
+    def reset_excursions(self) -> None:
+        self.opened_ts = time.time()
+        self.mfe_usd = self.mae_usd = self.mfe_pct = self.mae_pct = 0.0
+        self.mfe_ts = self.mae_ts = 0.0
+        self.low_price = self.high_price = 0.0
 
     @property
     def qty(self) -> float:
@@ -283,23 +360,53 @@ class BotPosition:
             return 0.0
         return sum(f.entry_price * f.qty for f in self.fills) / self.qty
 
+    @property
+    def pnl_sign(self) -> float:
+        """+1 en short (gana si el precio baja), -1 en long."""
+        return 1.0 if self.direction == "SHORT" else -1.0
+
     def unrealized_pnl(self, mark_price: float) -> float:
-        # LONG: se gana cuando el precio sube por encima del precio de entrada.
         if mark_price <= 0:
             return 0.0
-        return sum((mark_price - f.entry_price) * f.qty for f in self.fills)
+        return self.pnl_sign * sum((f.entry_price - mark_price) * f.qty for f in self.fills)
 
-    def refresh_default_sl(self) -> None:
-        """Recalcula sl_usd en función del notional actual (factor 0.14284),
-        solo si no fue fijado manualmente por el usuario desde el dashboard."""
-        if self.sl_manual:
-            return
-        notional = self.notional
-        if notional > 0:
-            self.sl_usd = -(notional * TAKE_PROFIT_FRACTION)
+    def sl_price(self) -> float:
+        """Precio al que se alcanza sl_usd (short: por encima; long: por debajo)."""
+        q = self.qty
+        if q <= 0:
+            return 0.0
+        return self.avg_entry - self.pnl_sign * self.sl_usd / q
+
+    def adverse_pct(self, price: float) -> float:
+        """% que el precio se movió EN CONTRA respecto a la 1.ª entrada."""
+        if not self.fills or price <= 0:
+            return 0.0
+        p0 = self.fills[0].entry_price
+        if p0 <= 0:
+            return 0.0
+        return (price / p0 - 1.0) * 100.0 * self.pnl_sign
 
     def opened_levels(self) -> set:
         return {f.level for f in self.fills}
+
+    # ── Stop loss automático por tramos ──────────────────────────────────────
+    def auto_sl_usd(self) -> float:
+        """1 solo tramo → -(notional del primer fill × 0.251).
+        2 o más tramos → SL estándar (DEFAULT_STOP_LOSS_USD)."""
+        if len(self.fills) == 1:
+            return -abs(self.fills[0].notional) * FIRST_TRANCHE_SL_FRACTION
+        return DEFAULT_STOP_LOSS_USD
+
+    def refresh_auto_sl(self) -> None:
+        """Recalcula el SL según los tramos abiertos, salvo SL manual."""
+        if not self.sl_manual:
+            self.sl_usd = self.auto_sl_usd()
+
+    @property
+    def sl_mode(self) -> str:
+        if self.sl_manual:
+            return "manual"
+        return "1er tramo" if len(self.fills) == 1 else "estándar"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,7 +431,7 @@ class BinanceFuturesClient:
                       params: Optional[dict] = None, signed: bool = False,
                       timeout: int = 15) -> Any:
         params  = dict(params or {})
-        headers = {"User-Agent": "BOTLONG/2.0"}
+        headers = {"User-Agent": "BOTSHORT/2.0"}
         if signed:
             if not API_KEY or not API_SECRET:
                 raise RuntimeError("Faltan BINANCE_API_KEY / BINANCE_API_SECRET")
@@ -379,7 +486,8 @@ class BinanceFuturesClient:
                 {"symbol": symbol, "leverage": LEVERAGE}, signed=True
             )
 
-    async def market_long(self, symbol: str, notional: float, price: float) -> float:
+    async def market_open(self, symbol: str, notional: float, price: float,
+                          direction: str = "SHORT") -> float:
         min_notional = self.exchange_filters.get(symbol, {}).get("minNotional", 5.0)
         effective    = max(notional, min_notional)
         qty          = self.normalize_qty(symbol, effective / price)
@@ -389,30 +497,32 @@ class BinanceFuturesClient:
             return qty
         await self.set_leverage(symbol)
         await self.request("POST", "/fapi/v1/order",
-            {"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": qty},
+            {"symbol": symbol, "side": "SELL" if direction == "SHORT" else "BUY",
+             "type": "MARKET", "quantity": qty},
             signed=True)
         return qty
 
-    async def close_long(self, symbol: str, qty: float) -> None:
+    async def close_order(self, symbol: str, qty: float, direction: str = "SHORT") -> None:
         qty = self.normalize_qty(symbol, qty)
         if qty <= 0 or PAPER_MODE or not LIVE_TRADING:
             return
         # Timeout 10 s: debe completarse antes del timeout de Flask (30 s)
         await self.request("POST", "/fapi/v1/order",
-            {"symbol": symbol, "side": "SELL", "type": "MARKET",
+            {"symbol": symbol, "side": "BUY" if direction == "SHORT" else "SELL", "type": "MARKET",
              "quantity": qty, "reduceOnly": "true"},
             signed=True, timeout=10)
 
 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# BOT PRINCIPAL
+# BOT PRINCIPAL (motor por eventos)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TradingBot:
     def __init__(self) -> None:
         self.client   = BinanceFuturesClient()
         self.positions: Dict[str, BotPosition] = {}
-        self.winners:   List[dict] = []
         self.closed_trades: List[dict] = []
         self.events:        List[str]  = []
         self.lock = threading.Lock()
@@ -424,28 +534,46 @@ class TradingBot:
         # Bloqueo permanente por precio
         self.price_blocked: set = set()
 
-        # ── Lista completa de símbolos (cargada en init, refresh c/12h) ──
+        # ── Lista de símbolos operables (REST + caché en disco, refresh c/12h) ──
         self.all_symbols:              List[str] = []
+        self._tradable:                frozenset = frozenset()
         self.last_symbols_refresh_at:  float     = 0.0
 
         # ── WS caches ─────────────────────────────────────────────────────
-        self.price_cache:        Optional[SymbolWebSocketPriceCache] = None
-        self.kline_cache:        Optional[KlineWebSocketCache]       = None
-        self.subscribed_symbols: List[str] = []
+        self.price_cache:   Optional[SymbolWebSocketPriceCache] = None
+        self.kline_cache:   Optional[KlineWebSocketCache]       = None
+
+        # ── Radar (símbolos con bookTicker suscrito). Copy-on-write: SOLO el
+        #    loop del bot lo reasigna; el resto (hilo WS, Flask) solo lee. ──
+        self.watch: frozenset = frozenset()
+
+        # ── Motor por eventos ─────────────────────────────────────────────
+        self._tick_event:   Optional[asyncio.Event] = None   # se crea en el loop del bot
+        self._kline_dirty:  Optional[asyncio.Event] = None
+        self._pending:      Dict[str, float] = {}            # símbolo → instante del primer tick pendiente
+        self._pending_lock  = threading.Lock()
+        self._wake_scheduled = False
+        self._bg_tasks:     set = set()
+        self._entry_inflight: set = set()                    # símbolos con una tanda de entradas en curso
+        self._entry_reserved: set = set()                    # (símbolo, nivel) reservados antes de enviar la orden
+        self._entry_backoff:  Dict[str, float] = {}
+        self._close_backoff:  Dict[str, float] = {}
+        self._log_throttle:   Dict[str, float] = {}
 
         # ── Métricas ──────────────────────────────────────────────────────
         self.running              = False
-        self.scan_count           = 0
+        self.scan_count           = 0           # evaluaciones realizadas (1 por símbolo y tick)
         self.last_scan_at         = 0.0
-        self.filter_cycle_count   = 0           # cuántos ciclos de filtrado se han ejecutado
-        self.last_filter_cycle_at = 0.0         # timestamp del último ciclo de filtrado
-        self.last_ws_ticker_at    = 0.0         # timestamp de última actualización WS ranking
-        self.ws_ticker_update_count = 0
+        self.eval_rate            = 0.0         # evaluaciones/s (última ventana de 1 s)
+        self.latency_avg_ms       = 0.0         # tick recibido → evaluado (media, ventana 1 s)
+        self.latency_max_ms       = 0.0         # idem, máximo
+        self._lat_sum = 0.0
+        self._lat_n   = 0
+        self._lat_max = 0.0
         self.last_error           = ""
         self.last_startup_err     = ""
         self.exchange_symbols     = 0
         self.started_at           = time.time()
-        self._sse_snapshot: str   = "{}"
 
         self.loop:   Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
@@ -466,12 +594,10 @@ class TradingBot:
         # total PnL realizado acumulado (suma de todos los cierres)
         self.total_realized_pnl: float = 0.0
 
-        # ── Cierre global configurable ─────────────────────────────────────
-        # Si la suma del PnL no realizado de todas las posiciones abiertas
-        # alcanza este valor, se cierran TODAS las posiciones automáticamente.
-        # Configurable en caliente vía POST /api/set-global-close.
-        self.global_close_pnl: float = DEFAULT_GLOBAL_CLOSE_PNL_USD
-        self._global_closing: bool = False
+        # ── Estadísticas MFE/MAE por operación cerrada (se cargan del disco) ──
+        self.trade_stats: List[dict] = []
+        self._stats_lock = threading.Lock()
+        self._load_trade_stats()
 
     # ── Logging ───────────────────────────────────────────────────────────────
 
@@ -503,6 +629,8 @@ class TradingBot:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self._persist_event = asyncio.Event()
+        self._tick_event    = asyncio.Event()
+        self._kline_dirty   = asyncio.Event()
         try:
             self.loop.run_until_complete(self._main())
         except Exception as exc:
@@ -564,17 +692,23 @@ class TradingBot:
             self.last_startup_err = str(exc)
             self.log(f"ExchangeInfo falló ({exc}). Continúo con filtros mínimos.")
 
-        # Cargar lista completa de símbolos (caché en disco o REST)
+        # Lista de perpetuos operables (caché en disco o REST)
         await self._init_all_symbols()
+        self._update_tradable()
+
+        if not _ALL_MARKET_ENABLED:
+            self.log("⚠️ WS_ALL_MARKET=false: sin !ticker@arr/!markPrice@arr el bot NO puede "
+                     "descubrir símbolos. Pon WS_ALL_MARKET=true.")
+
+        # UNA sola conexión WS permanente; el callback despierta al motor en cada tick
+        self._start_price_cache()
+        self._start_kline_cache()      # detector de cruces EMA (top N más activas)
 
         tasks = [
-            asyncio.create_task(self._supervised(self._all_symbols_refresh_loop,  "_all_symbols_refresh_loop")),
-            asyncio.create_task(self._supervised(self._filter_cycle_loop,          "_filter_cycle_loop")),
-            asyncio.create_task(self._supervised(self._ws_ticker_update_loop,      "_ws_ticker_update_loop")),
-            asyncio.create_task(self._supervised(self._scanner,                    "_scanner")),
-            asyncio.create_task(self._supervised(self._realtime_price_loop,        "_realtime_price_loop")),
-            asyncio.create_task(self._supervised(self._snapshot_loop,              "_snapshot_loop")),
-            asyncio.create_task(self._supervised(self._persist_state_loop,         "_persist_state_loop")),
+            asyncio.create_task(self._supervised(self._engine_loop,             "_engine_loop")),
+            asyncio.create_task(self._supervised(self._maintenance_loop,        "_maintenance_loop")),
+            asyncio.create_task(self._supervised(self._all_symbols_refresh_loop, "_all_symbols_refresh_loop")),
+            asyncio.create_task(self._supervised(self._persist_state_loop,      "_persist_state_loop")),
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -605,38 +739,95 @@ class TradingBot:
                 if pos.status == "OPEN" and pos.fills
             ]
 
-    def _start_price_cache(self, symbols: List[str]) -> None:
+    def _start_price_cache(self) -> None:
+        """Arranca el ÚNICO caché WS (permanente). Nace con las posiciones
+        abiertas (si las hay); el radar crece solo con los ticks 24h."""
         self._stop_price_cache()
-        if not symbols:
-            return
-        self.price_cache = SymbolWebSocketPriceCache(
-            symbols,
-            symbols_per_connection=30,
-        )
+        initial = self._open_position_symbols()
+        self.price_cache = SymbolWebSocketPriceCache(initial)
+        self.price_cache.set_update_callback(self._on_ws_event)
+        self.watch = frozenset(initial)
         self.price_cache.start()
-        self.log(f"PriceCache iniciado con {len(symbols)} símbolos (markPrice + @ticker)")
-
-    def _start_kline_cache(self, symbols: List[str]) -> None:
-        self._stop_kline_cache()
-        if not symbols:
-            return
-        pairs = {sym: ["1m"] for sym in symbols}
-        self.kline_cache = KlineWebSocketCache(
-            pairs                           = pairs,
-            max_candles                     = 1,
-            include_open_candle             = True,
-            backfill_on_start               = False,
-            streams_per_connection          = 30,
-            rest_concurrency                = 5,
-            rest_retries                    = 3,
-            backfill_batch_size             = 3,
-            backfill_batch_delay            = 0.25,
-            safety_refresh_interval_seconds = 1500,
+        self.log(
+            f"PriceCache permanente iniciado: !ticker@arr + !markPrice@arr (todos los símbolos) "
+            f"+ bookTicker ms para el radar (≥{MIN_GAIN_FILTER:.0f}% o posición abierta)"
         )
-        self.kline_cache.start()
-        self.log(f"KlineCache iniciado con {len(symbols)} símbolos (1m)")
 
-    # ── Caché de símbolos en disco ─────────────────────────────────────────────
+    def _top_active_symbols(self) -> List[str]:
+        """Perpetuos operables ordenados por volumen 24h (del !ticker@arr, sin REST)."""
+        pc = self.price_cache
+        if pc is None:
+            return []
+        rows = [(s, t.quote_vol) for s, t in list(pc.ticker_cache.items())
+                if t.quote_vol > 0 and self._is_tradable(s)]
+        rows.sort(key=lambda r: r[1], reverse=True)
+        return [s for s, _ in rows]
+
+    def _start_kline_cache(self) -> None:
+        self._stop_kline_cache()
+        self.kline_cache = KlineWebSocketCache(
+            interval                 = EMA_INTERVAL,
+            top_n                    = EMA_TOP_N,
+            fast_period              = EMA_FAST,
+            slow_period              = EMA_SLOW,
+            universe_provider        = self._top_active_symbols,
+            pinned_provider          = self._open_position_symbols,
+            universe_refresh_seconds = EMA_UNIVERSE_REFRESH_S,
+        )
+        self.kline_cache.set_signal_callback(self._on_cross)
+        self.kline_cache.start()
+        self.log(f"KlineCache EMA{EMA_FAST}/EMA{EMA_SLOW} {EMA_INTERVAL} iniciado "
+                 f"(top {EMA_TOP_N} por volumen)")
+
+    def _on_cross(self, symbol: str, direction: str, price: float, close_ms: int) -> None:
+        """Callback del kline cache (hilo del WS de velas): solo traspasa al loop del bot."""
+        loop = self.loop
+        if loop is None or not self.running:
+            return
+        try:
+            loop.call_soon_threadsafe(self._handle_cross, symbol, direction, price)
+        except Exception:
+            pass
+
+    def _handle_cross(self, symbol: str, direction: str, cross_price: float) -> None:
+        """Cruce EMA recién cerrado: UP → LONG, DOWN → SHORT. Abre el 1.er tramo.
+        Si ya hay posición abierta el cruce se ignora (el DCA/TP/SL la gestionan)."""
+        if not self._is_tradable(symbol):
+            return
+        side = "LONG" if direction == "UP" else "SHORT"
+        now = time.time()
+        if symbol in self._entry_inflight or symbol in self._closing_symbols:
+            return
+        if now < self._entry_backoff.get(symbol, 0.0):
+            return
+        with self.lock:
+            if symbol in self.price_blocked or self.symbol_cooldown.get(symbol, 0.0) > now:
+                return
+            if self.positions.get(symbol) is not None:
+                return
+        price = self._price_for(symbol)
+        if price is None or price <= 0:
+            self._log_throttled(f"x_{symbol}", f"Cruce {direction} {symbol} sin precio fresco: omitido")
+            return
+        if MAX_PRICE_BLOCK > 0 and price > MAX_PRICE_BLOCK:
+            self._block_by_price(symbol, price)
+            return
+        self.log(f"CRUCE EMA{EMA_FAST}/{EMA_SLOW} {direction} {symbol} → {side} "
+                 f"(cierre vela={cross_price:.6f} | px={price:.6f})")
+        self._entry_inflight.add(symbol)
+        self._spawn(self._enter_levels(symbol, [(0.0, ENTRY_NOTIONALS[0])], side))
+
+    # ── Símbolos operables (caché en disco + REST) ────────────────────────────
+
+    def _update_tradable(self) -> None:
+        self._tradable = frozenset(self.all_symbols)
+
+    def _is_tradable(self, symbol: str) -> bool:
+        tradable = self._tradable
+        if tradable:
+            return symbol in tradable
+        # Sin lista (REST caído): se aceptan perpetuos USDT y se descartan trimestrales (BTCUSDT_250627)
+        return symbol.endswith(QUOTE_ASSET) and "_" not in symbol
 
     def _load_symbols_from_cache(self) -> List[str]:
         """Lee la lista de símbolos desde el archivo de caché en disco."""
@@ -669,8 +860,6 @@ class TradingBot:
         except Exception as exc:
             self.log(f"No pude guardar caché de símbolos: {exc}")
 
-    # ── REST: obtención de todos los símbolos ─────────────────────────────────
-
     async def _refresh_all_symbols(self) -> bool:
         """
         Obtiene todos los símbolos USDT-M perpetuos vía REST (exchangeInfo).
@@ -698,6 +887,7 @@ class TradingBot:
                 return False
 
             self.all_symbols             = symbols
+            self._update_tradable()
             self.last_symbols_refresh_at = time.time()
             self._save_symbols_to_cache(symbols)
             self.log(f"REST: {len(symbols)} símbolos cargados y guardados en caché")
@@ -794,265 +984,287 @@ class TradingBot:
             )
             await self._refresh_all_symbols()
 
-    # ── Ciclo de filtrado: núcleo de la nueva arquitectura ────────────────────
+    # ── Motor por eventos ─────────────────────────────────────────────────────
+    #
+    # Camino de un tick:
+    #   WS (hilo ws-price-cache) → _on_ws_event → _enqueue → loop.call_soon_threadsafe(set)
+    #   → _engine_loop despierta → _evaluate_symbol (entradas / TP / SL)
+    # Sin sleeps ni ciclos: el único retraso es el viaje del propio mensaje.
 
-    async def _filter_cycle_loop(self) -> None:
-        """
-        Cada FILTER_CYCLE_SECS (5 min):
+    def _on_ws_event(self, symbol: str, kind: str) -> None:
+        """Callback del WS (hilo del WS, fuera de locks): solo el radar (= posiciones
+        abiertas) se evalúa por tick. Las entradas llegan por cruce EMA (_on_cross)."""
+        if symbol in self.watch:
+            self._enqueue(symbol)
 
-          En lugar de suscribir los ~500 símbolos de golpe (pico de RAM),
-          los procesa en lotes de FILTER_BATCH_SIZE para mantener el uso
-          de memoria bajo y constante durante todo el ciclo.
-
-          Por cada lote:
-            Fase 1 — Crear un WS temporal SOLO para ese lote.
-            Fase 2 — Esperar FILTER_BATCH_WAIT_SECS para recibir @ticker.
-            Fase 3 — Recoger tickers y destruir el WS temporal (libera RAM).
-            Pausa   — FILTER_BATCH_PAUSE segundos antes del siguiente lote.
-
-          Cuando todos los lotes están procesados:
-            Fase 4 — Filtrar: change >= MIN_GAIN_FILTER (15%) OR posición abierta.
-            Fase 5 — Iniciar WS permanente + klines SOLO con los filtrados.
-            Fase 6 — Actualizar self.winners y métricas.
-
-        Con FILTER_BATCH_SIZE=50 y 500 símbolos: 10 lotes × (10s + 1.5s) ≈ 2 min.
-        Máximo activo simultáneo: 50 símbolos (~2 conexiones WS) en vez de 500 (~100).
-        """
-        # Esperar hasta que all_symbols esté poblado
-        for _ in range(120):
-            if not self.running:
+    def _enqueue(self, symbol: str) -> None:
+        now = time.perf_counter()
+        with self._pending_lock:
+            if symbol not in self._pending:
+                self._pending[symbol] = now
+            if self._wake_scheduled:
                 return
-            if self.all_symbols:
-                break
-            await asyncio.sleep(1.0)
+            self._wake_scheduled = True
+        loop, ev = self.loop, self._tick_event
+        try:
+            if loop is None or ev is None:
+                raise RuntimeError("loop no listo")
+            loop.call_soon_threadsafe(ev.set)
+        except Exception:
+            with self._pending_lock:
+                self._wake_scheduled = False
 
-        if not self.all_symbols:
-            self.log("[filter_cycle] No hay símbolos disponibles. Abortando ciclo.")
-            return
-
-        while self.running:
-            open_syms       = set(self._open_position_symbols())
-            symbols_to_scan = list(dict.fromkeys([*self.all_symbols, *open_syms]))
-            n_total         = len(symbols_to_scan)
-            n_batches       = (n_total + FILTER_BATCH_SIZE - 1) // FILTER_BATCH_SIZE
-
-            self.log(
-                f"[filter_cycle] Ciclo #{self.filter_cycle_count + 1}: "
-                f"{n_total} símbolos → {n_batches} lotes de {FILTER_BATCH_SIZE} "
-                f"({FILTER_BATCH_WAIT_SECS}s/lote | posiciones abiertas: {len(open_syms)})"
-            )
-
-            # ── Fases 1-2-3: Recoger tickers lote por lote ───────────────
-            all_tickers_collected: Dict[str, dict] = {}
-
-            batches = [
-                symbols_to_scan[i : i + FILTER_BATCH_SIZE]
-                for i in range(0, n_total, FILTER_BATCH_SIZE)
-            ]
-
-            for batch_idx, batch in enumerate(batches, 1):
-                if not self.running:
-                    break
-
-                self.log(
-                    f"[filter_cycle]   Lote {batch_idx}/{n_batches}: "
-                    f"{len(batch)} símbolos "
-                    f"({batch[0]} … {batch[-1]})"
-                )
-
-                # WS temporal — completamente aislado de self.price_cache
-                temp_cache = SymbolWebSocketPriceCache(
-                    batch, symbols_per_connection=10
-                )
-                temp_cache.start()
-
-                # Esperar datos de @ticker
-                try:
-                    await asyncio.sleep(FILTER_BATCH_WAIT_SECS)
-                except asyncio.CancelledError:
-                    await asyncio.to_thread(temp_cache.stop)
-                    if not self.running:
-                        return
-                    raise
-
-                # Recoger tickers de este lote
-                try:
-                    tickers = temp_cache.get_all_tickers()
-                    all_tickers_collected.update(tickers)
-                except Exception as exc:
-                    self.log(
-                        f"[filter_cycle]   Error al leer tickers lote {batch_idx}: {exc}"
-                    )
-
-                # Destruir WS temporal → libera conexiones y RAM inmediatamente
-                await asyncio.to_thread(temp_cache.stop)
-
-                # Pausa entre lotes para no saturar el event loop ni Binance
-                if batch_idx < n_batches and self.running:
-                    try:
-                        await asyncio.sleep(FILTER_BATCH_PAUSE)
-                    except asyncio.CancelledError:
-                        if not self.running:
-                            return
-                        raise
-
-            if not self.running:
-                break
-
-            # ── Fase 4: Filtrar con los tickers acumulados ────────────────
-            open_syms        = set(self._open_position_symbols())  # refrescar
-            tickers_received = len(all_tickers_collected)
-            filtered_entries: List[dict] = []
-
-            for sym in symbols_to_scan:
-                ticker  = all_tickers_collected.get(sym)
-                in_open = sym in open_syms
-
-                change = 0.0
-                price  = 0.0
-                if ticker:
-                    change = ticker.get("change_pct", 0.0)
-                    price  = ticker.get("last_price",  0.0)
-
-                # Criterio: cambio >= umbral O posición abierta
-                if change >= MIN_GAIN_FILTER or in_open:
-                    if price > 0 or in_open:  # evitar entradas sin precio real
-                        filtered_entries.append({
-                            "symbol":    sym,
-                            "change":    change,
-                            "price":     price,
-                            "market":    "futures",
-                            "can_short": True,
-                        })
-
-            # Ordenar de mayor a menor cambio
-            filtered_entries.sort(key=lambda x: x["change"], reverse=True)
-            filtered_symbols = [e["symbol"] for e in filtered_entries]
-
-            n_filtered = len(filtered_entries)
-            n_by_gain  = sum(1 for e in filtered_entries if e["change"] >= MIN_GAIN_FILTER)
-            n_by_pos   = len(open_syms)
-            top_info   = (
-                f"{filtered_entries[0]['symbol']} {filtered_entries[0]['change']:.1f}%"
-                if filtered_entries else "ninguno"
-            )
-
-            self.log(
-                f"[filter_cycle] {tickers_received}/{n_total} tickers recibidos | "
-                f"{n_filtered} clasificados: "
-                f">={MIN_GAIN_FILTER:.0f}%={n_by_gain}, posiciones={n_by_pos} | "
-                f"top={top_info}"
-            )
-
-            # ── Fase 5: Iniciar WS permanente solo con los filtrados ──────
-            # Si no hay ningún clasificado (mercado plano), mantener mínimo
-            active_list = filtered_symbols if filtered_symbols else (
-                list(open_syms) or self.all_symbols[:10]
-            )
-
-            await asyncio.to_thread(self._start_price_cache, active_list)
-            await asyncio.to_thread(self._start_kline_cache,  active_list)
-
-            # ── Fase 6: Actualizar winners y métricas ─────────────────────
-            with self.lock:
-                self.winners              = filtered_entries
-                self.subscribed_symbols   = list(active_list)
-                self.last_filter_cycle_at = time.time()
-                self.filter_cycle_count  += 1
-
-            self.persist_state()
-
-            # ── Esperar siguiente ciclo ───────────────────────────────────
-            try:
-                await asyncio.sleep(FILTER_CYCLE_SECS)
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
-
-    # ── WS Ticker: actualización en tiempo real del ranking entre ciclos ──────
-
-    async def _ws_ticker_update_loop(self) -> None:
-        """
-        Mantiene self.winners actualizado entre ciclos de filtrado.
-
-        Cada WS_TICKER_UPDATE_SECS segundos lee get_all_tickers() del
-        price_cache (que solo cubre los símbolos actualmente suscritos)
-        y actualiza el campo 'change' de cada winner.
-        """
+    async def _engine_loop(self) -> None:
         self.log(
-            f"[ws_ticker] Loop de ranking en tiempo real iniciado "
-            f"(intervalo={WS_TICKER_UPDATE_SECS:.0f}s)"
+            f"Motor por eventos activo (sin ciclos de filtrado ni sleeps de detección | "
+            f"radar ≥{MIN_GAIN_FILTER:.0f}% | red de seguridad {SAFETY_TICK_SECS:g}s)"
         )
-
-        # Esperar hasta que el WS tenga sus primeros datos
-        for _ in range(60):
-            if not self.running:
-                return
-            try:
-                if self.price_cache and self.price_cache.get_all_tickers():
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-
+        ev = self._tick_event
         while self.running:
+            await ev.wait()
+            ev.clear()
+            with self._pending_lock:
+                batch = self._pending
+                self._pending = {}
+                self._wake_scheduled = False
+            for sym, t_in in batch.items():
+                lat = (time.perf_counter() - t_in) * 1000.0
+                self._lat_sum += lat
+                self._lat_n   += 1
+                if lat > self._lat_max:
+                    self._lat_max = lat
+                try:
+                    self._evaluate_symbol(sym)
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    self._log_throttled("eval_err", f"Error evaluando {sym}: {exc!r}")
+            # Cede el loop: sin esto, un flujo continuo de ticks dejaría sin turno
+            # a las tareas de órdenes (entradas/cierres).
+            await asyncio.sleep(0)
+
+    def _log_throttled(self, key: str, msg: str, secs: float = 5.0) -> None:
+        now = time.time()
+        if now - self._log_throttle.get(key, 0.0) >= secs:
+            self._log_throttle[key] = now
+            self.log(msg)
+
+    def _spawn(self, coro) -> None:
+        """Lanza una tarea en segundo plano (órdenes) sin bloquear el motor."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_done)
+
+    def _bg_done(self, task) -> None:
+        self._bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.last_error = str(exc)
+            self._log_throttled("bg_err", f"Tarea en segundo plano falló: {exc!r}")
+
+    # ── Precio / cambio en vivo ───────────────────────────────────────────────
+
+    def _price_for(self, symbol: str) -> Optional[float]:
+        """Precio para OPERAR: mid del bookTicker (o mark) con antigüedad máxima
+        PRICE_MAX_AGE_S; si no hay, último precio del ticker 24h con la misma
+        regla. None = no operar con un dato viejo."""
+        pc = self.price_cache
+        if pc is None:
+            return None
+        now = time.time()
+        e = pc.price_cache.get(symbol)
+        if e and now - e[1] <= PRICE_MAX_AGE_S:
+            return e[0]
+        t = pc.ticker_cache.get(symbol)
+        if t and t.last_price > 0 and now - t.ts <= PRICE_MAX_AGE_S:
+            return t.last_price
+        return None
+
+    def _display_price(self, symbol: str) -> float:
+        """Precio para MOSTRAR: el fresco si lo hay, si no el último conocido."""
+        pc = self.price_cache
+        if pc is None:
+            return 0.0
+        p = self._price_for(symbol)
+        if p:
+            return p
+        e = pc.price_cache.get(symbol)
+        if e:
+            return e[0]
+        m = pc.mark_cache.get(symbol)
+        if m:
+            return m[0]
+        t = pc.ticker_cache.get(symbol)
+        return t.last_price if t else 0.0
+
+    def _change_for(self, symbol: str, price: float) -> float:
+        """% de cambio 24h en vivo: (precio / open24h - 1) con el precio del tick.
+        Si no hay open24h cae al % del ticker (que se refresca cada ~1 s)."""
+        pc = self.price_cache
+        t  = pc.ticker_cache.get(symbol) if pc is not None else None
+        if t is None:
+            return 0.0
+        if USE_LIVE_CHANGE and t.open_24h > 0 and price > 0:
+            return (price / t.open_24h - 1.0) * 100.0
+        return t.change_pct
+
+    # ── Radar ─────────────────────────────────────────────────────────────────
+
+    def _watch_add(self, symbol: str) -> None:
+        """Mete un símbolo en el radar y suscribe su bookTicker (ms). Solo desde el loop."""
+        if symbol in self.watch:
+            return
+        self.watch = self.watch | {symbol}
+        pc = self.price_cache
+        if pc is not None:
             try:
-                if self.price_cache:
-                    all_tickers: Dict[str, dict] = {}
-                    try:
-                        all_tickers = self.price_cache.get_all_tickers()
-                    except Exception:
-                        pass
-
-                    if all_tickers:
-                        ws_updated = 0
-                        with self.lock:
-                            new_winners: List[dict] = []
-                            for w in self.winners:
-                                sym    = w["symbol"]
-                                ticker = all_tickers.get(sym)
-                                if ticker:
-                                    new_w            = dict(w)
-                                    new_w["change"]  = ticker["change_pct"]
-                                    new_w["price"]   = ticker.get("last_price", w.get("price", 0.0))
-                                    new_winners.append(new_w)
-                                    ws_updated += 1
-                                else:
-                                    new_winners.append(dict(w))
-
-                            if ws_updated:
-                                new_winners.sort(key=lambda x: x["change"], reverse=True)
-                                self.winners              = new_winners
-                                self.last_ws_ticker_at    = time.time()
-                                self.ws_ticker_update_count += 1
-
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
+                pc.ensure_symbols([symbol])
             except Exception as exc:
                 self.last_error = str(exc)
-                self.log(f"[ws_ticker] Error actualizando ranking: {exc}")
+                self._log_throttled("watch_add", f"No pude suscribir {symbol}: {exc}")
+        if self._kline_dirty is not None:
+            self._kline_dirty.set()
+        self.log(f"RADAR + {symbol} ({len(self.watch)} vigilados)")
 
-            try:
-                await asyncio.sleep(WS_TICKER_UPDATE_SECS)
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
-
-    # ── Condición kline ───────────────────────────────────────────────────────
-
-    def _kline_entry_ok(self, symbol: str) -> bool:
-        """True si la última vela 1m cerrada es alcista (o sin datos)."""
-        if not self.kline_cache:
-            return True
+    def _prune_watch(self) -> None:
+        """Saca del radar lo que ya no cumple (sin posición y por debajo de
+        MIN_GAIN_FILTER - histéresis) y da de baja su bookTicker."""
+        pc = self.price_cache
+        if pc is None:
+            return
+        pos_syms = set(self._open_position_symbols())
+        floor_pct = MIN_GAIN_FILTER - WATCH_PRUNE_HYSTERESIS
+        keep, dropped = set(), []
+        for sym in self.watch:
+            if sym in pos_syms:
+                keep.add(sym)
+                continue
+            dropped.append(sym)
+        if not dropped:
+            return
+        self.watch = frozenset(keep)
         try:
-            df = self.kline_cache.get_dataframe(symbol, "1m", only_closed=True)
-            if df.empty or len(df) < 2:
-                return True
-            last = df.iloc[-1]
-            return float(last["close"]) >= float(last["open"])
-        except Exception:
-            return True
+            pc.update_symbols(sorted(keep | pos_syms))
+        except Exception as exc:
+            self.last_error = str(exc)
+        if self._kline_dirty is not None:
+            self._kline_dirty.set()
+        self.log(f"RADAR - {len(dropped)} fuera ({', '.join(sorted(dropped)[:6])}"
+                 f"{'…' if len(dropped) > 6 else ''}) → {len(self.watch)} vigilados")
+
+    # ── Evaluación de un símbolo (se ejecuta en CADA tick) ────────────────────
+
+    def _evaluate_symbol(self, symbol: str) -> None:
+        pc = self.price_cache
+        if pc is None:
+            return
+
+        with self.lock:
+            pos = self.positions.get(symbol)
+            has_pos = bool(pos and pos.status == "OPEN" and pos.fills)
+
+        if symbol not in self.watch:
+            if has_pos:
+                self._watch_add(symbol)
+            else:
+                return
+
+        price = self._price_for(symbol)
+        if price is None or price <= 0:
+            return
+
+        self.scan_count  += 1
+        self.last_scan_at = time.time()
+
+        if has_pos:
+            with self.lock:
+                p_ex = self.positions.get(symbol)
+                if p_ex is not None and p_ex.status == "OPEN":
+                    p_ex.update_excursions(price)
+            self._check_exits(symbol, price)
+
+        if has_pos:
+            self._check_dca(symbol, price)
+
+    def _check_exits(self, symbol: str, price: float) -> None:
+        """TP / SL. Pre-chequeo barato en el loop; el cierre real va a una tarea."""
+        if symbol in self._closing_symbols:
+            return
+        if time.time() < self._close_backoff.get(symbol, 0.0):
+            return
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN" or not pos.fills:
+                return
+            pnl    = pos.unrealized_pnl(price)
+            target = pos.notional * TAKE_PROFIT_FRACTION
+            sl_usd = pos.sl_usd
+        if pnl <= sl_usd:
+            reason = "SL"
+        elif pnl >= target:
+            reason = "TP"
+        else:
+            return
+        if not self._begin_close_guard(symbol):       # se toma AQUÍ, antes de crear la tarea
+            return
+        self._spawn(self._close_position(symbol, price, reason, acquired=True))
+
+    def _check_dca(self, symbol: str, price: float) -> None:
+        """Tramos siguientes del DCA: se abren cuando el precio va EN CONTRA de la
+        1.ª entrada los % de ENTRY_LEVELS (el nivel 0 ya lo abrió el cruce EMA)."""
+        if symbol in self._entry_inflight or symbol in self._closing_symbols:
+            return
+        if time.time() < self._entry_backoff.get(symbol, 0.0):
+            return
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if pos is None or pos.status != "OPEN" or not pos.fills:
+                return
+            adverse   = pos.adverse_pct(price)
+            direction = pos.direction
+            opened    = pos.opened_levels()
+        due = [
+            (lvl, nt) for lvl, nt in zip(ENTRY_LEVELS, ENTRY_NOTIONALS)
+            if lvl > 0 and adverse >= lvl and lvl not in opened
+            and (symbol, lvl) not in self._entry_reserved
+        ]
+        if not due:
+            return
+        self._entry_inflight.add(symbol)
+        self._spawn(self._enter_levels(symbol, due, direction))
+
+    def _block_by_price(self, symbol: str, price: float) -> None:
+        with self.lock:
+            newly = symbol not in self.price_blocked
+            self.price_blocked.add(symbol)
+        if newly:
+            self.log(f"BLOQUEADO permanente {symbol}: precio {price:.4f} > {MAX_PRICE_BLOCK} USD")
+
+    async def _enter_levels(self, symbol: str, due: list, direction: str) -> None:
+        """Abre, en orden, los tramos vencidos. Corre como tarea: el motor no espera a la orden."""
+        opened_any = False
+        try:
+            for level, notional in due:
+                price = self._price_for(symbol)
+                if price is None:
+                    break
+                if level > 0:                # DCA: reconfirma que el precio sigue en contra
+                    with self.lock:
+                        pos = self.positions.get(symbol)
+                        adverse = pos.adverse_pct(price) if pos else 0.0
+                    if adverse < level:
+                        break
+                if MAX_PRICE_BLOCK > 0 and price > MAX_PRICE_BLOCK:
+                    self._block_by_price(symbol, price)
+                    break
+                if not await self._ensure_position(symbol, level, notional, price, direction):
+                    break
+                opened_any = True
+        finally:
+            self._entry_inflight.discard(symbol)
+            if opened_any:                   # reevalúa ya (TP/SL del nuevo tramo, niveles que falten)
+                self._enqueue(symbol)
 
     # ── Cooldown helpers ──────────────────────────────────────────────────────
 
@@ -1069,156 +1281,6 @@ class TradingBot:
         if h > 0:  return f"{h}h {m:02d}m"
         if m > 0:  return f"{m}m {r:02d}s"
         return f"{r}s"
-
-    # ── Scanner ───────────────────────────────────────────────────────────────
-
-    async def _scanner(self) -> None:
-        """
-        Bucle de entradas. Lee change desde self.winners (actualizado por
-        _ws_ticker_update_loop vía WS @ticker en tiempo real).
-        """
-        self.log("Scanner: esperando datos de price_cache...")
-        for _ in range(120):
-            if not self.running:
-                return
-            try:
-                if self.price_cache and len(self.price_cache.get_all_prices()) > 0:
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-        self.log("Scanner: price_cache con datos — iniciando escaneos")
-
-        while self.running:
-            try:
-                with self.lock:
-                    winners = [dict(w) for w in self.winners]
-
-                all_prices: Dict[str, float] = {}
-                try:
-                    all_prices = self.price_cache.get_all_prices() if self.price_cache else {}
-                except Exception:
-                    pass
-
-                for row in winners:
-                    if not row.get("can_short", True):
-                        continue
-                    symbol = row["symbol"]
-                    change = row["change"]
-                    price  = all_prices.get(symbol) or row.get("price", 0.0)
-                    if price <= 0:
-                        continue
-
-                    with self.lock:
-                        if symbol in self.price_blocked:
-                            continue
-
-                    kline_ok = self._kline_entry_ok(symbol)
-
-                    for level, notional in zip(ENTRY_LEVELS, ENTRY_NOTIONALS):
-                        if change >= level and kline_ok:
-                            await self._ensure_long(symbol, level, notional, price, change)
-
-                    await self._maybe_stop_loss(symbol, price)
-                    await self._maybe_take_profit(symbol, price)
-
-                # TP/SL de posiciones que ya no están en winners
-                with self.lock:
-                    pos_syms = list(self.positions.keys())
-                winner_syms = {w["symbol"] for w in winners}
-                for symbol in pos_syms:
-                    if symbol not in winner_syms:
-                        price = all_prices.get(symbol)
-                        if price:
-                            await self._maybe_stop_loss(symbol, price)
-                            await self._maybe_take_profit(symbol, price)
-
-                # ── Cierre global por PnL no realizado acumulado ──────────────
-                await self._maybe_global_close(all_prices)
-
-                with self.lock:
-                    self.scan_count  += 1
-                    self.last_scan_at = time.time()
-                    now = time.time()
-                    self.symbol_cooldown = {
-                        sym: ts for sym, ts in self.symbol_cooldown.items()
-                        if ts > now
-                    }
-                    n_cool = len(self.symbol_cooldown)
-
-                n_high = sum(1 for w in winners if w["change"] >= ENTRY_LEVELS[0])
-                self.log(
-                    f"Escan #{self.scan_count}: {len(winners)} activos | "
-                    f">={ENTRY_LEVELS[0]:.0f}%: {n_high} | "
-                    f"posiciones: {len(self.positions)} | cooldown: {n_cool}"
-                )
-                self.persist_state()
-
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
-                self.log("Scanner: CancelledError inesperado, continuando...")
-                await asyncio.sleep(1.0)
-            except Exception as exc:
-                self.last_error = str(exc)
-                self.log(f"Error en scanner: {exc}")
-
-            try:
-                await asyncio.sleep(SCAN_INTERVAL_SECS)
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
-
-    # ── Realtime TP loop ──────────────────────────────────────────────────────
-
-    async def _realtime_price_loop(self) -> None:
-        """Comprueba TP y SL cada 0.25 s usando precios markPrice WS."""
-        while self.running:
-            try:
-                if self.price_cache and self.positions:
-                    try:
-                        all_prices = self.price_cache.get_all_prices()
-                    except Exception:
-                        all_prices = {}
-                    with self.lock:
-                        pos_syms = list(self.positions.keys())
-                    for symbol in pos_syms:
-                        price = all_prices.get(symbol)
-                        if price and price > 0:
-                            await self._maybe_stop_loss(symbol, price)
-                            await self._maybe_take_profit(symbol, price)
-                        # Ceder el event loop en cada símbolo para no bloquearlo
-                        await asyncio.sleep(0)
-                    await self._maybe_global_close(all_prices)
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
-            except Exception as exc:
-                self.last_error = str(exc)
-            try:
-                await asyncio.sleep(0.25)
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
-
-    # ── Snapshot loop ─────────────────────────────────────────────────────────
-
-    async def _snapshot_loop(self) -> None:
-        """Reconstruye el snapshot JSON cada segundo para /api/status."""
-        while self.running:
-            try:
-                snap = self._build_snapshot()
-                self._sse_snapshot = json.dumps(snap, ensure_ascii=False, default=str)
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
-            except Exception as exc:
-                self.log(f"Error construyendo snapshot: {exc}")
-            try:
-                await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                if not self.running:
-                    break
 
     def _begin_close_guard(self, symbol: str) -> bool:
         """Evita cierres duplicados del mismo símbolo."""
@@ -1237,117 +1299,164 @@ class TradingBot:
 
     # ── Estrategia ────────────────────────────────────────────────────────────
 
-    async def _ensure_long(self, symbol: str, level: float, notional: float,
-                            price: float, change: float) -> None:
-
-        should_log = False
+    async def _ensure_position(self, symbol: str, level: float, notional: float,
+                               price: float, direction: str) -> bool:
+        """Abre el tramo `level`. True si se abrió. El nivel se RESERVA antes de
+        enviar la orden para que ningún tick lo duplique mientras está en vuelo."""
+        key = (symbol, level)
         with self.lock:
-            if price > MAX_PRICE_BLOCK:
-                if symbol not in self.price_blocked:
-                    self.price_blocked.add(symbol)
-                    should_log = True
-                return
-
-            if self._cooldown_remaining(symbol) > 0:
-                return
-            if symbol in self._closing_symbols:
-                return
-            pos = self.positions.setdefault(symbol, BotPosition(symbol=symbol))
-            if level in pos.opened_levels() or pos.status != "OPEN":
-                return
-            # Asignar trade_id la primera vez que se abre la posición
-            if pos.trade_id == 0:
-                pos.trade_id = self._next_trade_id()
-            trade_id = pos.trade_id
+            if self.symbol_cooldown.get(symbol, 0.0) > time.time():
+                return False
+            if symbol in self._closing_symbols or key in self._entry_reserved:
+                return False
+            pos = self.positions.get(symbol)
+            if pos is not None and (level in pos.opened_levels() or pos.status != "OPEN"
+                                    or pos.direction != direction):
+                return False
+            trade_id = pos.trade_id if (pos is not None and pos.trade_id) else 0
+            self._entry_reserved.add(key)
 
         try:
-            if should_log:
-               self.log(f"BLOQUEADO permanente {symbol}: precio {price:.4f} > {MAX_PRICE_BLOCK} USD")
-               should_log = False
-            qty  = await self.client.market_long(symbol, notional, price)
+            if trade_id == 0:
+                trade_id = self._next_trade_id()
+            try:
+                qty = await self.client.market_open(symbol, notional, price, direction)
+            except Exception as exc:
+                self.last_error = str(exc)
+                self._entry_backoff[symbol] = time.time() + ENTRY_ERROR_BACKOFF_S
+                self.log(f"Error abriendo {direction} {symbol} tramo {level}: {exc}")
+                return False
+
             fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
             with self.lock:
-                self.positions[symbol].fills.append(fill)
-                # Actualizar el stop loss por defecto al notional ACTUAL de la
-                # posición (suma de todos los fills), salvo que el usuario lo
-                # haya fijado manualmente desde el dashboard.
-                self.positions[symbol].refresh_default_sl()
-                new_sl = self.positions[symbol].sl_usd
+                pos = self.positions.get(symbol)
+                if pos is None:
+                    pos = BotPosition(symbol=symbol, trade_id=trade_id, direction=direction)
+                    self.positions[symbol] = pos
+                elif pos.trade_id == 0:
+                    pos.trade_id = trade_id
+                else:
+                    trade_id = pos.trade_id
+                pos.fills.append(fill)
+                pos.refresh_auto_sl()           # 1 tramo → notional×0.251 | 2+ → SL estándar | manual → intacto
+                sl_now, sl_mode, n_fills = pos.sl_usd, pos.sl_mode, len(pos.fills)
+
+            self._watch_add(symbol)             # la posición abierta siempre queda vigilada
             self.log(
-                f"LONG {symbol}: nivel {level:.0f}% | {notional:.2f} USDT | "
-                f"qty={qty} | px={price:.6f} | cambio(WS)={change:.2f}% | "
-                f"trade_id={trade_id} | SL auto={new_sl:.4f}"
+                f"{direction} {symbol}: tramo adverso {level:.0f}% | {notional:.2f} USDT | "
+                f"qty={qty} | px={price:.6f} | trade_id={trade_id} | "
+                f"tramos={n_fills} | SL={sl_now:.4f} USD ({sl_mode})"
             )
-            # Notificar apertura al Executor
             self.executor.notify_open(
                 trade_id=trade_id,
                 symbol=symbol,
-                direction="LONG",
+                direction=direction,
                 price=price,
                 quantity=qty,
                 notional=notional,
                 level=level,
             )
             self.persist_state()
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.log(f"Error abriendo long {symbol} nivel {level}: {exc}")
+            return True
+        finally:
+            with self.lock:
+                self._entry_reserved.discard(key)
 
-    async def _maybe_take_profit(self, symbol: str, price: float) -> None:
-        # ── Pre-verificación sin guard (caso más común: TP no alcanzado) ──────
-        # Esto evita bloquear close_position_manual con el guard innecesariamente
-        with self.lock:
-            pos = self.positions.get(symbol)
-            if not pos or pos.status != "OPEN" or not pos.fills:
-                return
-            pnl    = pos.unrealized_pnl(price)
-            # TP = notional ACTUAL abierto en la posición (se recalcula en vivo
-            # según vayan entrando más niveles).
-            target = pos.notional
-
-        if pnl < target:
-            return  # Caso normal: sin TP todavía, sin tocar el guard
-
-        # ── TP alcanzado: adquirir guard y cerrar ─────────────────────────────
-        if not self._begin_close_guard(symbol):
-            return
-
+    async def _close_position(self, symbol: str, price: float, reason: str,
+                              acquired: bool = False) -> bool:
+        """Cierre único para TP / SL / MANUAL (antes había 3 copias del mismo código)."""
+        if not acquired and not self._begin_close_guard(symbol):
+            return False
         try:
-            # Re-verificar tras adquirir el guard (condición puede haber cambiado)
             with self.lock:
                 pos = self.positions.get(symbol)
                 if not pos or pos.status != "OPEN" or not pos.fills:
-                    return
-                pnl      = pos.unrealized_pnl(price)
-                target   = pos.notional
-                if pnl < target:
-                    return
-                qty      = pos.qty
-                avg_ent  = pos.avg_entry
-                notional = pos.notional
-                trade_id = pos.trade_id
+                    return False
+                fills_n   = len(pos.fills)
+                snapshot  = list(pos.fills)
+                qty       = sum(f.qty for f in snapshot)
+                notional  = sum(f.notional for f in snapshot)
+                avg_ent   = (sum(f.entry_price * f.qty for f in snapshot) / qty) if qty > 0 else 0.0
+                trade_id  = pos.trade_id
+                direction = pos.direction
+                sl_usd    = pos.sl_usd
+                target    = notional * TAKE_PROFIT_FRACTION
+                pnl       = pos.pnl_sign * sum((f.entry_price - price) * f.qty for f in snapshot) if price > 0 else 0.0
+                # Re-verifica la condición con el estado actual (pudo cambiar el SL desde el dashboard)
+                if reason == "SL" and pnl > sl_usd:
+                    return False
+                if reason == "TP" and pnl < target:
+                    return False
+                # Último punto de la operación: el precio de cierre también cuenta
+                pos.update_excursions(price)
+                now_ts   = time.time()
+                duration = now_ts - pos.opened_ts
+                exc = {
+                    "mfe_usd":    pos.mfe_usd,
+                    "mae_usd":    pos.mae_usd,
+                    "mfe_pct":    pos.mfe_pct,
+                    "mae_pct":    pos.mae_pct,
+                    "duration_s": duration,
+                }
+                stat_rec = {
+                    "trade_id":      trade_id,
+                    "symbol":        symbol,
+                    "direction":     direction,
+                    "reason":        reason,
+                    "opened_at_ts":  pos.opened_ts,
+                    "closed_at_ts":  now_ts,
+                    "duration_s":    duration,
+                    "avg_entry":     avg_ent,
+                    "close_price":   price,
+                    "qty":           qty,
+                    "notional":      notional,
+                    "fills_n":       fills_n,
+                    "levels":        [f.level for f in snapshot],
+                    "sl_usd":        sl_usd,
+                    "target":        target,
+                    "pnl":           pnl,
+                    "pnl_pct":       (pnl / notional * 100.0) if notional > 0 else 0.0,
+                    "mfe_usd":       pos.mfe_usd,
+                    "mae_usd":       pos.mae_usd,
+                    "mfe_pct":       pos.mfe_pct,
+                    "mae_pct":       pos.mae_pct,
+                    "time_to_mfe_s": (pos.mfe_ts - pos.opened_ts) if pos.mfe_ts else 0.0,
+                    "time_to_mae_s": (pos.mae_ts - pos.opened_ts) if pos.mae_ts else 0.0,
+                    "low_price":     pos.low_price,
+                    "high_price":    pos.high_price,
+                }
 
             try:
-                await self.client.close_long(symbol, qty)
+                await self.client.close_order(symbol, qty, direction)
             except Exception as exc:
                 self.last_error = str(exc)
-                self.log(f"Error cerrando long {symbol}: {exc}")
-                return
+                self._close_backoff[symbol] = time.time() + CLOSE_ERROR_BACKOFF_S
+                label = {"SL": "STOP LOSS", "TP": "short", "MANUAL": "cierre manual"}.get(reason, reason)
+                self.log(f"Error cerrando {label} {symbol}: {exc}")
+                return False
 
             unblock_str = ""
+            leftover = 0
             with self.lock:
-                pos = self.positions.pop(symbol, None)
+                pos = self.positions.get(symbol)
                 if pos:
-                    pos.status       = "CLOSED"
-                    pos.realized_pnl = pnl
+                    extra = pos.fills[fills_n:]
                     self.total_realized_pnl += pnl
-
-                    unblock_ts  = time.time() + COOLDOWN_SECONDS
-                    self.symbol_cooldown[symbol] = unblock_ts
-                    unblock_str = datetime.fromtimestamp(
-                        unblock_ts, timezone.utc
-                    ).strftime("%Y-%m-%d %H:%M UTC")
-
+                    if extra:
+                        # Se abrió otro tramo MIENTRAS se cerraba: no estaba en la orden de
+                        # cierre, así que la posición sigue abierta solo con esos fills.
+                        pos.fills = list(extra)
+                        leftover  = len(extra)
+                        pos.reset_excursions()      # la posición restante empieza sus excursiones de cero
+                    else:
+                        self.positions.pop(symbol, None)
+                        pos.status       = "CLOSED"
+                        pos.realized_pnl = pnl
+                        unblock_ts  = time.time() + COOLDOWN_SECONDS
+                        self.symbol_cooldown[symbol] = unblock_ts
+                        unblock_str = datetime.fromtimestamp(
+                            unblock_ts, timezone.utc
+                        ).strftime("%Y-%m-%d %H:%M UTC")
                     self.closed_trades.insert(0, {
                         "symbol":      symbol,
                         "pnl":         pnl,
@@ -1358,116 +1467,175 @@ class TradingBot:
                         "notional":    notional,
                         "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                         "unblock_at":  unblock_str,
-                        "reason":      "TP",
+                        "reason":      reason,
+                        **exc,
                     })
                     self.closed_trades = self.closed_trades[:500]
 
+            self._record_trade_stat(stat_rec)
             self.executor.notify_close(
                 trade_id=trade_id,
                 symbol=symbol,
-                direction="LONG",
-                reason="TP",
+                direction=direction,
+                reason=reason,
                 close_price=price,
                 pnl=pnl,
             )
-            self.log(
-                f"CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
-                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
-            )
+            if reason == "TP":
+                self.log(
+                    f"CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
+                    f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+                )
+            elif reason == "SL":
+                self.log(
+                    f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
+                    f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+                )
+            else:
+                self.log(
+                    f"✋ CIERRE MANUAL {symbol}: PnL={pnl:.4f} | "
+                    f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+                )
+            if leftover:
+                self.log(f"⚠️ {symbol}: {leftover} tramo(s) se abrieron durante el cierre; "
+                         f"la posición sigue abierta con ellos (sin cooldown)")
             self.persist_state()
+            return True
         finally:
             self._end_close_guard(symbol)
 
-    async def _maybe_stop_loss(self, symbol: str, price: float) -> None:
-        """Cierra la posición si la pérdida no realizada >= stop loss configurado
-        para esa posición (pos.sl_usd, por defecto DEFAULT_STOP_LOSS_USD)."""
-        # ── Pre-verificación sin guard ────────────────────────────────────────
-        with self.lock:
-            pos = self.positions.get(symbol)
-            if not pos or pos.status != "OPEN" or not pos.fills:
-                return
-            pnl      = pos.unrealized_pnl(price)
-            notional = pos.notional
-            sl_usd   = pos.sl_usd
+    # ── Estadísticas MFE / MAE ────────────────────────────────────────────────
 
-        if pnl > sl_usd:
-            return  # Caso normal: sin SL todavía, sin tocar el guard
-
-        # ── SL alcanzado: adquirir guard y cerrar ─────────────────────────────
-        if not self._begin_close_guard(symbol):
-            return
-
+    def _load_trade_stats(self) -> None:
+        """Carga el histórico de operaciones (una línea JSON por cierre)."""
         try:
-            # Re-verificar tras adquirir el guard
-            with self.lock:
-                pos = self.positions.get(symbol)
-                if not pos or pos.status != "OPEN" or not pos.fills:
-                    return
-                pnl      = pos.unrealized_pnl(price)
-                notional = pos.notional
-                sl_usd   = pos.sl_usd
-                if pnl > sl_usd:
-                    return
-                qty      = pos.qty
-                avg_ent  = pos.avg_entry
-                trade_id = pos.trade_id
-
-            try:
-                await self.client.close_long(symbol, qty)
-            except Exception as exc:
-                self.last_error = str(exc)
-                self.log(f"Error cerrando STOP LOSS {symbol}: {exc}")
+            if not os.path.exists(STATS_FILE):
                 return
+            rows: List[dict] = []
+            with open(STATS_FILE, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+            self.trade_stats = rows
+            max_id = max((int(r.get("trade_id", 0) or 0) for r in rows), default=0)
+            if max_id > self._trade_id_seq:
+                self._trade_id_seq = max_id        # evita repetir trade_id tras reinicios
+        except Exception as exc:
+            print(f"No pude leer {STATS_FILE}: {exc}", flush=True)
 
-            unblock_str = ""
-            with self.lock:
-                pos = self.positions.pop(symbol, None)
-                if pos:
-                    pos.status       = "CLOSED"
-                    pos.realized_pnl = pnl
-                    self.total_realized_pnl += pnl
+    def _record_trade_stat(self, rec: dict) -> None:
+        with self._stats_lock:
+            self.trade_stats.append(rec)
+        try:
+            with open(STATS_FILE, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            self._log_throttled("stats_write", f"No pude guardar estadística de {rec.get('symbol')}: {exc}")
 
-                    unblock_ts  = time.time() + COOLDOWN_SECONDS
-                    self.symbol_cooldown[symbol] = unblock_ts
-                    unblock_str = datetime.fromtimestamp(
-                        unblock_ts, timezone.utc
-                    ).strftime("%Y-%m-%d %H:%M UTC")
+    @staticmethod
+    def _pctl(sorted_vals: List[float], p: float) -> float:
+        if not sorted_vals:
+            return 0.0
+        k = (len(sorted_vals) - 1) * p
+        lo, hi = int(floor(k)), min(int(floor(k)) + 1, len(sorted_vals) - 1)
+        return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo)
 
-                    self.closed_trades.insert(0, {
-                        "symbol":      symbol,
-                        "pnl":         pnl,
-                        "target":      notional,  # TP = notional actual de la posición
-                        "qty":         qty,
-                        "avg_entry":   avg_ent,
-                        "close_price": price,
-                        "notional":    notional,
-                        "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                        "unblock_at":  unblock_str,
-                        "reason":      "SL",
-                    })
-                    self.closed_trades = self.closed_trades[:500]
+    def _summ(self, vals: List[float]) -> dict:
+        v = sorted(vals)
+        if not v:
+            return {"mean": 0.0, "median": 0.0, "p75": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+        return {
+            "mean":   sum(v) / len(v),
+            "median": self._pctl(v, 0.5),
+            "p75":    self._pctl(v, 0.75),
+            "p90":    self._pctl(v, 0.90),
+            "min":    v[0],
+            "max":    v[-1],
+        }
 
-            self.executor.notify_close(
-                trade_id=trade_id,
-                symbol=symbol,
-                direction="LONG",
-                reason="SL",
-                close_price=price,
-                pnl=pnl,
-            )
-            self.log(
-                f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
-                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
-            )
-            self.persist_state()
-        finally:
-            self._end_close_guard(symbol)
+    def compute_stats(self) -> dict:
+        """Resumen estadístico de MFE/MAE (MAE se reporta en valor absoluto)."""
+        with self._stats_lock:
+            recs = [r for r in self.trade_stats if "mfe_usd" in r]
+        groups: Dict[str, dict] = {}
+        for name, subset in (
+            ("ALL",    recs),
+            ("TP",     [r for r in recs if r.get("reason") == "TP"]),
+            ("SL",     [r for r in recs if r.get("reason") == "SL"]),
+            ("MANUAL", [r for r in recs if r.get("reason") == "MANUAL"]),
+        ):
+            groups[name] = {
+                "n":          len(subset),
+                "mfe_usd":    self._summ([abs(float(r.get("mfe_usd", 0))) for r in subset]),
+                "mae_usd":    self._summ([abs(float(r.get("mae_usd", 0))) for r in subset]),
+                "mfe_pct":    self._summ([abs(float(r.get("mfe_pct", 0))) for r in subset]),
+                "mae_pct":    self._summ([abs(float(r.get("mae_pct", 0))) for r in subset]),
+                "duration_s": self._summ([float(r.get("duration_s", 0)) for r in subset]),
+                "pnl":        self._summ([float(r.get("pnl", 0)) for r in subset]),
+            }
+        tps = groups["TP"]["n"]
+        total_pnl = sum(float(r.get("pnl", 0)) for r in recs)
+
+        # ¿Qué SL habría cortado ganadoras (TP)? (MAE <= SL → la operación se habría parado)
+        tp_mae = [float(r.get("mae_usd", 0)) for r in recs if r.get("reason") == "TP"]
+        sl_sim = []
+        for sl in (-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -8.0, -10.0, -12.0, -15.0, -20.0):
+            stopped = sum(1 for m in tp_mae if m <= sl)
+            sl_sim.append({
+                "sl": sl, "tp_stopped": stopped, "tp_total": tps,
+                "pct": (stopped / tps * 100.0) if tps else 0.0,
+            })
+        return {
+            "count":     len(recs),
+            "win_rate":  (tps / len(recs) * 100.0) if recs else 0.0,
+            "total_pnl": total_pnl,
+            "avg_pnl":   (total_pnl / len(recs)) if recs else 0.0,
+            "groups":    groups,
+            "sl_sim":    sl_sim,
+            "updated":   time.time(),
+        }
+
+    # ── SL global editable en caliente ────────────────────────────────────────
+
+    def set_default_stop_loss(self, sl_usd: float, override_manual: bool = False) -> dict:
+        """Cambia el SL estándar (2+ tramos), lo guarda en disco y lo aplica ya a las
+        posiciones abiertas. Los SL manuales se respetan salvo override_manual=True."""
+        global DEFAULT_STOP_LOSS_USD
+        DEFAULT_STOP_LOSS_USD = float(sl_usd)
+        updated: List[str] = []
+        with self.lock:
+            for sym, pos in self.positions.items():
+                if pos.status != "OPEN" or not pos.fills:
+                    continue
+                if override_manual:
+                    pos.sl_manual = False
+                before = pos.sl_usd
+                pos.refresh_auto_sl()
+                if pos.sl_usd != before:
+                    updated.append(sym)
+        tmp = f"{SETTINGS_FILE}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"default_stop_loss_usd": DEFAULT_STOP_LOSS_USD}, fh)
+            os.replace(tmp, SETTINGS_FILE)
+        except Exception as exc:
+            self.log(f"No pude guardar ajustes: {exc}")
+        self.log(f"SL GLOBAL = {DEFAULT_STOP_LOSS_USD:.4f} USD "
+                 f"(posiciones actualizadas: {', '.join(updated) or 'ninguna'}"
+                 f"{' | manuales sobrescritos' if override_manual else ''})")
+        self.persist_state()
+        for sym in self._open_position_symbols():
+            self._enqueue(sym)          # reevalúa ya con el nuevo SL
+        return {"default_stop_loss_usd": DEFAULT_STOP_LOSS_USD, "updated": updated}
 
     def set_stop_loss(self, symbol: str, sl_usd: float) -> bool:
-        """Establece el stop loss (en USD, valor negativo) para una posición
-        abierta específica. Se puede llamar desde el dashboard en cualquier
-        momento mientras la posición esté abierta. A partir de este punto el
-        SL deja de autoactualizarse según el notional (queda fijo en manual)."""
+        """Fija un stop loss MANUAL (USD, negativo) para una posición abierta.
+        Queda marcado como manual: el SL automático por tramos ya no lo pisa."""
         symbol = symbol.upper().strip()
         with self.lock:
             pos = self.positions.get(symbol)
@@ -1475,150 +1643,122 @@ class TradingBot:
                 return False
             pos.sl_usd    = sl_usd
             pos.sl_manual = True
-        self.log(f"Stop loss actualizado manualmente para {symbol}: {sl_usd:.4f} USD")
+        self.log(f"Stop loss MANUAL para {symbol}: {sl_usd:.4f} USD")
         self.persist_state()
+        # Reevalúa ya con el nuevo SL (por si el precio actual ya lo cruza)
+        self._enqueue(symbol)
         return True
 
-    async def close_position_manual(self, symbol: str, reason: str = "MANUAL") -> bool:
-        """Cierre manual (o por cierre global) de una posición abierta."""
-        if not self._begin_close_guard(symbol):
-            return False
+    async def close_position_manual(self, symbol: str) -> bool:
+        """Cierre manual de una posición abierta desde la UI."""
+        symbol = symbol.upper().strip()
+        price = self._display_price(symbol)
+        return await self._close_position(symbol, price, "MANUAL")
 
-        try:
-            with self.lock:
-                pos = self.positions.get(symbol)
-                if not pos or pos.status != "OPEN" or not pos.fills:
-                    return False
-                qty      = pos.qty
-                avg_ent  = pos.avg_entry
-                notional = pos.notional
-                trade_id = pos.trade_id
+    # ── Mantenimiento (housekeeping; NO es la vía de detección) ───────────────
 
-            price = 0.0
+    async def _maintenance_loop(self) -> None:
+        """Red de seguridad + limpieza del radar + métricas + guardado periódico.
+        Las entradas y los TP/SL los dispara cada tick del WS, no este bucle."""
+        step = SAFETY_TICK_SECS if SAFETY_TICK_SECS > 0 else 1.0
+        step = max(0.2, min(step, 1.0))
+        last_rate = last_prune = last_persist = time.time()
+        last_count = self.scan_count
+        while self.running:
+            await asyncio.sleep(step)
+            now = time.time()
             try:
-                if self.price_cache:
-                    price = self.price_cache.get_all_prices().get(symbol, 0.0)
-            except Exception:
-                pass
+                if SAFETY_TICK_SECS > 0:
+                    for sym in set(self.watch) | set(self._open_position_symbols()):
+                        self._enqueue(sym)
 
-            try:
-                await self.client.close_long(symbol, qty)
+                if now - last_rate >= 1.0:
+                    dt = now - last_rate
+                    self.eval_rate = (self.scan_count - last_count) / dt
+                    if self._lat_n:
+                        self.latency_avg_ms = self._lat_sum / self._lat_n
+                        self.latency_max_ms = self._lat_max
+                    self._lat_sum, self._lat_n, self._lat_max = 0.0, 0, 0.0
+                    last_count, last_rate = self.scan_count, now
+
+                if now - last_prune >= WATCH_PRUNE_SECS:
+                    last_prune = now
+                    self._prune_watch()
+                    with self.lock:
+                        self.symbol_cooldown = {s: ts for s, ts in self.symbol_cooldown.items() if ts > now}
+                    self._entry_backoff = {s: ts for s, ts in self._entry_backoff.items() if ts > now}
+                    self._close_backoff = {s: ts for s, ts in self._close_backoff.items() if ts > now}
+
+                if now - last_persist >= STATE_PERSIST_SECS:
+                    last_persist = now
+                    self.persist_state()
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 self.last_error = str(exc)
-                self.log(f"Error en cierre manual {symbol}: {exc}")
-                return False
-
-            pnl = 0.0
-            unblock_str = ""
-            with self.lock:
-                pos = self.positions.pop(symbol, None)
-                if pos:
-                    pnl = pos.unrealized_pnl(price) if price > 0 else 0.0
-                    pos.status       = "CLOSED"
-                    pos.realized_pnl = pnl
-                    self.total_realized_pnl += pnl
-
-                    unblock_ts  = time.time() + COOLDOWN_SECONDS
-                    self.symbol_cooldown[symbol] = unblock_ts
-                    unblock_str = datetime.fromtimestamp(
-                        unblock_ts, timezone.utc
-                    ).strftime("%Y-%m-%d %H:%M UTC")
-
-                    self.closed_trades.insert(0, {
-                        "symbol":      symbol,
-                        "pnl":         pnl,
-                        "target":      notional,  # TP = notional actual de la posición
-                        "qty":         qty,
-                        "avg_entry":   avg_ent,
-                        "close_price": price,
-                        "notional":    notional,
-                        "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                        "unblock_at":  unblock_str,
-                        "reason":      reason,
-                    })
-                    self.closed_trades = self.closed_trades[:500]
-
-            self.executor.notify_close(
-                trade_id=trade_id,
-                symbol=symbol,
-                direction="LONG",
-                reason=reason,
-                close_price=price,
-                pnl=pnl,
-            )
-            self.log(
-                f"✋ CIERRE {reason} {symbol}: PnL={pnl:.4f} | "
-                f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
-            )
-            self.persist_state()
-            return True
-        finally:
-            self._end_close_guard(symbol)
-
-    # ── Cierre global por PnL no realizado ───────────────────────────────────
-
-    def set_global_close(self, pnl_usd: float) -> bool:
-        """Configura el umbral de PnL no realizado (USD) agregado de TODAS las
-        posiciones abiertas, a partir del cual se cierran todas de golpe.
-        Configurable en caliente desde el dashboard (POST /api/set-global-close)."""
-        with self.lock:
-            self.global_close_pnl = float(pnl_usd)
-        self.log(f"Cierre global configurado: {pnl_usd:.2f} USD de PnL no realizado")
-        self.persist_state()
-        return True
-
-    async def _maybe_global_close(self, all_prices: Dict[str, float]) -> None:
-        """Si el PnL no realizado SUMADO de todas las posiciones abiertas
-        alcanza/supera el umbral configurable (self.global_close_pnl), cierra
-        TODAS las posiciones abiertas a mercado."""
-        if self._global_closing:
-            return
-
-        with self.lock:
-            threshold = self.global_close_pnl
-            pos_items = list(self.positions.items())
-
-        if threshold <= 0 or not pos_items:
-            return
-
-        total_unreal = 0.0
-        for symbol, pos in pos_items:
-            if pos.status != "OPEN" or not pos.fills:
-                continue
-            price = all_prices.get(symbol, 0.0)
-            if price > 0:
-                total_unreal += pos.unrealized_pnl(price)
-
-        if total_unreal < threshold:
-            return
-
-        self._global_closing = True
-        try:
-            symbols = [s for s, p in pos_items if p.status == "OPEN" and p.fills]
-            self.log(
-                f"🎯 CIERRE GLOBAL activado: PnL no realizado total={total_unreal:.4f} "
-                f">= umbral={threshold:.2f}. Cerrando {len(symbols)} posiciones..."
-            )
-            for symbol in symbols:
-                try:
-                    await self.close_position_manual(symbol, reason="GLOBAL")
-                except Exception as exc:
-                    self.last_error = str(exc)
-                    self.log(f"Error cerrando {symbol} en cierre global: {exc}")
-            self.log("🎯 CIERRE GLOBAL completado.")
-        finally:
-            self._global_closing = False
+                self._log_throttled("maint_err", f"Error en mantenimiento: {exc!r}")
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
+    def _winners_now(self, pos_syms: set) -> List[dict]:
+        """Radar ordenado por cambio en vivo: ≥ MIN_GAIN_FILTER o con posición."""
+        rows = []
+        for sym in self.watch:
+            price  = self._display_price(sym)
+            change = self._change_for(sym, price)
+            if change >= MIN_GAIN_FILTER or sym in pos_syms:
+                rows.append({
+                    "symbol":    sym,
+                    "change":    change,
+                    "price":     price,
+                    "market":    "futures",
+                    "can_short": True,
+                })
+        rows.sort(key=lambda r: r["change"], reverse=True)
+        return rows
+
+    def live_payload(self) -> dict:
+        """Payload MÍNIMO para el refresco del navegador (precio, cambio y PnL):
+        sin eventos, sin cierres, sin rehacer tablas."""
+        now = time.time()
+        pos_out: Dict[str, dict] = {}
+        total_unreal = 0.0
+        with self.lock:
+            for sym, pos in self.positions.items():
+                if pos.status != "OPEN" or not pos.fills:
+                    continue
+                price = self._display_price(sym)
+                pnl   = pos.unrealized_pnl(price)
+                total_unreal += pnl
+                qty = pos.qty
+                pos_out[sym] = {
+                    "p":   price,
+                    "c":   self._change_for(sym, price),
+                    "pnl": pnl,
+                    "sl":  pos.sl_price(),
+                    "mfe": max(pos.mfe_usd, pnl),
+                    "mae": min(pos.mae_usd, pnl),
+                }
+        winners = [{"s": w["symbol"], "p": w["price"], "c": w["change"]}
+                   for w in self._winners_now(set(pos_out))]
+        return {
+            "ts":               now,
+            "positions":        pos_out,
+            "winners":          winners,
+            "total_unrealized": total_unreal,
+            "scan_count":       self.scan_count,
+            "eval_rate":        self.eval_rate,
+            "latency_avg_ms":   self.latency_avg_ms,
+            "latency_max_ms":   self.latency_max_ms,
+            "watch_count":      len(self.watch),
+        }
+
     def _build_snapshot(self) -> dict:
-        all_prices: Dict[str, float] = {}
-        ws_stats:   dict = {}
-        kl_stats:   dict = {}
+        ws_stats: dict = {}
+        kl_stats: dict = {}
         try:
             if self.price_cache:
-                all_prices = self.price_cache.get_all_prices()
-                ws_stats   = self.price_cache.get_stats()
+                ws_stats = self.price_cache.get_stats()
         except Exception:
             pass
         try:
@@ -1628,30 +1768,25 @@ class TradingBot:
             pass
 
         with self.lock:
-            winners_raw        = [dict(w) for w in self.winners]
             positions_raw      = dict(self.positions)
             closed             = list(self.closed_trades[:130])
             events             = list(self.events[:50])
             cooldown_snap      = dict(self.symbol_cooldown)
             price_blocked_snap = set(self.price_blocked)
-            last_ws_ticker_at  = self.last_ws_ticker_at
-            ws_ticker_updates  = self.ws_ticker_update_count
-            filter_cycle_count = self.filter_cycle_count
-            last_filter_at     = self.last_filter_cycle_at
             all_symbols_count  = len(self.all_symbols)
             total_realized_pnl = self.total_realized_pnl
-            global_close_pnl   = self.global_close_pnl
 
         now = time.time()
+        pos_syms = {s for s, p in positions_raw.items() if p.status == "OPEN" and p.fills}
+        winners_raw = self._winners_now(pos_syms)
+        change_by_sym = {w["symbol"]: w["change"] for w in winners_raw}
 
         winners_out = []
         for w in winners_raw:
             sym       = w["symbol"]
-            price     = all_prices.get(sym) or w.get("price", 0.0)
             remaining = max(0.0, cooldown_snap.get(sym, 0.0) - now)
             winners_out.append({
                 **w,
-                "price":              price,
                 "cooldown_remaining": remaining,
                 "cooldown_str":       self._fmt_cooldown(remaining) if remaining > 0 else "",
                 "price_blocked":      sym in price_blocked_snap,
@@ -1661,29 +1796,33 @@ class TradingBot:
         total_unreal   = 0.0
         total_notional = 0.0
         for symbol, pos in positions_raw.items():
-            price = all_prices.get(symbol) or 0.0
+            if pos.status != "OPEN" or not pos.fills:
+                continue
+            price = self._display_price(symbol)
             pnl   = pos.unrealized_pnl(price)
             total_unreal   += pnl
             total_notional += pos.notional
-            # Precio al que se activa el Stop Loss configurado para esta posición
-            # LONG SL: (sl_price - avg_entry) * qty = sl_usd → sl_price = avg_entry + sl_usd/qty
-            sl_price = (pos.avg_entry + pos.sl_usd / pos.qty) if pos.qty > 0 else 0.0
+            # Short SL: (avg_entry - sl_price) * qty = sl_usd → sl_price = avg_entry - sl_usd/qty
+            sl_price = pos.sl_price()
             open_positions.append({
-                "symbol":         symbol,
-                "mark_price":     price,
-                "avg_entry":      pos.avg_entry,
-                "qty":            pos.qty,
-                "notional":       pos.notional,
-                "target":         pos.notional,
-                "unrealized_pnl": pnl,
+                "symbol":          symbol,
+                "mark_price":      price,
+                "avg_entry":       pos.avg_entry,
+                "qty":             pos.qty,
+                "notional":        pos.notional,
+                "target":          pos.notional * TAKE_PROFIT_FRACTION,
+                "unrealized_pnl":  pnl,
                 "stop_loss_price": sl_price,
                 "stop_loss_usd":   pos.sl_usd,
-                "stop_loss_manual": pos.sl_manual,
-                "trade_id":       pos.trade_id,
-                "fills":          [f.__dict__ for f in pos.fills],
-                "change":         next(
-                    (w["change"] for w in winners_raw if w["symbol"] == symbol), 0.0
-                ),
+                "sl_mode":         pos.sl_mode,
+                "trade_id":        pos.trade_id,
+                "mfe_usd":         max(pos.mfe_usd, pnl),
+                "mae_usd":         min(pos.mae_usd, pnl),
+                "mfe_pct":         pos.mfe_pct,
+                "mae_pct":         pos.mae_pct,
+                "opened_ts":       pos.opened_ts,
+                "fills":           [f.__dict__ for f in pos.fills],
+                "change":          change_by_sym.get(symbol, self._change_for(symbol, price)),
             })
 
         active_cooldowns = {
@@ -1702,21 +1841,7 @@ class TradingBot:
             .strftime("%Y-%m-%d %H:%M:%S UTC")
             if self.last_scan_at else "pendiente"
         )
-        last_filter_text = (
-            datetime.fromtimestamp(last_filter_at, timezone.utc)
-            .strftime("%H:%M:%S UTC")
-            if last_filter_at else "pendiente"
-        )
-        last_ws_ticker_text = (
-            datetime.fromtimestamp(last_ws_ticker_at, timezone.utc)
-            .strftime("%H:%M:%S UTC")
-            if last_ws_ticker_at else "pendiente"
-        )
-        next_filter_text = (
-            self._fmt_cooldown(FILTER_CYCLE_SECS - (now - last_filter_at))
-            if last_filter_at and (now - last_filter_at) < FILTER_CYCLE_SECS
-            else "pronto"
-        )
+        watch = sorted(self.watch)
 
         return {
             "mode":              "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL",
@@ -1726,30 +1851,30 @@ class TradingBot:
             "uptime_seconds":    round(now - self.started_at, 1),
             "scan_count":        self.scan_count,
             "last_scan_text":    last_scan_text,
-            # Ciclo de filtrado
-            "filter_cycle_count":   filter_cycle_count,
-            "last_filter_text":     last_filter_text,
-            "next_filter_text":     next_filter_text,
-            "filter_cycle_secs":    FILTER_CYCLE_SECS,
-            "min_gain_filter":      MIN_GAIN_FILTER,
-            "full_subscribe_wait":  FULL_SUBSCRIBE_WAIT_SECS,
-            # Símbolos
-            "all_symbols_count":    all_symbols_count,
-            "subscribed_count":     len(self.subscribed_symbols),
-            "subscribed_symbols":   self.subscribed_symbols,
-            # WS ticker (actualizaciones entre ciclos)
-            "last_ws_ticker_text":  last_ws_ticker_text,
-            "ws_ticker_updates":    ws_ticker_updates,
+            # Motor por eventos
+            "eval_rate":         self.eval_rate,
+            "latency_avg_ms":    self.latency_avg_ms,
+            "latency_max_ms":    self.latency_max_ms,
+            "live_poll_ms":      LIVE_POLL_MS,
+            "status_poll_ms":    STATUS_POLL_MS,
+            "min_gain_filter":   MIN_GAIN_FILTER,
+            "safety_tick_secs":  SAFETY_TICK_SECS,
+            # Símbolos / radar
+            "all_symbols_count": all_symbols_count,
+            "universe_count":    ws_stats.get("active_tickers", 0),
+            "subscribed_count":  len(watch),
+            "subscribed_symbols": watch,
+            "ws_connected":      bool(ws_stats.get("connected", False)),
+            "book_ticks":        ws_stats.get("book_ticks", 0),
             # Resto
             "last_error":        self.last_error,
             "last_startup_err":  self.last_startup_err,
             "exchange_symbols":  self.exchange_symbols,
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
-            "take_profit_pct":   100.0,  # TP = 100% del notional actual de la posición
-            "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
-            "default_stop_loss_fraction_pct": TAKE_PROFIT_FRACTION * 100,  # SL auto = notional * 0.14284
-            "global_close_pnl_usd": global_close_pnl,
+            "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
+            "default_stop_loss_usd":      DEFAULT_STOP_LOSS_USD,
+            "first_tranche_sl_fraction":  FIRST_TRANCHE_SL_FRACTION,
             "total_unrealized":   total_unreal,
             "total_realized_pnl": total_realized_pnl,
             "total_notional":    total_notional,
@@ -1771,9 +1896,9 @@ class TradingBot:
                 "stale":          ws_stats.get("stale_symbols",  0),
             },
             "kline_ws": {
-                "pairs_with_data": kl_stats.get("pairs_with_data", 0),
-                "total_messages":  kl_stats.get("total_messages",  0),
-                "active_conns":    kl_stats.get("active_connections", 0),
+                "pairs_with_data": kl_stats.get("ready_symbols", 0),
+                "total_messages":  kl_stats.get("closed_candles", 0),
+                "active_conns":    int(bool(kl_stats.get("connected", False))),
             },
             "ts": now,
         }
@@ -1893,297 +2018,364 @@ HTML = r"""<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bot Long Ganadores · Binance Futures</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0f1e">
+  <title>Bot Short · Binance Futures</title>
   <style>
     :root {
-      --bg: #0f172a; --card: #111827; --border: #334155;
-      --txt: #e2e8f0; --muted: #94a3b8;
-      --green: #22c55e; --red: #ef4444; --yellow: #f59e0b;
-      --blue: #60a5fa; --purple: #a78bfa; --orange: #fb923c;
-      --teal: #2dd4bf;
+      --bg: #0a0f1e; --bg2: #0e1630;
+      --card: #121a30; --card2: #17213d; --line: #223052;
+      --txt: #e8edf8; --muted: #8b9bbd;
+      --green: #34d399; --red: #f87171; --amber: #fbbf24;
+      --blue: #60a5fa; --violet: #a78bfa; --teal: #2dd4bf; --orange: #fb923c;
+      --radius: 16px;
     }
-    * { box-sizing: border-box; }
-    body   { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--txt); }
-    header { padding: 20px 24px; background: var(--card); border-bottom: 1px solid var(--border);
-             display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-    header h1 { margin: 0; font-size: 18px; }
-    .badge        { padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
-    .badge-green  { background: #14532d; color: #86efac; }
-    .badge-yellow { background: #713f12; color: #fde68a; }
-    .badge-blue   { background: #1e3a5f; color: #93c5fd; }
-    .badge-teal   { background: #134e4a; color: #99f6e4; }
-    .badge-orange { background: #431407; color: #fdba74; }
-    .badge-purple { background: #3b0764; color: #d8b4fe; }
-    main   { padding: 16px; display: grid; gap: 16px; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
-    .card  { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0; color: var(--txt);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1a2550 0%, transparent 60%),
+                  radial-gradient(900px 500px at 100% 0%, #2a1850 0%, transparent 55%),
+                  var(--bg);
+      background-attachment: fixed;
+      font-variant-numeric: tabular-nums;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    a { color: inherit; }
+    .positive { color: var(--green); } .negative { color: var(--red); }
+    .warn { color: var(--amber); } .teal { color: var(--teal); } .violet { color: var(--violet); }
+    .muted { color: var(--muted); }
+
+    /* ── Cabecera ── */
+    header {
+      position: sticky; top: 0; z-index: 50;
+      backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+      background: rgba(10,15,30,.78); border-bottom: 1px solid var(--line);
+      padding: calc(10px + env(safe-area-inset-top)) 16px 0;
+    }
+    .head-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .logo { font-size: 18px; font-weight: 800; letter-spacing: .2px; }
+    .logo small { color: var(--muted); font-weight: 600; font-size: 12px; margin-left: 6px; }
+    .grow { flex: 1; }
+    .badge { padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: .4px; }
+    .b-real { background: rgba(52,211,153,.15); color: var(--green); border: 1px solid rgba(52,211,153,.45); }
+    .b-paper { background: rgba(251,191,36,.12); color: var(--amber); border: 1px solid rgba(251,191,36,.4); }
+    .dots { display: flex; gap: 6px; align-items: center; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #3a4766; transition: background .25s; }
+    .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    #dotEngine.on { background: var(--violet); box-shadow: 0 0 8px var(--violet); }
+    nav { display: flex; gap: 6px; overflow-x: auto; padding: 10px 0 10px; scrollbar-width: none; }
+    nav::-webkit-scrollbar { display: none; }
+    nav a {
+      flex: 0 0 auto; text-decoration: none; font-size: 13px; font-weight: 700; color: var(--muted);
+      padding: 7px 14px; border-radius: 999px; background: var(--card); border: 1px solid var(--line);
+    }
+    nav a:active { background: var(--card2); color: var(--txt); }
+
+    /* ── Layout ── */
+    main { max-width: 1200px; margin: 0 auto; padding: 16px; display: grid; gap: 18px; }
+    .anchor { scroll-margin-top: 110px; }
+    .card {
+      background: linear-gradient(180deg, var(--card2), var(--card));
+      border: 1px solid var(--line); border-radius: var(--radius); padding: 16px;
+    }
+    h2.sec { margin: 0 0 12px; font-size: 16px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    h2.sec .sub { color: var(--muted); font-size: 12px; font-weight: 500; }
     .label { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
-    .value { font-size: 22px; font-weight: 700; }
-    .value.sm { font-size: 14px; }
-    .positive { color: var(--green); } .negative { color: var(--red); } .warn { color: var(--yellow); }
-    .teal { color: var(--teal); } .purple { color: var(--purple); }
-    section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-    section h2 { margin: 0; padding: 12px 16px; font-size: 15px; border-bottom: 1px solid var(--border); }
-    table  { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 9px 12px; border-bottom: 1px solid #1f2937; text-align: right; white-space: nowrap; }
-    th:first-child, td:first-child { text-align: left; }
-    th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
-    pre  { background: var(--card); padding: 12px; overflow: auto; max-height: 260px;
-           white-space: pre-wrap; font-size: 12px; margin: 0; }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
-            background: #1e293b; border: 1px solid #475569; font-size: 11px; margin: 1px; }
-    .ws-row  { display: flex; gap: 8px; flex-wrap: wrap; }
-    .ws-chip { background: #1e293b; border: 1px solid var(--border);
-               border-radius: 8px; padding: 4px 10px; font-size: 12px; }
-    .ws-chip.highlight { border-color: var(--teal); }
-    .ws-chip.highlight2 { border-color: var(--purple); }
-    #errorBox { border-color: var(--red); }
-    .sym-link { color: var(--blue); text-decoration: none; font-weight: 600; }
-    .sym-link:hover { text-decoration: underline; }
-    .cd-badge { display: inline-block; padding: 2px 8px; border-radius: 6px;
-                background: #431407; color: #fdba74; border: 1px solid #c2410c;
-                font-size: 11px; font-weight: 700; white-space: nowrap; }
-    tr.in-cooldown { background: rgba(251,146,60,0.07); }
-    tr.can-trade   { background: rgba(34,197,94,0.05); }
-    #dotPoll { width: 8px; height: 8px; border-radius: 50%; background: var(--red);
-               display: inline-block; transition: background .3s; }
-    #dotPoll.on { background: var(--green); }
-    #dotFilter { width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
-                 display: inline-block; transition: background .3s; }
-    #dotFilter.on { background: var(--purple); }
-    #dotWsTicker { width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
-                   display: inline-block; transition: background .3s; }
-    #dotWsTicker.on { background: var(--teal); }
-    .filter-bar { background: #1e293b; border: 1px solid var(--purple);
-                  border-radius: 8px; padding: 8px 14px; margin-bottom: 8px;
-                  display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; }
-    .filter-bar span { color: var(--muted); }
-    .filter-bar b   { color: var(--purple); }
-    /* Botón de cierre manual */
-    .btn-close {
-      background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444;
-      border-radius: 6px; padding: 3px 10px; font-size: 11px; font-weight: 700;
-      cursor: pointer; transition: background .2s;
+
+    .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .kpi { padding: 14px 16px; }
+    .kpi .value { font-size: 24px; font-weight: 800; line-height: 1.15; word-break: break-word; }
+    .kpi .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+
+    /* ── Tarjeta SL global ── */
+    .slcard { border-color: rgba(251,146,60,.45); }
+    .slrow { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+    .slcur { min-width: 120px; }
+    .slcur b { font-size: 26px; color: var(--orange); }
+    .field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 160px; }
+    .field label { font-size: 12px; color: var(--muted); }
+    input[type=number] {
+      width: 100%; background: #0b1226; color: var(--txt); border: 1px solid var(--line);
+      border-radius: 12px; padding: 12px; font-size: 16px; outline: none;
     }
-    .btn-close:hover  { background: #991b1b; }
-    .btn-close:active { background: #b91c1c; }
-    .btn-close:disabled { opacity: .45; cursor: not-allowed; }
-    /* Badge de SL */
-    .sl-badge { display: inline-block; padding: 2px 7px; border-radius: 6px;
-                background: #1c1917; color: #fb923c;
-                border: 1px solid #78350f; font-size: 11px; white-space: nowrap; }
-    /* Badge de razón de cierre */
-    .reason-tp     { color: var(--green);  font-weight: 700; }
-    .reason-sl     { color: var(--red);    font-weight: 700; }
-    .reason-manual { color: var(--yellow); font-weight: 700; }
-    /* Executor status chip */
-    .executor-chip { background: #0f2027; border: 1px solid var(--teal);
-                     border-radius: 8px; padding: 4px 12px; font-size: 12px;
-                     color: var(--teal); display: inline-block; }
+    input[type=number]:focus { border-color: var(--orange); }
+    .check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-top: 10px; }
+    .check input { width: 18px; height: 18px; accent-color: var(--orange); }
+    .btn {
+      appearance: none; border: 1px solid transparent; border-radius: 12px; padding: 12px 18px;
+      font-size: 14px; font-weight: 800; cursor: pointer; color: #0a0f1e; min-height: 44px;
+    }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-orange { background: linear-gradient(135deg, #fdba74, #fb923c); }
+    .btn-ghost { background: var(--card2); color: var(--txt); border-color: var(--line); }
+    .btn-danger { background: rgba(248,113,113,.14); color: #fca5a5; border-color: rgba(248,113,113,.5); }
+    .btn-danger:active { background: rgba(248,113,113,.28); }
+    .btn-sm { padding: 6px 12px; min-height: 34px; font-size: 12px; }
+    .msg { font-size: 12px; margin-top: 8px; min-height: 16px; }
+
+    /* ── Posiciones (tarjetas) ── */
+    .poslist { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+    .pos { padding: 14px; }
+    .pos-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+    .sym { font-weight: 800; font-size: 17px; color: var(--blue); text-decoration: none; }
+    .chg { display: block; font-size: 13px; font-weight: 700; margin-top: 2px; }
+    .pnl { font-size: 24px; font-weight: 800; text-align: right; }
+    .pgrid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 14px; margin: 12px 0; }
+    .pgrid > div { display: flex; flex-direction: column; gap: 2px; background: rgba(255,255,255,.03);
+                   border-radius: 10px; padding: 8px 10px; }
+    .pgrid span { font-size: 11px; color: var(--muted); }
+    .pgrid b { font-size: 14px; }
+    .pills { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+    .pill { padding: 3px 10px; border-radius: 999px; background: #0b1226; border: 1px solid var(--line); font-size: 11px; }
+    .slbtn { background: none; border: 1px dashed var(--orange); color: var(--orange); border-radius: 8px;
+             font-weight: 800; font-size: 14px; padding: 3px 8px; cursor: pointer; text-align: left; }
+    .tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid #78350f; color: var(--orange); width: fit-content; }
+    .pos-actions { display: flex; gap: 8px; }
+    .pos-actions .btn { flex: 1; }
+    .empty { color: var(--muted); text-align: center; padding: 22px; border: 1px dashed var(--line); border-radius: var(--radius); }
+
+    /* ── Tablas ── */
+    .tablewrap { overflow-x: auto; border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #1a2542; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: var(--muted); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
+    tr.in-cooldown { background: rgba(251,146,60,.07); }
+    tr.can-trade { background: rgba(52,211,153,.06); }
+    .cd-badge { padding: 2px 8px; border-radius: 999px; background: rgba(251,146,60,.12); color: #fdba74;
+                border: 1px solid #c2410c; font-size: 11px; font-weight: 800; white-space: nowrap; }
+    .r-tp { color: var(--green); font-weight: 800; } .r-sl { color: var(--red); font-weight: 800; }
+    .r-manual { color: var(--amber); font-weight: 800; }
+
+    /* ── Estadísticas ── */
+    .statgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
+    .stat { background: rgba(255,255,255,.04); border-radius: 12px; padding: 12px; }
+    .stat .v { font-size: 20px; font-weight: 800; }
+    .twocol { display: grid; grid-template-columns: 1.6fr 1fr; gap: 14px; }
+    .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; line-height: 1.5; }
+
+    /* ── Diagnóstico ── */
+    details.card summary { cursor: pointer; font-weight: 800; font-size: 15px; list-style: none; }
+    details.card summary::-webkit-details-marker { display: none; }
+    details.card summary::after { content: "▾"; float: right; color: var(--muted); }
+    details[open].card summary::after { content: "▴"; }
+    .diag { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 14px; }
+    .diag .stat .v { font-size: 15px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .chip { background: #0b1226; border: 1px solid var(--line); border-radius: 10px; padding: 5px 10px; font-size: 12px; }
+    .executor-chip { color: var(--teal); }
+    pre { margin: 0; white-space: pre-wrap; font-size: 12px; max-height: 280px; overflow: auto; color: #b8c4e0; line-height: 1.5; }
+    #errorBox { border-color: var(--red); }
+
+    /* ── Modal ── */
+    .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 100;
+               align-items: center; justify-content: center; padding: 16px; }
+    .modal { width: 340px; max-width: 100%; }
+
+    /* ── Responsive ── */
+    @media (max-width: 900px) {
+      .kpis { grid-template-columns: repeat(2, 1fr); }
+      .statgrid { grid-template-columns: repeat(2, 1fr); }
+      .twocol { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 720px) {
+      main { padding: 12px; gap: 14px; }
+      .poslist { grid-template-columns: 1fr; }
+      .kpi .value { font-size: 20px; }
+      table.rt thead { display: none; }
+      table.rt, .rt tbody, .rt tr, .rt td { display: block; width: 100%; }
+      .rt tr { border: 1px solid var(--line); border-radius: 12px; margin: 0 0 10px; padding: 8px 12px; background: rgba(255,255,255,.03); }
+      .rt td { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border: 0; white-space: normal; text-align: right; }
+      .rt td:first-child { text-align: right; }
+      .rt td::before { content: attr(data-label); color: var(--muted); font-size: 12px; text-align: left; }
+      .logo small { display: none; }
+    }
   </style>
 </head>
 <body>
 <header>
-  <span id="dotPoll"     title="Verde = polling REST activo"></span>
-  <span id="dotFilter"   title="Púrpura = ciclo de filtrado completado"></span>
-  <span id="dotWsTicker" title="Teal = ranking WS @ticker activo"></span>
-  <h1>Bot Short Ganadores · Binance USDT-M Futures</h1>
-  <span id="modeBadge" class="badge badge-yellow">—</span>
-  <span class="badge badge-green">markPrice WS en tiempo real</span>
-  <span class="badge badge-teal">Ranking 24h WS @ticker</span>
-  <span class="badge badge-purple">Ciclo filtrado cada 5 min (sub ALL → ≥15% → unsub resto)</span>
-  <span class="badge badge-blue">Lista símbolos REST inicial + caché 12h</span>
-  <span class="badge badge-orange">Cooldown 24h tras cierre</span>
+  <div class="head-row">
+    <div class="logo">⚡ Bot Short<small>Binance USDT-M</small></div>
+    <span id="modeBadge" class="badge b-paper">—</span>
+    <div class="grow"></div>
+    <div class="dots">
+      <span id="dotPoll" class="dot" title="Estructura (/api/status) al día"></span>
+      <span id="dotLive" class="dot" title="Precios en vivo (/api/live)"></span>
+      <span id="dotEngine" class="dot" title="El motor evalúa ticks"></span>
+    </div>
+  </div>
+  <nav>
+    <a href="#sec-pos">Posiciones</a>
+    <a href="#sec-sl">SL global</a>
+    <a href="#sec-radar">Radar</a>
+    <a href="#sec-stats">Estadísticas</a>
+    <a href="#sec-hist">Historial</a>
+    <a href="#sec-diag">Diagnóstico</a>
+  </nav>
 </header>
+
 <main>
-
   <!-- KPIs -->
-  <div class="cards">
-    <div class="card"><div class="label">Modo</div><div id="mode" class="value warn sm">—</div></div>
-    <div class="card"><div class="label">PnL no realizado</div><div id="pnl" class="value">—</div></div>
-    <div class="card" style="border-color:#22c55e55">
-      <div class="label">✅ PnL Realizado Total</div>
-      <div id="realizedPnl" class="value positive">—</div>
-    </div>
-    <div class="card"><div class="label">Capital en posiciones</div><div id="notional" class="value">—</div></div>
-    <div class="card" style="border-color:#f59e0b55">
-      <div class="label">🎯 Cierre global (PnL no realizado total)</div>
-      <div style="display:flex; align-items:center; gap:6px;">
-        <input id="globalCloseInput" type="number" step="0.5" min="0.5"
-               style="width:80px; background:#0b1220; color:var(--txt); border:1px solid var(--border);
-                      border-radius:6px; padding:4px 6px; font-size:13px;">
-        <button id="globalCloseSave" onclick="saveGlobalClose()"
-                style="background:#92400e; color:#fde68a; border:none; border-radius:6px;
-                       padding:5px 10px; font-size:12px; cursor:pointer;">Guardar</button>
-      </div>
-      <div id="globalCloseError" style="color:var(--red); font-size:11px; margin-top:4px; display:none;"></div>
-    </div>
-    <div class="card"><div class="label">Último escaneo</div><div id="scan" class="value sm">—</div></div>
-    <div class="card"><div class="label">Escaneos totales</div><div id="scanCount" class="value">—</div></div>
-    <div class="card">
-      <div class="label">Ciclos de filtrado</div>
-      <div id="filterCycles" class="value purple">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Último ciclo filtrado</div>
-      <div id="lastFilter" class="value sm purple">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Próximo ciclo</div>
-      <div id="nextFilter" class="value sm warn">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Símbolos totales (caché)</div>
-      <div id="allSymbols" class="value">—</div>
-    </div>
-    <div class="card"><div class="label">Suscritos actualmente</div><div id="subCount" class="value teal">—</div></div>
-    <div class="card">
-      <div class="label">Update WS @ticker</div>
-      <div id="lastWsTicker" class="value sm teal">—</div>
-    </div>
-    <div class="card">
-      <div class="label">En cooldown (24h)</div>
-      <div id="cooldownCount" class="value warn">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Executor</div>
-      <div id="executorStatus" class="value sm">—</div>
-    </div>
-  </div>
-
-  <!-- Estado del ciclo de filtrado -->
-  <div class="card filter-bar">
-    <div>🔍 Filtrado: sub <b id="fbAll">—</b> símbolos →
-         espera <b id="fbWait">—</b>s →
-         quedan <b id="fbFiltered">—</b> (≥<b id="fbThreshold">—</b>% o posición abierta) →
-         unsub <b id="fbUnsub">—</b></div>
-    <div>⏱ Próximo: <b id="fbNext" style="color:var(--yellow)">—</b></div>
-  </div>
-
-  <!-- WS status -->
-  <div class="card">
-    <div class="label">Estado WebSockets</div>
-    <div class="ws-row" style="margin-top:8px">
-      <div class="ws-chip highlight2">Ciclos filtrado: <b id="wsFilterCycles" style="color:var(--purple)">—</b></div>
-      <div class="ws-chip highlight">@ticker 24h activos: <b id="wsTickers" style="color:var(--teal)">—</b>/<span id="wsTotal">—</span></div>
-      <div class="ws-chip">markPrice activos: <b id="wsActive">—</b>/<span id="wsTotal2">—</span></div>
-      <div class="ws-chip">stale: <b id="wsStale">—</b></div>
-      <div class="ws-chip">kline pares: <b id="klPairs">—</b></div>
-      <div class="ws-chip">kline msgs: <b id="klMsgs">—</b></div>
-      <div class="ws-chip">kline conns: <b id="klConns">—</b></div>
-      <div class="ws-chip">fetch polls: <b id="pollCount">0</b></div>
-    </div>
+  <div class="kpis">
+    <div class="card kpi"><div class="label">PnL no realizado</div><div id="pnl" class="value">—</div><div class="hint">USDT</div></div>
+    <div class="card kpi"><div class="label">PnL realizado total</div><div id="realizedPnl" class="value">—</div><div class="hint">USDT</div></div>
+    <div class="card kpi"><div class="label">Capital en posiciones</div><div id="notional" class="value">—</div><div class="hint">USDT</div></div>
+    <div class="card kpi"><div class="label">Posiciones abiertas</div><div id="openCount" class="value">—</div><div class="hint"><span id="rbWatchK">—</span> en radar</div></div>
   </div>
 
   <!-- Error -->
-  <section id="errorBox" style="display:none">
-    <h2 style="color:var(--red)">⚠️ Error / Diagnóstico</h2>
+  <section id="errorBox" class="card" style="display:none">
+    <h2 class="sec negative">⚠️ Error / diagnóstico</h2>
     <pre id="lastError" style="color:var(--red)"></pre>
   </section>
 
-  <!-- Cooldowns activos -->
+  <!-- Posiciones -->
+  <section id="sec-pos" class="anchor">
+    <h2 class="sec">Posiciones abiertas <span class="sub" id="slHint"></span></h2>
+    <div id="posList" class="poslist"><div class="empty">Sin posiciones abiertas</div></div>
+  </section>
+
+  <!-- SL global -->
+  <section id="sec-sl" class="anchor card slcard">
+    <h2 class="sec">⛔ Stop Loss global <span class="sub">se aplica ya a las posiciones abiertas con 2+ tramos</span></h2>
+    <div class="slrow">
+      <div class="slcur"><div class="label">Valor actual (USD)</div><b id="gslCurrent">—</b></div>
+      <div class="field">
+        <label for="gslInput">Nuevo SL global (negativo, ej. -6)</label>
+        <input id="gslInput" type="number" step="0.1" inputmode="decimal" placeholder="-8">
+      </div>
+      <button id="gslSave" class="btn btn-orange">Aplicar</button>
+    </div>
+    <label class="check"><input id="gslOverride" type="checkbox"> También sobrescribir los SL manuales de las posiciones abiertas</label>
+    <div id="gslMsg" class="msg"></div>
+    <p class="note" id="gslNote">El valor se guarda y sobrevive a reinicios. Los SL fijados a mano en una posición se respetan salvo que marques la casilla.</p>
+  </section>
+
+  <!-- Radar -->
+  <section id="sec-radar" class="anchor">
+    <h2 class="sec"><span id="winnerCount">0</span> en el radar
+      <span class="sub">≥<span id="gainThreshold">20</span>% · cambio 24h en vivo</span></h2>
+    <div class="card" style="padding:0">
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Símbolo</th><th>Cambio 24h</th><th>Precio</th><th>Estado</th></tr></thead>
+          <tbody id="tbWinners"><tr><td colspan="4" class="muted">Esperando símbolos que superen el umbral…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Cooldowns -->
   <section id="cooldownSection" style="display:none">
-    <h2>🔒 Símbolos en cooldown — bloqueados 24h tras cierre</h2>
-    <table>
-      <thead><tr>
-        <th>Símbolo</th>
-        <th>Tiempo restante</th>
-        <th>Se desbloquea (UTC)</th>
-      </tr></thead>
-      <tbody id="tbCooldown"></tbody>
-    </table>
+    <h2 class="sec">🔒 En cooldown <span class="sub">bloqueados tras cierre</span></h2>
+    <div class="card" style="padding:0">
+      <div class="tablewrap">
+        <table class="rt">
+          <thead><tr><th>Símbolo</th><th>Tiempo restante</th><th>Se desbloquea (UTC)</th></tr></thead>
+          <tbody id="tbCooldown"></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 
-  <!-- Posiciones abiertas -->
-  <section>
-    <h2>Posiciones abiertas
-      <span style="color:var(--muted);font-size:12px;font-weight:400;margin-left:8px">
-        ⛔ SL configurable por posición (por defecto $-5.00)
-      </span>
+  <!-- Estadísticas MFE / MAE -->
+  <section id="sec-stats" class="anchor">
+    <h2 class="sec">📊 Estadísticas MFE / MAE
+      <span class="sub">máximo a favor / máximo en contra por operación</span>
+      <span class="grow"></span>
+      <a class="btn btn-ghost btn-sm" href="/api/trades.csv" download style="text-decoration:none">⬇ CSV</a>
     </h2>
-    <table>
-      <thead><tr>
-        <th>Símbolo</th><th>Cambio 24h (WS)</th><th>Entrada media</th>
-        <th>Precio WS</th><th>Notional</th><th>Objetivo TP</th>
-        <th>Stop Loss (precio)</th><th>Stop Loss (USD)</th><th>PnL tiempo real</th><th>Tramos</th>
-        <th>Cerrar</th>
-      </tr></thead>
-      <tbody id="tbPositions">
-        <tr><td colspan="11" style="color:var(--muted)">Sin posiciones</td></tr>
-      </tbody>
-    </table>
+    <div class="card">
+      <div class="statgrid">
+        <div class="stat"><div class="label">Operaciones</div><div class="v" id="stCount">0</div></div>
+        <div class="stat"><div class="label">% acierto (TP)</div><div class="v" id="stWin">—</div></div>
+        <div class="stat"><div class="label">MFE mediana</div><div class="v positive" id="stMfe">—</div></div>
+        <div class="stat"><div class="label">MAE mediana</div><div class="v negative" id="stMae">—</div></div>
+      </div>
+      <div class="twocol">
+        <div>
+          <div class="label">Por tipo de cierre (USD; MAE en valor absoluto)</div>
+          <div class="tablewrap">
+            <table>
+              <thead><tr><th>Grupo</th><th>N</th><th>MFE med</th><th>MFE p90</th><th>MAE med</th><th>MAE p90</th><th>MFE %</th><th>MAE %</th><th>Duración</th></tr></thead>
+              <tbody id="tbStatGroups"><tr><td colspan="9" class="muted">Sin datos aún</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <div class="label">¿Qué SL habría frenado ganadoras (TP)?</div>
+          <div class="tablewrap">
+            <table>
+              <thead><tr><th>SL USD</th><th>TP frenadas</th><th>%</th></tr></thead>
+              <tbody id="tbSlSim"><tr><td colspan="3" class="muted">Sin datos aún</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <p class="note">MFE = mejor PnL no realizado alcanzado durante la operación; MAE = peor. Se mide en cada tick del motor y se guarda al cerrar (archivo de estadísticas del servidor). Útil para calibrar TP y SL: si el MAE p90 de tus TP es bajo, un SL más ajustado casi no te quita ganadoras.</p>
+    </div>
   </section>
 
-  <!-- Ganadores -->
-  <section>
-    <h2>
-      <span id="winnerCount">0</span> símbolos activos (≥<span id="gainThreshold">15</span>% · 24h WS)
-      <span style="color:var(--muted);font-weight:400;font-size:13px">
-        · Filtrado cada 5 min: sub ALL → mantener ≥15% o posición abierta
-        &nbsp;|&nbsp; 🟠 = cooldown
-      </span>
-    </h2>
-    <table>
-      <thead><tr>
-        <th>Símbolo</th>
-        <th>Cambio 24h (WS)</th>
-        <th>Precio (markPrice)</th>
-        <th>Cond. kline</th>
-        <th>Short</th>
-        <th>Estado</th>
-      </tr></thead>
-      <tbody id="tbWinners">
-        <tr><td colspan="6" style="color:var(--muted)">Esperando primer ciclo de filtrado…</td></tr>
-      </tbody>
-    </table>
+  <!-- Historial -->
+  <section id="sec-hist" class="anchor">
+    <h2 class="sec">Operaciones cerradas <span id="totalRealizedBadge" class="sub"></span></h2>
+    <div class="card" style="padding:0">
+      <div class="tablewrap">
+        <table class="rt">
+          <thead><tr><th>Símbolo</th><th>Motivo</th><th>PnL</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Entrada</th><th>Cierre</th><th>Bloqueado hasta</th><th>Fecha</th></tr></thead>
+          <tbody id="tbClosed"><tr><td colspan="10" class="muted">Sin cierres aún</td></tr></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 
-  <!-- Cierres -->
-  <section>
-    <h2>Operaciones cerradas
-      <span id="totalRealizedBadge" style="margin-left:10px;font-size:13px;font-weight:400"></span>
-    </h2>
-    <table>
-      <thead><tr>
-        <th>Símbolo</th><th>Motivo</th><th>PnL realizado</th><th>Objetivo TP</th>
-        <th>Entrada media</th><th>Precio cierre</th>
-        <th>Bloqueado hasta</th><th>Fecha cierre</th>
-      </tr></thead>
-      <tbody id="tbClosed">
-        <tr><td colspan="8" style="color:var(--muted)">Sin cierres aún</td></tr>
-      </tbody>
-    </table>
-  </section>
-
-  <!-- Eventos -->
-  <section>
-    <h2>Eventos del bot</h2>
-    <pre id="events" style="background:transparent"></pre>
-  </section>
-
+  <!-- Diagnóstico -->
+  <details id="sec-diag" class="card anchor">
+    <summary>🛠 Diagnóstico del motor</summary>
+    <div class="diag">
+      <div class="stat"><div class="label">Última evaluación</div><div class="v" id="scan">—</div></div>
+      <div class="stat"><div class="label">Evaluaciones</div><div class="v" id="scanCount">—</div></div>
+      <div class="stat"><div class="label">Eval / s</div><div class="v violet" id="evalRate">—</div></div>
+      <div class="stat"><div class="label">Latencia tick→eval</div><div class="v teal" id="latency">—</div></div>
+      <div class="stat"><div class="label">Perpetuos (REST)</div><div class="v" id="allSymbols">—</div></div>
+      <div class="stat"><div class="label">Universo WS</div><div class="v" id="universe">—</div></div>
+      <div class="stat"><div class="label">Radar (bookTicker)</div><div class="v teal" id="subCount">—</div></div>
+      <div class="stat"><div class="label">En cooldown</div><div class="v warn" id="cooldownCount">—</div></div>
+      <div class="stat"><div class="label">WebSocket</div><div class="v" id="rbWs">—</div></div>
+      <div class="stat"><div class="label">Red de seguridad</div><div class="v" id="rbSafety">—</div></div>
+      <div class="stat"><div class="label">Executor</div><div class="v" id="executorStatus">—</div></div>
+    </div>
+    <div class="chips">
+      <div class="chip">ticker 24h: <b id="wsTickers" class="teal">—</b></div>
+      <div class="chip">precios: <b id="wsActive" class="violet">—</b></div>
+      <div class="chip">bookTicker msgs: <b id="bookTicks">—</b></div>
+      <div class="chip">stale: <b id="wsStale">—</b></div>
+      <div class="chip">kline pares: <b id="klPairs">—</b></div>
+      <div class="chip">kline msgs: <b id="klMsgs">—</b></div>
+      <div class="chip">kline conns: <b id="klConns">—</b></div>
+      <div class="chip">polls estado: <b id="pollCount">0</b></div>
+      <div class="chip">polls precios: <b id="livePollCount">0</b></div>
+    </div>
+    <h3 style="margin:18px 0 8px;font-size:14px">Eventos del bot</h3>
+    <pre id="events"></pre>
+  </details>
 </main>
 
-<!-- Modal: editar Stop Loss -->
-<div id="slModalOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6);
-     z-index:1000; align-items:center; justify-content:center;">
-  <div style="background:var(--card); border:1px solid var(--border); border-radius:12px;
-       padding:20px; width:320px; max-width:90vw;">
-    <h3 style="margin:0 0 4px 0; font-size:16px;">Editar Stop Loss</h3>
-    <p style="margin:0 0 14px 0; color:var(--muted); font-size:13px;">
-      Símbolo: <strong id="slModalSymbol" style="color:var(--txt)">—</strong>
-    </p>
-    <label style="display:block; font-size:12px; color:var(--muted); margin-bottom:6px;">
-      Pérdida máxima en USD (valor negativo, ej. -5)
-    </label>
-    <input id="slModalInput" type="number" step="0.1"
-           style="width:100%; box-sizing:border-box; background:#0f172a; color:var(--txt);
-           border:1px solid var(--border); border-radius:6px; padding:8px; font-size:14px;
-           margin-bottom:6px;">
-    <p id="slModalError" style="display:none; color:var(--red); font-size:12px; margin:0 0 10px 0;"></p>
-    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:10px;">
-      <button id="slModalCancel" class="btn-close" style="background:#334155;">Cancelar</button>
-      <button id="slModalSave" class="btn-close" style="background:#166534;">Guardar</button>
+<!-- Modal: SL individual -->
+<div id="slModalOverlay" class="overlay">
+  <div class="card modal">
+    <h3 style="margin:0 0 4px;font-size:16px">Editar Stop Loss</h3>
+    <p class="muted" style="margin:0 0 12px;font-size:13px">Símbolo: <strong id="slModalSymbol" style="color:var(--txt)">—</strong></p>
+    <div class="field">
+      <label for="slModalInput">Pérdida máxima en USD (negativo). Un SL manual se respeta siempre.</label>
+      <input id="slModalInput" type="number" step="0.1" inputmode="decimal">
+    </div>
+    <p id="slModalError" class="negative" style="display:none;font-size:12px;margin:8px 0 0"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+      <button id="slModalCancel" class="btn btn-ghost">Cancelar</button>
+      <button id="slModalSave" class="btn btn-orange">Guardar</button>
     </div>
   </div>
 </div>
@@ -2193,458 +2385,463 @@ HTML = r"""<!doctype html>
 const q     = id => document.getElementById(id);
 const n     = v  => { const p = Number(v); return isFinite(p) ? p : 0; };
 const fx    = (v, d=8) => n(v).toFixed(d);
-const money = v  => fx(v,4) + ' USDT';
-const pct   = v  => fx(v,2) + '%';
+const px    = v  => { const x = n(v), a = Math.abs(x); if (!x) return '0'; return x.toFixed(a >= 100 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 6 : 8); };
+const usd   = v  => fx(v, 3);
+const sgn   = v  => (n(v) > 0 ? '+' : '') + fx(v, 3);
+const pct   = v  => fx(v, 2) + '%';
 const cls   = v  => n(v) >= 0 ? 'positive' : 'negative';
-
-function tb(rows, fallback, cols) {
-  return rows.length
-    ? rows.join('')
-    : `<tr><td colspan="${cols}" style="color:var(--muted)">${fallback}</td></tr>`;
-}
+const setTxt = (id, txt) => { const el = q(id); if (el && el.textContent !== txt) el.textContent = txt; };
 
 function fmtCd(secs) {
   const s = Math.max(0, Math.floor(secs));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const r = s % 60;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
   if (h > 0) return `${h}h ${String(m).padStart(2,'0')}m`;
   if (m > 0) return `${m}m ${String(r).padStart(2,'0')}s`;
   return `${r}s`;
 }
+function fmtDur(secs) {
+  const s = Math.max(0, Math.floor(n(secs)));
+  if (s >= 3600) return `${Math.floor(s/3600)}h ${String(Math.floor((s%3600)/60)).padStart(2,'0')}m`;
+  if (s >= 60) return `${Math.floor(s/60)}m ${String(s%60).padStart(2,'0')}s`;
+  return `${s}s`;
+}
 
-let pollCount     = 0;
-let _cdData       = {};
-let _lastFetch    = 0;
-let _prevFilter   = 0;
-let _prevWsTicker = 0;
-let _filterAt     = 0;
-let _filterCycle  = 300;
+let pollCount = 0, livePollCount = 0, _cdData = {}, _lastFetch = 0, _prevScan = 0;
+let _entryLevels = [50], _posSyms = new Set(), _winSyms = new Set();
+let _posSig = '', _winSig = '', _persisted = false;
+let livePollMs = 250, statusPollMs = 1500;
 
-// Decrementa cooldowns y cuenta regresiva del ciclo de filtrado
 function tickTimers() {
   const elapsed = (Date.now() - _lastFetch) / 1000;
-
-  // Cooldowns
   Object.entries(_cdData).forEach(([sym, info]) => {
     const rem = Math.max(0, info.remaining_s - elapsed);
-    const elBadge = document.getElementById('cd_' + sym);
-    if (elBadge) {
-      if (rem > 0) {
-        elBadge.textContent  = '🔒 ' + fmtCd(rem);
-        elBadge.className    = 'cd-badge';
-      } else {
-        elBadge.textContent  = '✓ libre';
-        elBadge.className    = '';
-        elBadge.style.color  = 'var(--green)';
-      }
+    const el = q('cd_' + sym);
+    if (el) {
+      if (rem > 0) { el.textContent = '🔒 ' + fmtCd(rem); el.className = 'cd-badge'; }
+      else { el.textContent = '✓ libre'; el.className = ''; el.style.color = 'var(--green)'; }
     }
-    const trCd = document.getElementById('cdrow_' + sym);
-    if (trCd) {
-      const tdRem = trCd.querySelector('.cdrem');
-      if (tdRem) tdRem.textContent = rem > 0 ? fmtCd(rem) : 'Expirado';
-    }
+    const row = q('cdrow_' + sym);
+    if (row) { const t = row.querySelector('.cdrem'); if (t) t.textContent = rem > 0 ? fmtCd(rem) : 'Expirado'; }
   });
-
-  // Cuenta regresiva del próximo ciclo de filtrado
-  if (_filterAt > 0) {
-    const nextIn = Math.max(0, _filterCycle - elapsed);
-    q('nextFilter').textContent = nextIn > 0 ? `en ${fmtCd(nextIn)}` : 'pronto…';
-    q('fbNext').textContent     = nextIn > 0 ? fmtCd(nextIn) : 'pronto…';
-  }
 }
 setInterval(tickTimers, 1000);
 
-// ── Render ──────────────────────────────────────────────────────────────────
+function slStyle(slPx, mrkPx) {
+  const d = (slPx > 0 && mrkPx > 0) ? ((slPx - mrkPx) / mrkPx * 100) : 999;
+  return d < 2 ? 'color:var(--red)' : d < 5 ? 'color:var(--orange)' : '';
+}
+
+// ── Render completo (estructura) ────────────────────────────────────────────
 function render(d) {
   if (!d) return;
-  _lastFetch    = Date.now();
-  _filterAt     = n(d.last_filter_cycle_at || 0);  // no viene en snapshot directamente, usamos texto
-  _filterCycle  = n(d.filter_cycle_secs || 300);
+  _lastFetch = Date.now();
+  _persisted = d.state_source === 'persisted';
+  if (n(d.live_poll_ms))   livePollMs   = Math.max(100, n(d.live_poll_ms));
+  if (n(d.status_poll_ms)) statusPollMs = Math.max(500, n(d.status_poll_ms));
 
   const mode = d.mode || '—';
-  q('mode').textContent      = mode;
   q('modeBadge').textContent = mode;
-  q('modeBadge').className   = 'badge ' + (mode === 'REAL' ? 'badge-green' : 'badge-yellow');
+  q('modeBadge').className = 'badge ' + (mode === 'REAL' ? 'b-real' : 'b-paper');
+
+  const frac = n(d.first_tranche_sl_fraction || 0.251);
+  const defSl = n(d.default_stop_loss_usd ?? -8);
+  q('slHint').textContent = `1er tramo = notional×${frac} · 2+ tramos = ${fx(defSl, 2)} USD`;
+  setTxt('gslCurrent', fx(defSl, 2) + ' USD');
+  const gi = q('gslInput');
+  if (gi && document.activeElement !== gi && !gi.dataset.dirty) gi.value = defSl;
 
   const pu = n(d.total_unrealized);
-  q('pnl').textContent            = money(pu);
-  q('pnl').className              = 'value ' + cls(pu);
-
+  q('pnl').textContent = sgn(pu); q('pnl').className = 'value ' + cls(pu);
   const rp = n(d.total_realized_pnl);
-  q('realizedPnl').textContent    = money(rp);
-  q('realizedPnl').className      = 'value ' + cls(rp);
-
-  // Executor status
-  const exUrl = d.executor_url || '';
-  const exEl  = q('executorStatus');
-  if (exUrl) {
-    exEl.innerHTML = `<span class="executor-chip">🔗 ${exUrl.replace('https://','').split('/')[0]}</span>`;
-  } else {
-    exEl.innerHTML = `<span style="color:var(--muted);font-size:12px">No configurado</span>`;
-  }
-
-  q('notional').textContent       = money(d.total_notional);
-  {
-    const gcInput = q('globalCloseInput');
-    if (gcInput && document.activeElement !== gcInput) {
-      gcInput.value = (d.global_close_pnl_usd != null) ? d.global_close_pnl_usd : 40;
-    }
-  }
-  q('scan').textContent           = d.last_scan_text         || 'pendiente';
-  q('scanCount').textContent      = n(d.scan_count);
-  q('filterCycles').textContent   = n(d.filter_cycle_count);
-  q('lastFilter').textContent     = d.last_filter_text       || 'pendiente';
-  q('nextFilter').textContent     = d.next_filter_text       || '—';
-  q('allSymbols').textContent     = n(d.all_symbols_count);
-  q('subCount').textContent       = n(d.subscribed_count);
-  q('lastWsTicker').textContent   = d.last_ws_ticker_text    || 'pendiente';
-  q('cooldownCount').textContent  = n(d.cooldown_count);
-
-  // Filter bar info
-  const subCount  = n(d.subscribed_count);
-  const allCount  = n(d.all_symbols_count);
-  const threshold = n(d.min_gain_filter || 15);
-  q('fbAll').textContent       = allCount;
-  q('fbWait').textContent      = n(d.full_subscribe_wait || 30);
-  q('fbFiltered').textContent  = subCount;
-  q('fbThreshold').textContent = threshold;
-  q('fbUnsub').textContent     = Math.max(0, allCount - subCount);
-  q('gainThreshold').textContent = threshold;
-  q('fbNext').textContent      = d.next_filter_text || '—';
-
-  // Parpadeo del ciclo de filtrado
-  const fc = n(d.filter_cycle_count);
-  if (fc !== _prevFilter) {
-    q('dotFilter').className = 'on';
-    setTimeout(() => { q('dotFilter').className = ''; }, 1500);
-    _prevFilter = fc;
-  }
-
-  // Parpadeo del WS @ticker
-  const wtu = n(d.ws_ticker_updates);
-  if (wtu !== _prevWsTicker) {
-    q('dotWsTicker').className = 'on';
-    setTimeout(() => { q('dotWsTicker').className = ''; }, 800);
-    _prevWsTicker = wtu;
-  }
+  q('realizedPnl').textContent = sgn(rp); q('realizedPnl').className = 'value ' + cls(rp);
+  q('notional').textContent = fx(d.total_notional, 2);
+  const positions = Array.isArray(d.positions) ? d.positions : [];
+  q('openCount').textContent = positions.length;
+  q('rbWatchK').textContent = n(d.subscribed_count);
 
   const pw = d.price_ws || {}, kw = d.kline_ws || {};
-  q('wsFilterCycles').textContent = n(d.filter_cycle_count);
-  q('wsTickers').textContent  = n(pw.active_tickers);
-  q('wsTotal').textContent    = n(pw.total);
-  q('wsActive').textContent   = n(pw.active_prices);
-  q('wsTotal2').textContent   = n(pw.total);
-  q('wsStale').textContent    = n(pw.stale);
-  q('klPairs').textContent    = n(kw.pairs_with_data);
-  q('klMsgs').textContent     = n(kw.total_messages);
-  q('klConns').textContent    = n(kw.active_conns);
-  q('pollCount').textContent  = pollCount;
+  const threshold = n(d.min_gain_filter || 20);
+  q('scan').textContent = d.last_scan_text || 'pendiente';
+  q('scanCount').textContent = n(d.scan_count);
+  q('evalRate').textContent = fx(d.eval_rate, 0) + '/s';
+  q('latency').textContent = `${fx(d.latency_avg_ms, 1)} / ${fx(d.latency_max_ms, 1)} ms`;
+  q('allSymbols').textContent = n(d.all_symbols_count);
+  q('universe').textContent = n(d.universe_count);
+  q('subCount').textContent = n(d.subscribed_count);
+  q('cooldownCount').textContent = n(d.cooldown_count);
+  q('rbWs').textContent = d.ws_connected ? 'conectado' : 'desconectado';
+  q('rbWs').style.color = d.ws_connected ? 'var(--green)' : 'var(--red)';
+  q('rbSafety').textContent = n(d.safety_tick_secs) > 0 ? `${n(d.safety_tick_secs)} s` : 'off';
+  q('gainThreshold').textContent = threshold;
+  q('wsTickers').textContent = n(pw.active_tickers);
+  q('wsActive').textContent = n(pw.active_prices);
+  q('bookTicks').textContent = n(d.book_ticks);
+  q('wsStale').textContent = n(pw.stale);
+  q('klPairs').textContent = n(kw.pairs_with_data);
+  q('klMsgs').textContent = n(kw.total_messages);
+  q('klConns').textContent = n(kw.active_conns);
+  q('pollCount').textContent = pollCount;
+  q('livePollCount').textContent = livePollCount;
+
+  const exUrl = d.executor_url || '';
+  q('executorStatus').innerHTML = exUrl
+    ? `<span class="executor-chip">🔗 ${exUrl.replace('https://','').split('/')[0]}</span>`
+    : `<span class="muted" style="font-size:12px">No configurado</span>`;
 
   const err = d.last_error || d.last_startup_err || '';
   q('errorBox').style.display = err ? 'block' : 'none';
-  q('lastError').textContent  = err;
+  q('lastError').textContent = err;
 
   _cdData = {};
   Object.entries(d.cooldowns || {}).forEach(([sym, info]) => {
     _cdData[sym] = { remaining_s: n(info.remaining_s), unblock_utc: info.unblock_utc || '' };
   });
 
-  // ── Panel cooldowns ───────────────────────────────────────────────────────
+  // Cooldowns
   const cdEntries = Object.entries(d.cooldowns || {});
   q('cooldownSection').style.display = cdEntries.length ? 'block' : 'none';
-  q('tbCooldown').innerHTML = cdEntries.length
-    ? cdEntries
-        .sort((a, b) => n(b[1].remaining_s) - n(a[1].remaining_s))
-        .map(([sym, info]) => `
-          <tr id="cdrow_${sym}">
-            <td style="font-weight:700;color:var(--orange)">${sym}</td>
-            <td class="cdrem" style="color:var(--orange)">${fmtCd(n(info.remaining_s))}</td>
-            <td style="color:var(--muted)">${info.unblock_utc || ''}</td>
-          </tr>`)
-        .join('')
-    : '<tr><td colspan="3" style="color:var(--muted)">Ninguno activo</td></tr>';
+  q('tbCooldown').innerHTML = cdEntries
+    .sort((a, b) => n(b[1].remaining_s) - n(a[1].remaining_s))
+    .map(([sym, info]) => `
+      <tr id="cdrow_${sym}">
+        <td data-label="Símbolo" style="font-weight:800;color:var(--orange)">${sym}</td>
+        <td data-label="Restante" class="cdrem" style="color:var(--orange)">${fmtCd(n(info.remaining_s))}</td>
+        <td data-label="Desbloqueo" class="muted">${info.unblock_utc || ''}</td>
+      </tr>`).join('');
 
-  // ── Posiciones ────────────────────────────────────────────────────────────
-  const positions = Array.isArray(d.positions) ? d.positions : [];
-  q('tbPositions').innerHTML = tb(positions.map(p => {
-    const pnl    = n(p.unrealized_pnl);
-    const slPx   = n(p.stop_loss_price);
-    const mrkPx  = n(p.mark_price);
-    // Alerta si el precio está cerca del SL (dentro del 5%)
-    const slDist = slPx > 0 ? ((slPx - mrkPx) / mrkPx * 100) : 999;
-    const slCls  = slDist < 2 ? 'style="color:var(--red);font-weight:700"'
-                 : slDist < 5 ? 'style="color:var(--orange)"' : '';
-    const fills = (Array.isArray(p.fills) ? p.fills : [])
-      .map(f => `<span class="pill">+${fx(f.level,0)}% / ${fx(f.notional,2)}</span>`)
-      .join(' ');
-    const slUsd = n(p.stop_loss_usd);
-    return `<tr>
-      <td><a class="sym-link" href="https://www.binance.com/en/futures/${p.symbol}"
-             target="_blank">${p.symbol}</a></td>
-      <td class="${cls(p.change)}">${pct(p.change)}</td>
-      <td>${fx(p.avg_entry)}</td>
-      <td>${fx(p.mark_price)}</td>
-      <td>${money(p.notional)}</td>
-      <td class="positive">${money(p.target)}</td>
-      <td ${slCls}><span class="sl-badge">⛔ ${fx(slPx)}</span></td>
-      <td>
-        <button class="btn-close" style="padding:2px 8px"
-                onclick="editStopLoss('${p.symbol}', ${slUsd}, this)">${money(slUsd)}</button>
-      </td>
-      <td class="${cls(pnl)}">${money(pnl)}</td>
-      <td>${fills}</td>
-      <td><button class="btn-close" onclick="closePosition('${p.symbol}', this)">Cerrar</button></td>
-    </tr>`;
-  }), 'Sin posiciones abiertas', 10);
-
-  // ── Ganadores (símbolos activos ≥15%) ────────────────────────────────────
-  const winners     = Array.isArray(d.winners) ? d.winners : [];
-  const entryLevels = Array.isArray(d.entry_levels) ? d.entry_levels : [50];
-  q('winnerCount').textContent = winners.length;
-
-  q('tbWinners').innerHTML = tb(winners.map(w => {
-    const change     = n(w.change);
-    const cdSecs     = n(w.cooldown_remaining);
-    const inCooldown = cdSecs > 0;
-    const canTrade   = change >= entryLevels[0] && !inCooldown;
-    const rowCls     = inCooldown ? 'in-cooldown' : (canTrade ? 'can-trade' : '');
-
-    if (inCooldown && !_cdData[w.symbol]) {
-      _cdData[w.symbol] = { remaining_s: cdSecs, unblock_utc: w.cooldown_str || '' };
-    }
-
-    let statusHtml;
-    if (inCooldown) {
-      statusHtml = `<span id="cd_${w.symbol}" class="cd-badge">🔒 ${fmtCd(cdSecs)}</span>`;
-    } else if (w.price_blocked) {
-      statusHtml = `<span id="cd_${w.symbol}" style="color:var(--red)">⛔ precio alto</span>`;
-    } else if (canTrade) {
-      statusHtml = `<span id="cd_${w.symbol}" style="color:var(--green)">✓ libre</span>`;
-    } else {
-      statusHtml = `<span id="cd_${w.symbol}" style="color:var(--muted)">—</span>`;
-    }
-
-    return `<tr class="${rowCls}">
-      <td><a class="sym-link" href="https://www.binance.com/en/futures/${w.symbol}"
-             target="_blank">${w.symbol}</a></td>
-      <td class="${cls(change)}" style="font-weight:600">${pct(change)}</td>
-      <td>${fx(n(w.price))}</td>
-      <td>${canTrade
-            ? '<span style="color:var(--green)">✓ alcista</span>'
-            : '<span style="color:var(--muted)">—</span>'}</td>
-      <td>${w.can_short
-            ? '<span style="color:var(--green)">sí</span>'
-            : '<span style="color:var(--red)">no</span>'}</td>
-      <td>${statusHtml}</td>
-    </tr>`;
-  }), 'Esperando primer ciclo de filtrado…', 6);
-
-  // ── Cierres ───────────────────────────────────────────────────────────────
-  const closed = Array.isArray(d.closed_trades) ? d.closed_trades : [];
-
-  // Badge de total realizado en el encabezado de la sección
-  const trBadge = q('totalRealizedBadge');
-  if (trBadge) {
-    const rpv = n(d.total_realized_pnl);
-    const rpCls = rpv >= 0 ? 'positive' : 'negative';
-    trBadge.innerHTML = closed.length
-      ? `— PnL total realizado: <span class="${rpCls}" style="font-weight:700">${money(rpv)}</span>`
-      : '';
+  // Posiciones (se reconstruye solo si cambia la estructura)
+  _posSyms = new Set(positions.map(p => p.symbol));
+  const posSig = JSON.stringify(positions.map(p => [
+    p.symbol, p.avg_entry, p.qty, p.notional, p.target, p.stop_loss_usd, p.sl_mode,
+    (Array.isArray(p.fills) ? p.fills.length : 0)
+  ]));
+  if (posSig !== _posSig) {
+    _posSig = posSig;
+    q('posList').innerHTML = positions.length ? positions.map(p => {
+      const sym = p.symbol, pnl = n(p.unrealized_pnl);
+      const slPx = n(p.stop_loss_price), mrkPx = n(p.mark_price), slUsd = n(p.stop_loss_usd);
+      const fills = (Array.isArray(p.fills) ? p.fills : [])
+        .map(f => `<span class="pill">+${fx(f.level,0)}% · ${fx(f.notional,2)}</span>`).join('');
+      return `<article class="card pos" id="prow_${sym}">
+        <div class="pos-top">
+          <div>
+            <a class="sym" href="https://www.binance.com/en/futures/${sym}" target="_blank" rel="noopener">${sym}</a>
+            <span id="pc_${sym}" class="chg ${cls(p.change)}">${pct(p.change)}</span>
+          </div>
+          <div id="ppnl_${sym}" class="pnl ${cls(pnl)}">${sgn(pnl)}</div>
+        </div>
+        <div class="pgrid">
+          <div><span>Entrada media</span><b>${px(p.avg_entry)}</b></div>
+          <div><span>Precio en vivo</span><b id="pp_${sym}">${px(p.mark_price)}</b></div>
+          <div><span>Notional</span><b>${fx(p.notional, 2)} USDT</b></div>
+          <div><span>Objetivo TP</span><b class="positive">+${fx(p.target, 3)}</b></div>
+          <div id="pslc_${sym}" style="${slStyle(slPx, mrkPx)}"><span>SL (precio)</span><b id="psl_${sym}">${px(slPx)}</b></div>
+          <div><span>SL (USD)</span>
+            <button class="slbtn" onclick="editStopLoss('${sym}', ${slUsd})">${usd(slUsd)}</button>
+            <span class="tag">${p.sl_mode || ''}</span></div>
+          <div><span>MFE (máx. a favor)</span><b id="pmfe_${sym}" class="positive">${sgn(p.mfe_usd)}</b></div>
+          <div><span>MAE (máx. en contra)</span><b id="pmae_${sym}" class="negative">${sgn(p.mae_usd)}</b></div>
+        </div>
+        <div class="pills">${fills}</div>
+        <div class="pos-actions"><button class="btn btn-danger" onclick="closePosition('${sym}', this)">Cerrar posición</button></div>
+      </article>`;
+    }).join('') : '<div class="empty">Sin posiciones abiertas</div>';
   }
 
-  const reasonLabel = r => {
-    if (!r) return '—';
-    if (r === 'TP')     return '<span class="reason-tp">✅ TP</span>';
-    if (r === 'SL')     return '<span class="reason-sl">⛔ SL</span>';
-    if (r === 'MANUAL') return '<span class="reason-manual">✋ Manual</span>';
-    return `<span style="color:var(--muted)">${r}</span>`;
-  };
+  // Radar
+  const winners = Array.isArray(d.winners) ? d.winners : [];
+  _entryLevels = Array.isArray(d.entry_levels) && d.entry_levels.length ? d.entry_levels : [50];
+  _winSyms = new Set(winners.map(w => w.symbol));
+  q('winnerCount').textContent = winners.length;
+  const winSig = JSON.stringify(winners.map(w => [
+    w.symbol, n(w.cooldown_remaining) > 0, !!w.price_blocked, !!w.can_short, n(w.change) >= _entryLevels[0]
+  ]));
+  if (winSig !== _winSig) {
+    _winSig = winSig;
+    q('tbWinners').innerHTML = winners.length ? winners.map(w => {
+      const change = n(w.change), cdSecs = n(w.cooldown_remaining);
+      const inCd = cdSecs > 0, canTrade = change >= _entryLevels[0] && !inCd;
+      const rowCls = inCd ? 'in-cooldown' : (canTrade ? 'can-trade' : '');
+      if (inCd && !_cdData[w.symbol]) _cdData[w.symbol] = { remaining_s: cdSecs, unblock_utc: w.cooldown_str || '' };
+      let st;
+      if (inCd) st = `<span id="cd_${w.symbol}" class="cd-badge">🔒 ${fmtCd(cdSecs)}</span>`;
+      else if (w.price_blocked) st = `<span id="cd_${w.symbol}" class="negative">⛔ precio alto</span>`;
+      else if (canTrade) st = `<span id="cd_${w.symbol}" class="positive">✓ libre</span>`;
+      else st = `<span id="cd_${w.symbol}" class="muted">—</span>`;
+      return `<tr id="wrow_${w.symbol}" class="${rowCls}">
+        <td><a class="sym" style="font-size:14px" href="https://www.binance.com/en/futures/${w.symbol}" target="_blank" rel="noopener">${w.symbol}</a></td>
+        <td id="wc_${w.symbol}" class="${cls(change)}" style="font-weight:700">${pct(change)}</td>
+        <td id="wp_${w.symbol}">${px(w.price)}</td>
+        <td>${st}</td>
+      </tr>`;
+    }).join('') : '<tr><td colspan="4" class="muted">Esperando símbolos que superen el umbral…</td></tr>';
+  }
 
-  q('tbClosed').innerHTML = tb(closed.map(t => {
-    const pnlVal = n(t.pnl);
-    return `<tr>
-      <td style="font-weight:700">${t.symbol || ''}</td>
-      <td>${reasonLabel(t.reason)}</td>
-      <td class="${cls(pnlVal)}">${money(pnlVal)}</td>
-      <td>${money(t.target)}</td>
-      <td>${fx(t.avg_entry)}</td>
-      <td>${fx(t.close_price)}</td>
-      <td style="color:var(--orange)">${t.unblock_at || '—'}</td>
-      <td style="color:var(--muted)">${t.closed_at || ''}</td>
-    </tr>`;
-  }), 'Sin cierres aún', 8);
+  // Cierres
+  const closed = Array.isArray(d.closed_trades) ? d.closed_trades : [];
+  q('totalRealizedBadge').innerHTML = closed.length
+    ? `· total realizado: <b class="${cls(rp)}">${sgn(rp)} USDT</b>` : '';
+  const reasonLabel = r => r === 'TP' ? '<span class="r-tp">✅ TP</span>'
+    : r === 'SL' ? '<span class="r-sl">⛔ SL</span>'
+    : r === 'MANUAL' ? '<span class="r-manual">✋ Manual</span>'
+    : `<span class="muted">${r || '—'}</span>`;
+  q('tbClosed').innerHTML = closed.length ? closed.map(t => `<tr>
+      <td data-label="Símbolo" style="font-weight:800">${t.symbol || ''}</td>
+      <td data-label="Motivo">${reasonLabel(t.reason)}</td>
+      <td data-label="PnL" class="${cls(t.pnl)}" style="font-weight:700">${sgn(t.pnl)}</td>
+      <td data-label="MFE" class="positive">${t.mfe_usd === undefined ? '—' : sgn(t.mfe_usd)}</td>
+      <td data-label="MAE" class="negative">${t.mae_usd === undefined ? '—' : sgn(t.mae_usd)}</td>
+      <td data-label="Duración">${t.duration_s === undefined ? '—' : fmtDur(t.duration_s)}</td>
+      <td data-label="Entrada">${px(t.avg_entry)}</td>
+      <td data-label="Cierre">${px(t.close_price)}</td>
+      <td data-label="Bloqueado hasta" style="color:var(--orange)">${t.unblock_at || '—'}</td>
+      <td data-label="Fecha" class="muted">${t.closed_at || ''}</td>
+    </tr>`).join('') : '<tr><td colspan="10" class="muted">Sin cierres aún</td></tr>';
 
   q('events').textContent = (Array.isArray(d.events) ? d.events : []).join('\n');
 }
 
-// ── Modal: editar Stop Loss individual por posición ─────────────────────────
-let _slModalSymbol = null;
-let _slModalBtn    = null;
-
-function editStopLoss(symbol, currentSl, btn) {
-  _slModalSymbol = symbol;
-  _slModalBtn    = btn;
-  q('slModalSymbol').textContent = symbol;
-  q('slModalInput').value        = currentSl;
-  q('slModalError').style.display = 'none';
-  q('slModalError').textContent   = '';
-  q('slModalOverlay').style.display = 'flex';
-  setTimeout(() => q('slModalInput').focus(), 50);
-}
-
-function closeSlModal() {
-  q('slModalOverlay').style.display = 'none';
-  _slModalSymbol = null;
-  _slModalBtn    = null;
-}
-
-async function saveSlModal() {
-  const symbol = _slModalSymbol;
-  const btn    = _slModalBtn;
-  if (!symbol) return;
-
-  const raw   = q('slModalInput').value;
-  const slUsd = parseFloat(String(raw).replace(',', '.'));
-  if (isNaN(slUsd) || slUsd >= 0) {
-    q('slModalError').textContent   = 'El Stop Loss debe ser un número negativo (por ejemplo -5).';
-    q('slModalError').style.display = 'block';
-    return;
+// ── Refresco en vivo: parchea celdas ────────────────────────────────────────
+function applyLive(d) {
+  if (!d) return;
+  let mismatch = false;
+  const pos = d.positions || {};
+  const keys = Object.keys(pos);
+  for (const sym of keys) {
+    const p = pos[sym];
+    if (!q('prow_' + sym)) { mismatch = true; continue; }
+    setTxt('pp_' + sym, px(p.p));
+    const c = q('pc_' + sym);
+    if (c) { setTxt('pc_' + sym, pct(p.c)); c.className = 'chg ' + cls(p.c); }
+    const pn = q('ppnl_' + sym);
+    if (pn) { setTxt('ppnl_' + sym, sgn(p.pnl)); pn.className = 'pnl ' + cls(p.pnl); }
+    setTxt('psl_' + sym, px(p.sl));
+    const slc = q('pslc_' + sym);
+    if (slc) slc.style.cssText = slStyle(n(p.sl), n(p.p));
+    setTxt('pmfe_' + sym, sgn(p.mfe));
+    setTxt('pmae_' + sym, sgn(p.mae));
   }
+  if (keys.length !== _posSyms.size) mismatch = true;
 
-  const saveBtn = q('slModalSave');
-  saveBtn.disabled    = true;
-  saveBtn.textContent = '…';
+  const wins = Array.isArray(d.winners) ? d.winners : [];
+  const body = q('tbWinners');
+  let idx = 0;
+  for (const w of wins) {
+    const row = q('wrow_' + w.s);
+    if (!row) { mismatch = true; continue; }
+    setTxt('wp_' + w.s, px(w.p));
+    const c = q('wc_' + w.s);
+    if (c) { setTxt('wc_' + w.s, pct(w.c)); c.className = cls(w.c); }
+    if (body.children[idx] !== row) body.insertBefore(row, body.children[idx] || null);
+    idx++;
+  }
+  if (wins.length !== _winSyms.size) mismatch = true;
+
+  const pu = n(d.total_unrealized);
+  setTxt('pnl', sgn(pu)); q('pnl').className = 'value ' + cls(pu);
+  setTxt('scanCount', String(n(d.scan_count)));
+  setTxt('evalRate', fx(d.eval_rate, 0) + '/s');
+  setTxt('latency', `${fx(d.latency_avg_ms, 1)} / ${fx(d.latency_max_ms, 1)} ms`);
+  setTxt('subCount', String(n(d.watch_count)));
+  setTxt('rbWatchK', String(n(d.watch_count)));
+  setTxt('livePollCount', String(livePollCount));
+
+  if (n(d.scan_count) !== _prevScan) {
+    _prevScan = n(d.scan_count);
+    q('dotEngine').classList.add('on');
+    setTimeout(() => q('dotEngine').classList.remove('on'), 120);
+  }
+  if (mismatch && !_persisted) requestFull();
+}
+
+// ── Estadísticas MFE / MAE ──────────────────────────────────────────────────
+function renderStats(s) {
+  if (!s) return;
+  setTxt('stCount', String(n(s.count)));
+  setTxt('stWin', s.count ? fx(s.win_rate, 1) + '%' : '—');
+  const all = (s.groups || {}).ALL;
+  setTxt('stMfe', all && all.n ? '+' + fx(all.mfe_usd.median, 3) : '—');
+  setTxt('stMae', all && all.n ? '−' + fx(all.mae_usd.median, 3) : '—');
+
+  const names = { ALL: 'Todas', TP: '✅ TP', SL: '⛔ SL', MANUAL: '✋ Manual' };
+  const rows = ['ALL', 'TP', 'SL', 'MANUAL'].filter(k => (s.groups || {})[k] && s.groups[k].n)
+    .map(k => { const g = s.groups[k]; return `<tr>
+      <td style="font-weight:700">${names[k]}</td><td>${g.n}</td>
+      <td class="positive">${fx(g.mfe_usd.median, 3)}</td><td class="positive">${fx(g.mfe_usd.p90, 3)}</td>
+      <td class="negative">${fx(g.mae_usd.median, 3)}</td><td class="negative">${fx(g.mae_usd.p90, 3)}</td>
+      <td>${fx(g.mfe_pct.median, 1)}%</td><td>${fx(g.mae_pct.median, 1)}%</td>
+      <td>${fmtDur(g.duration_s.median)}</td></tr>`; });
+  q('tbStatGroups').innerHTML = rows.length ? rows.join('') : '<tr><td colspan="9" class="muted">Sin datos aún</td></tr>';
+
+  const sim = Array.isArray(s.sl_sim) ? s.sl_sim : [];
+  q('tbSlSim').innerHTML = sim.length && sim[0].tp_total
+    ? sim.map(r => `<tr><td>${fx(r.sl, 1)}</td><td>${r.tp_stopped} / ${r.tp_total}</td>
+        <td class="${n(r.pct) > 20 ? 'negative' : n(r.pct) > 5 ? 'warn' : 'positive'}">${fx(r.pct, 0)}%</td></tr>`).join('')
+    : '<tr><td colspan="3" class="muted">Aún no hay TP registrados</td></tr>';
+}
+
+let statsTimer = null;
+async function loadStats() {
   try {
-    const resp = await fetch(`/api/set-sl/${symbol}`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ sl_usd: slUsd }),
-      cache:   'no-store',
+    const resp = await fetch('/api/stats', { cache: 'no-store' });
+    if (resp.ok) renderStats(await resp.json());
+  } catch (e) { /* silencioso */ }
+  finally { clearTimeout(statsTimer); statsTimer = setTimeout(loadStats, 15000); }
+}
+
+// ── SL global ───────────────────────────────────────────────────────────────
+async function saveGlobalSl() {
+  const msg = q('gslMsg'), btn = q('gslSave');
+  const v = parseFloat(String(q('gslInput').value).replace(',', '.'));
+  msg.className = 'msg';
+  if (isNaN(v) || v >= 0) {
+    msg.className = 'msg negative'; msg.textContent = 'El SL global debe ser un número negativo (por ejemplo -6).'; return;
+  }
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const resp = await fetch('/api/set-default-sl', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+      body: JSON.stringify({ sl_usd: v, override_manual: q('gslOverride').checked }),
     });
     const data = await resp.json();
     if (data.ok) {
-      closeSlModal();
-      if (pollTimer) clearTimeout(pollTimer);
-      pollTimer = setTimeout(poll, 300);
+      delete q('gslInput').dataset.dirty;
+      const upd = (data.updated || []).length;
+      msg.className = 'msg positive';
+      msg.textContent = `✓ SL global = ${fx(v, 2)} USD · ${upd} posición(es) abierta(s) actualizada(s)`;
+      requestFull(true);
     } else {
-      q('slModalError').textContent   = data.error || `Error HTTP ${resp.status}`;
-      q('slModalError').style.display = 'block';
+      msg.className = 'msg negative'; msg.textContent = data.error || `Error HTTP ${resp.status}`;
     }
   } catch (err) {
-    q('slModalError').textContent   = `Error de red: ${err.message}`;
-    q('slModalError').style.display = 'block';
+    msg.className = 'msg negative'; msg.textContent = 'Error de red: ' + err.message;
   } finally {
-    saveBtn.disabled    = false;
-    saveBtn.textContent = 'Guardar';
+    btn.disabled = false; btn.textContent = 'Aplicar';
   }
+}
+
+// ── Modal SL por posición ───────────────────────────────────────────────────
+let _slModalSymbol = null;
+function editStopLoss(symbol, currentSl) {
+  _slModalSymbol = symbol;
+  q('slModalSymbol').textContent = symbol;
+  q('slModalInput').value = currentSl;
+  q('slModalError').style.display = 'none';
+  q('slModalOverlay').style.display = 'flex';
+  setTimeout(() => q('slModalInput').focus(), 50);
+}
+function closeSlModal() { q('slModalOverlay').style.display = 'none'; _slModalSymbol = null; }
+
+async function saveSlModal() {
+  const symbol = _slModalSymbol;
+  if (!symbol) return;
+  const slUsd = parseFloat(String(q('slModalInput').value).replace(',', '.'));
+  if (isNaN(slUsd) || slUsd >= 0) {
+    q('slModalError').textContent = 'El Stop Loss debe ser un número negativo (por ejemplo -5).';
+    q('slModalError').style.display = 'block'; return;
+  }
+  const saveBtn = q('slModalSave');
+  saveBtn.disabled = true; saveBtn.textContent = '…';
+  try {
+    const resp = await fetch(`/api/set-sl/${symbol}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sl_usd: slUsd }), cache: 'no-store',
+    });
+    const data = await resp.json();
+    if (data.ok) { closeSlModal(); requestFull(true); }
+    else { q('slModalError').textContent = data.error || `Error HTTP ${resp.status}`; q('slModalError').style.display = 'block'; }
+  } catch (err) {
+    q('slModalError').textContent = `Error de red: ${err.message}`; q('slModalError').style.display = 'block';
+  } finally { saveBtn.disabled = false; saveBtn.textContent = 'Guardar'; }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   q('slModalCancel').addEventListener('click', closeSlModal);
   q('slModalSave').addEventListener('click', saveSlModal);
-  q('slModalOverlay').addEventListener('click', (e) => {
-    if (e.target.id === 'slModalOverlay') closeSlModal();
-  });
-  q('slModalInput').addEventListener('keydown', (e) => {
+  q('slModalOverlay').addEventListener('click', e => { if (e.target.id === 'slModalOverlay') closeSlModal(); });
+  q('slModalInput').addEventListener('keydown', e => {
     if (e.key === 'Enter') saveSlModal();
     if (e.key === 'Escape') closeSlModal();
   });
+  q('gslSave').addEventListener('click', saveGlobalSl);
+  q('gslInput').addEventListener('input', () => { q('gslInput').dataset.dirty = '1'; });
+  q('gslInput').addEventListener('keydown', e => { if (e.key === 'Enter') saveGlobalSl(); });
 });
 
-// ── Cierre global configurable (PnL no realizado total) ─────────────────────
-async function saveGlobalClose() {
-  const input = q('globalCloseInput');
-  const errEl = q('globalCloseError');
-  const btn   = q('globalCloseSave');
-  errEl.style.display = 'none';
-  const val = parseFloat(input.value);
-  if (isNaN(val) || val <= 0) {
-    errEl.textContent   = 'El valor debe ser un número positivo (ej. 40).';
-    errEl.style.display = 'block';
-    return;
-  }
-  btn.disabled    = true;
-  btn.textContent = '…';
-  try {
-    const resp = await fetch('/api/set-global-close', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ pnl_usd: val }),
-      cache:   'no-store',
-    });
-    const data = await resp.json();
-    if (!data.ok) {
-      errEl.textContent   = data.error || `Error HTTP ${resp.status}`;
-      errEl.style.display = 'block';
-    }
-  } catch (err) {
-    errEl.textContent   = `Error de red: ${err.message}`;
-    errEl.style.display = 'block';
-  } finally {
-    btn.disabled    = false;
-    btn.textContent = 'Guardar';
-  }
-}
-
-// ── Cierre manual de posición ────────────────────────────────────────────────
+// ── Cierre manual ───────────────────────────────────────────────────────────
 async function closePosition(symbol, btn) {
   if (!confirm(`¿Cerrar posición ${symbol} al precio actual de mercado?\n\nEsta acción es irreversible.`)) return;
-  btn.disabled    = true;
-  btn.textContent = '…';
+  btn.disabled = true; btn.textContent = '…';
   try {
     const resp = await fetch(`/api/close/${symbol}`, { method: 'POST', cache: 'no-store' });
     const data = await resp.json();
-    if (data.ok) {
-      btn.textContent   = '✓';
-      btn.style.background = '#14532d';
-      btn.style.color      = '#86efac';
-      // Forzar poll inmediato para actualizar la tabla
-      if (pollTimer) clearTimeout(pollTimer);
-      pollTimer = setTimeout(poll, 300);
-    } else {
-      btn.disabled    = false;
-      btn.textContent = 'Cerrar';
-      alert(`Error al cerrar ${symbol}: ${data.error || `HTTP ${resp.status}`}`);
-    }
+    if (data.ok) { btn.textContent = '✓ Cerrada'; requestFull(true); setTimeout(loadStats, 1500); }
+    else { btn.disabled = false; btn.textContent = 'Cerrar posición'; alert(`Error al cerrar ${symbol}: ${data.error || `HTTP ${resp.status}`}`); }
   } catch (err) {
-    btn.disabled    = false;
-    btn.textContent = 'Cerrar';
+    btn.disabled = false; btn.textContent = 'Cerrar posición';
     alert(`Error de red al cerrar ${symbol}: ${err.message}`);
   }
 }
 
-// ── Polling fetch() cada 2 s ─────────────────────────────────────────────────
-let pollTimer   = null;
-let pollDelay   = 2000;
-let pollFailing = false;
+// ── Bucle 1: precios en vivo ────────────────────────────────────────────────
+let liveTimer = null, liveFails = 0;
+async function livePoll() {
+  const t0 = performance.now();
+  try {
+    const resp = await fetch('/api/live', { cache: 'no-store' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    livePollCount++; liveFails = 0;
+    q('dotLive').classList.add('on');
+    applyLive(data);
+  } catch (err) {
+    liveFails++; q('dotLive').classList.remove('on');
+  } finally {
+    const spent = performance.now() - t0;
+    const backoff = liveFails ? Math.min(3000, liveFails * 300) : 0;
+    liveTimer = setTimeout(livePoll, Math.max(0, livePollMs - spent) + backoff);
+  }
+}
 
-async function poll() {
+// ── Bucle 2: estructura completa ────────────────────────────────────────────
+let statusTimer = null, statusDelay = 1500, statusFailing = false, statusInFlight = false, _lastFull = 0;
+async function pollStatus() {
+  if (statusInFlight) return;
+  statusInFlight = true; _lastFull = Date.now();
   try {
     const resp = await fetch('/api/status', { cache: 'no-store' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     pollCount++;
-    q('dotPoll').className = 'on';
-    pollDelay   = 2000;
-    pollFailing = false;
+    q('dotPoll').classList.add('on');
+    statusDelay = statusPollMs; statusFailing = false;
     render(data);
   } catch (err) {
-    q('dotPoll').className = '';
-    if (!pollFailing) { console.warn('Poll error:', err.message); pollFailing = true; }
-    pollDelay = Math.min(pollDelay * 1.5, 15000);
+    q('dotPoll').classList.remove('on');
+    if (!statusFailing) { console.warn('Poll error:', err.message); statusFailing = true; }
+    statusDelay = Math.min(statusDelay * 1.5, 15000);
   } finally {
-    pollTimer = setTimeout(poll, pollDelay);
+    statusInFlight = false;
+    statusTimer = setTimeout(pollStatus, statusDelay);
   }
 }
+function requestFull(force) {
+  if (statusInFlight) return;
+  if (!force && Date.now() - _lastFull < 1000) return;
+  if (statusTimer) clearTimeout(statusTimer);
+  statusTimer = setTimeout(pollStatus, force ? 250 : 0);
+}
 
-poll();
-window.addEventListener('beforeunload', () => { if (pollTimer) clearTimeout(pollTimer); });
+livePoll();
+pollStatus();
+loadStats();
+window.addEventListener('beforeunload', () => {
+  [liveTimer, statusTimer, statsTimer].forEach(t => t && clearTimeout(t));
+});
 </script>
 </body>
 </html>
 """
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RUTAS FLASK
@@ -2652,7 +2849,7 @@ window.addEventListener('beforeunload', () => { if (pollTimer) clearTimeout(poll
 
 @app.get("/")
 def index():
-    resp = make_response(render_template_string(HTML))
+    resp = make_response(HTML)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
@@ -2660,6 +2857,14 @@ def index():
 @app.get("/api/status")
 def api_status():
     resp = jsonify(bot.snapshot())
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.get("/api/live")
+def api_live():
+    """Payload mínimo (precio, cambio y PnL) para el refresco en vivo del navegador."""
+    resp = jsonify(bot.live_payload())
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
@@ -2707,20 +2912,6 @@ def api_set_sl(symbol: str):
     return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o cerrada"}), 404
 
 
-@app.post("/api/set-global-close")
-def api_set_global_close():
-    """Configura el umbral de cierre global (PnL no realizado agregado, USD)."""
-    data = request.get_json(silent=True) or {}
-    try:
-        pnl_usd = float(data.get("pnl_usd"))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "pnl_usd inválido"}), 400
-    if pnl_usd <= 0:
-        return jsonify({"ok": False, "error": "pnl_usd debe ser un valor positivo"}), 400
-    bot.set_global_close(pnl_usd)
-    return jsonify({"ok": True, "pnl_usd": pnl_usd})
-
-
 @app.post("/api/force-close/<symbol>")
 def api_force_close(symbol: str):
     """Cierre de EMERGENCIA: ignora el guard anti-doble-cierre y libera el
@@ -2752,19 +2943,89 @@ def api_force_close(symbol: str):
     return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o ya cerrada"}), 404
 
 
+@app.get("/api/stats")
+def api_stats():
+    """Estadísticas agregadas de MFE / MAE de todas las operaciones cerradas."""
+    resp = jsonify(bot.compute_stats())
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.get("/api/trades")
+def api_trades():
+    """Operaciones cerradas con su MFE/MAE (últimas N, por defecto 200)."""
+    try:
+        limit = max(1, min(5000, int(request.args.get("limit", "200"))))
+    except ValueError:
+        limit = 200
+    with bot._stats_lock:
+        rows = list(bot.trade_stats[-limit:])
+    rows.reverse()
+    resp = jsonify(rows)
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.get("/api/trades.csv")
+def api_trades_csv():
+    """Descarga CSV de todo el histórico (para analizarlo en Excel / pandas)."""
+    cols = [
+        "trade_id", "symbol", "direction", "reason", "opened_at_ts", "closed_at_ts",
+        "duration_s", "avg_entry", "close_price", "qty", "notional", "fills_n", "levels",
+        "sl_usd", "target", "pnl", "pnl_pct", "mfe_usd", "mae_usd", "mfe_pct", "mae_pct",
+        "time_to_mfe_s", "time_to_mae_s", "low_price", "high_price",
+    ]
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(cols)
+    with bot._stats_lock:
+        rows = list(bot.trade_stats)
+    for r in rows:
+        out = []
+        for c in cols:
+            v = r.get(c, "")
+            out.append("|".join(str(x) for x in v) if isinstance(v, list) else v)
+        writer.writerow(out)
+    resp = make_response(buf.getvalue())
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = "attachment; filename=trade_stats.csv"
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.post("/api/set-default-sl")
+def api_set_default_sl():
+    """Cambia el SL global (USD, negativo) sin reiniciar el bot."""
+    data = request.get_json(silent=True) or {}
+    try:
+        sl_usd = float(data.get("sl_usd"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "sl_usd inválido"}), 400
+    if sl_usd >= 0:
+        return jsonify({"ok": False, "error": "sl_usd debe ser un valor negativo (pérdida)"}), 400
+    if sl_usd < -100000:
+        return jsonify({"ok": False, "error": "sl_usd fuera de rango"}), 400
+    override = bool(data.get("override_manual", False))
+    result = bot.set_default_stop_loss(sl_usd, override_manual=override)
+    return jsonify({"ok": True, **result})
+
+
 @app.get("/health")
 def health():
     snap = bot.snapshot()
     return jsonify({
-        "ok":                  True,
-        "running":             bot.running,
-        "mode":                snap["mode"],
-        "scan_count":          snap["scan_count"],
-        "filter_cycle_count":  snap["filter_cycle_count"],
-        "all_symbols_count":   snap["all_symbols_count"],
-        "subscribed_count":    snap["subscribed_count"],
-        "last_error":          snap["last_error"],
-        "cooldown_count":      snap["cooldown_count"],
+        "ok":                True,
+        "running":           bot.running,
+        "mode":              snap["mode"],
+        "ws_connected":      snap.get("ws_connected", False),
+        "scan_count":        snap["scan_count"],
+        "eval_rate":         snap.get("eval_rate", 0),
+        "latency_avg_ms":    snap.get("latency_avg_ms", 0),
+        "all_symbols_count": snap["all_symbols_count"],
+        "universe_count":    snap.get("universe_count", 0),
+        "subscribed_count":  snap["subscribed_count"],
+        "last_error":        snap["last_error"],
+        "cooldown_count":    snap["cooldown_count"],
     })
 
 
