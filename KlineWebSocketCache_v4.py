@@ -1,26 +1,26 @@
 """
-KlineWebSocketCache — v5  (detector de cruces EMA100 / EMA200 · memoria mínima)
-===============================================================================
+KlineWebSocketCache — v6  (detector de cruces EMA · hasta 1500 velas por símbolo)
+================================================================================
 
 QUÉ HACE
 ────────
   • Sigue las N (200) criptos USDT-M más activas (por volumen 24h).
-  • NO guarda velas. Por cada símbolo guarda solo 6 números: EMA rápida,
-    EMA lenta, último signo del cruce, open_time de la última vela, n y
-    un flag. Cada vela cerrada actualiza ambas EMA en O(1):
-        ema += alpha * (close - ema)
+  • Por cada símbolo guarda los últimos `max_candles` CIERRES (máximo 1500,
+    límite de Binance por petición) en un array('d') de 8 bytes por vela:
+    200 símbolos × 1500 velas ≈ 2.4 MB en total.
+  • Las EMA rápida/lenta se mantienen de forma incremental (O(1) por vela
+    cerrada) y se pueden CAMBIAR EN CALIENTE con set_periods(fast, slow):
+    se recalculan al instante desde los cierres guardados, sin volver a
+    descargar nada y sin disparar cruces falsos.
   • Cuando en una vela CERRADA la EMA rápida cruza la lenta, dispara el
     callback  cb(symbol, "UP" | "DOWN", close_price, close_time_ms).
-        UP   = EMA100 cruza hacia ARRIBA de la EMA200
-        DOWN = EMA100 cruza hacia ABAJO  de la EMA200
+        UP   = EMA rápida cruza hacia ARRIBA de la EMA lenta
+        DOWN = EMA rápida cruza hacia ABAJO  de la EMA lenta
 
-POR QUÉ NO NUMBA / PANDAS
-─────────────────────────
-  La EMA incremental son 2 multiplicaciones por vela cerrada y por
-  símbolo (~400 cierres/min en total). Numba cargaría LLVM (~100+ MB de
-  RAM) para acelerar algo que ya cuesta microsegundos; pandas, otros
-  ~60 MB solo por importarse. Aquí solo se importan aiohttp y websockets.
-  El estado completo de 200 símbolos pesa unas decenas de KB.
+PERIODO MÁXIMO
+──────────────
+  Para que una EMA sea fiable necesita ~3 veces su periodo de historia, así
+  que con 1500 velas el periodo máximo admitido es 500 (max_period).
 
 FLUJO
 ─────
@@ -28,12 +28,14 @@ FLUJO
      refresca cada universe_refresh_seconds). Histéresis: un símbolo ya
      seguido no sale hasta caer del puesto top_n + rank_margin, y los
      símbolos "pinned" (posiciones abiertas) nunca salen.
-  2. Warm-up por REST: UNA petición (limit=500, peso 2) por símbolo nuevo
-     para sembrar las EMA. Las velas se descartan al instante.
+  2. Warm-up por REST: UNA petición (limit=max_candles, peso 10) por símbolo
+     nuevo para llenar el historial de cierres y sembrar las EMA.
   3. WebSocket único con SUBSCRIBE/UNSUBSCRIBE en caliente. Solo se
      parsean los mensajes con x=true (vela cerrada).
   4. Si falta una vela (corte de red) se detecta por el hueco en
      open_time y SOLO ese símbolo se re-siembra por REST.
+  5. Todo el estado se modifica únicamente desde el hilo/loop del cache
+     (también set_periods), así que no hay condiciones de carrera.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ import os
 import random
 import threading
 import time
+from array import array
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
@@ -88,15 +91,20 @@ class _TokenBucket:
 # =============================================================================
 
 class _EmaState:
-    __slots__ = ("fast", "slow", "sign", "last_ot", "n", "ready")
+    """Historial de cierres (máx. max_candles) + EMA actuales de un símbolo."""
+    __slots__ = ("closes", "fast", "slow", "sign", "last_ot", "ready")
 
     def __init__(self) -> None:
+        self.closes  = array("d")   # últimos cierres, el más reciente al final
         self.fast    = 0.0
         self.slow    = 0.0
         self.sign    = 0      # último signo NO cero de (fast - slow)
         self.last_ot = 0      # open_time (ms) de la última vela procesada
-        self.n       = 0      # velas procesadas (para exigir historial mínimo)
         self.ready   = False  # False mientras se siembra por REST
+
+    @property
+    def n(self) -> int:       # velas disponibles en el historial
+        return len(self.closes)
 
 
 SignalCallback = Callable[[str, str, float, int], None]
@@ -110,6 +118,7 @@ class KlineWebSocketCache:
     """Detector de cruces EMA fast/slow sobre las N criptos más activas."""
 
     BASE_REST_URL = "https://fapi.binance.com"
+    MAX_KLINES    = 1500        # máximo de velas por petición REST de Binance
     # Mismo endpoint que usa WS.py (por defecto). Sobrescribible con KLINE_WS_URL.
     DEFAULT_WS_URL = os.environ.get("KLINE_WS_URL", "wss://fstream.binance.com/market/stream")
 
@@ -120,7 +129,7 @@ class KlineWebSocketCache:
         top_n: int = 200,
         fast_period: int = 100,
         slow_period: int = 200,
-        warmup_candles: int = 500,
+        max_candles: int = 1500,
         min_candles: Optional[int] = None,
         universe_provider: Optional[Callable[[], List[str]]] = None,
         pinned_provider: Optional[Callable[[], List[str]]] = None,
@@ -135,12 +144,15 @@ class KlineWebSocketCache:
     ) -> None:
         self.interval       = interval
         self.top_n          = int(top_n)
-        self.fast_period    = int(fast_period)
-        self.slow_period    = int(slow_period)
-        self.warmup_candles = max(int(warmup_candles), self.slow_period + 10)
-        self.min_candles    = int(min_candles) if min_candles else self.slow_period
-        self._af = 2.0 / (self.fast_period + 1)
-        self._as = 2.0 / (self.slow_period + 1)
+        # Historial por símbolo: máximo 1500 (límite de Binance por petición)
+        self.max_candles    = max(50, min(int(max_candles), self.MAX_KLINES))
+        # Con ~3× el periodo de historia la EMA ya es fiable
+        self.max_period     = max(2, self.max_candles // 3)
+        self._fixed_min     = int(min_candles) if min_candles else None
+        self.fast_period    = 0
+        self.slow_period    = 0
+        self._af = self._as = 0.0
+        self._apply_periods_values(int(fast_period), int(slow_period))
         self._iv_ms = self._interval_ms(interval)
 
         self._provider        = universe_provider
@@ -199,6 +211,82 @@ class KlineWebSocketCache:
         u = "".join(c for c in interval if c.isalpha())
         return n * units.get(u, 60_000)
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Periodos de EMA (cambiables en caliente)
+    # ─────────────────────────────────────────────────────────────────────
+
+    @property
+    def min_candles(self) -> int:
+        """Velas mínimas para aceptar un cruce (por defecto = periodo lento)."""
+        return self._fixed_min or self.slow_period
+
+    def validate_periods(self, fast: int, slow: int) -> Tuple[int, int]:
+        try:
+            fast, slow = int(fast), int(slow)
+        except (TypeError, ValueError):
+            raise ValueError("Los periodos deben ser números enteros")
+        if fast < 2:
+            raise ValueError("La EMA rápida debe ser ≥ 2")
+        if fast >= slow:
+            raise ValueError("La EMA rápida debe ser menor que la EMA lenta")
+        if slow > self.max_period:
+            raise ValueError(
+                f"La EMA lenta no puede superar {self.max_period} "
+                f"(con {self.max_candles} velas guardadas por símbolo)")
+        return fast, slow
+
+    def _apply_periods_values(self, fast: int, slow: int) -> None:
+        fast, slow = self.validate_periods(fast, slow)
+        self.fast_period = fast
+        self.slow_period = slow
+        self._af = 2.0 / (fast + 1)
+        self._as = 2.0 / (slow + 1)
+
+    def _recompute(self, st: _EmaState) -> None:
+        """Recalcula fast/slow/sign desde el historial de cierres (sin emitir cruces)."""
+        closes = st.closes
+        if not closes:
+            st.fast = st.slow = 0.0
+            st.sign = 0
+            return
+        af, as_ = self._af, self._as
+        fast = slow = closes[0]
+        sign = 0
+        for i in range(1, len(closes)):
+            c = closes[i]
+            fast += af * (c - fast)
+            slow += as_ * (c - slow)
+            d = fast - slow
+            if d > 0.0:
+                sign = 1
+            elif d < 0.0:
+                sign = -1
+        st.fast, st.slow, st.sign = fast, slow, sign
+
+    def _apply_periods_now(self, fast: int, slow: int) -> int:
+        """Aplica los periodos y recalcula todos los símbolos. Debe ejecutarse
+        en el loop del cache (o con el cache parado). Devuelve nº recalculados."""
+        self._apply_periods_values(fast, slow)
+        done = 0
+        for st in self._states.values():
+            if st.ready and st.closes:
+                self._recompute(st)
+                done += 1
+        return done
+
+    def set_periods(self, fast: int, slow: int) -> int:
+        """Cambia EMA rápida/lenta EN CALIENTE. Recalcula con los cierres
+        guardados (no descarga nada) y NO emite cruces por el cambio.
+        Lanza ValueError si los valores no son válidos."""
+        fast, slow = self.validate_periods(fast, slow)          # valida ya, en el hilo llamador
+        loop = self._loop
+        if self._running and loop is not None and loop.is_running():
+            async def _do() -> int:
+                return self._apply_periods_now(fast, slow)
+            fut = asyncio.run_coroutine_threadsafe(_do(), loop)
+            return fut.result(timeout=15)
+        return self._apply_periods_now(fast, slow)
+
     def set_signal_callback(self, cb: Optional[SignalCallback]) -> None:
         """cb(symbol, "UP"|"DOWN", close_price, close_time_ms). Se llama desde
         el hilo del WS: debe ser instantáneo (encolar y salir)."""
@@ -214,15 +302,22 @@ class KlineWebSocketCache:
     # EMA incremental + detección de cruce  (núcleo, O(1))
     # ─────────────────────────────────────────────────────────────────────
 
+    def _push_close(self, st: _EmaState, close: float) -> None:
+        """Añade un cierre al historial (máx. max_candles)."""
+        st.closes.append(close)
+        if len(st.closes) > self.max_candles:
+            del st.closes[0]
+
     def _step(self, st: _EmaState, close: float) -> int:
-        """Actualiza las EMA con una vela cerrada.
+        """Procesa una vela cerrada: guarda el cierre y actualiza las EMA.
         Devuelve +1 (cruce hacia arriba), -1 (hacia abajo) o 0 (sin cruce)."""
-        if st.n == 0:
+        first = not st.closes
+        self._push_close(st, close)
+        if first:
             st.fast = st.slow = close
         else:
             st.fast += self._af * (close - st.fast)
             st.slow += self._as * (close - st.slow)
-        st.n += 1
         d   = st.fast - st.slow
         new = 1 if d > 0.0 else (-1 if d < 0.0 else 0)
         cross = 0
@@ -313,7 +408,7 @@ class KlineWebSocketCache:
     async def _warmup(self, sym: str) -> None:
         retry = False
         try:
-            limit  = self.warmup_candles
+            limit  = self.max_candles
             params = {"symbol": sym, "interval": self.interval, "limit": limit}
             async with self._sem:
                 data = await self._fetch(
@@ -329,9 +424,12 @@ class KlineWebSocketCache:
                 if int(k[6]) >= now_ms:              # vela aún abierta
                     continue
                 new.last_ot = int(k[0])
-                self._step(new, float(k[4]))
+                new.closes.append(float(k[4]))
             del data
-            new.ready = new.n > 0
+            if len(new.closes) > self.max_candles:   # por seguridad
+                del new.closes[:len(new.closes) - self.max_candles]
+            self._recompute(new)                     # EMA con los periodos ACTUALES
+            new.ready = len(new.closes) > 0
             self._states[sym] = new
 
             for ot, c, ct in self._pending.pop(sym, []):   # velas llegadas durante la siembra
@@ -529,8 +627,9 @@ class KlineWebSocketCache:
                                                keepalive_timeout=30))
             self._spawn(self._ws_loop())
             self._spawn(self._universe_loop())
-            print(f"🚀 KlineEMA v5: EMA{self.fast_period}/EMA{self.slow_period} "
-                  f"· {self.interval} · top {self.top_n} más activas")
+            print(f"🚀 KlineEMA v6: EMA{self.fast_period}/EMA{self.slow_period} "
+                  f"· {self.interval} · top {self.top_n} más activas "
+                  f"· {self.max_candles} velas/símbolo")
 
         asyncio.run_coroutine_threadsafe(_startup(), loop)
 
@@ -583,6 +682,11 @@ class KlineWebSocketCache:
     def get_stats(self) -> dict:
         states = list(self._states.values())
         return {
+            "fast_period":       self.fast_period,
+            "slow_period":       self.slow_period,
+            "max_period":        self.max_period,
+            "max_candles":       self.max_candles,
+            "stored_candles":    sum(s.n for s in states),
             "tracked_symbols":   len(states),
             "ready_symbols":     sum(1 for s in states if s.ready and s.n >= self.min_candles),
             "warming":           len(self._warming),
