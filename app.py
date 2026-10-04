@@ -218,6 +218,13 @@ EMA_INTERVAL           = os.getenv("EMA_INTERVAL", "1m")
 EMA_FAST               = int(os.getenv("EMA_FAST", "100"))
 EMA_SLOW               = int(os.getenv("EMA_SLOW", "200"))
 EMA_TOP_N              = int(os.getenv("EMA_TOP_N", "200"))
+# Velas (cierres) guardadas por símbolo: máximo 1500 (límite de Binance por petición).
+# Con 1500 velas el periodo máximo admitido para la EMA lenta es 500 (≈ 3× de historia).
+EMA_MAX_CANDLES        = max(50, min(int(os.getenv("EMA_MAX_CANDLES", "1500")), 1500))
+EMA_MAX_PERIOD         = max(2, EMA_MAX_CANDLES // 3)
+if not (2 <= EMA_FAST < EMA_SLOW <= EMA_MAX_PERIOD):
+    print(f"EMA_FAST/EMA_SLOW inválidas ({EMA_FAST}/{EMA_SLOW}); uso 100/200", flush=True)
+    EMA_FAST, EMA_SLOW = 100, 200
 EMA_UNIVERSE_REFRESH_S = float(os.getenv("EMA_UNIVERSE_REFRESH_S", "900"))
 ENTRY_ERROR_BACKOFF_S  = float(os.getenv("ENTRY_ERROR_BACKOFF_S",  "5"))    # pausa tras fallo al abrir
 CLOSE_ERROR_BACKOFF_S  = float(os.getenv("CLOSE_ERROR_BACKOFF_S",  "3"))    # pausa tras fallo al cerrar
@@ -244,6 +251,8 @@ ENTRY_NOTIONALS = [float(x) for x in os.getenv("ENTRY_NOTIONALS", "5,5,10,20,40,
 # Nombre de variable de entorno NUEVO a propósito: así un TAKE_PROFIT_FRACTION=0.14284
 # viejo en tu hosting no pisa el 0.07.
 TAKE_PROFIT_FRACTION = float(os.getenv("EMA_TAKE_PROFIT_FRACTION", "0.07"))
+# Rango permitido al cambiarlo desde la web (fracción del notional: 0.07 = 7 %)
+TP_MIN, TP_MAX = 0.001, 5.0
 
 # Stop loss por defecto en USD (pérdida absoluta, valor negativo). Es el SL
 # "estándar": se usa en cuanto la posición tiene 2 o más tramos.
@@ -268,16 +277,49 @@ SETTINGS_FILE = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.jso
 
 
 def _load_settings() -> None:
-    """Restaura el SL global guardado desde la web (sobrescribe el valor de entorno)."""
-    global DEFAULT_STOP_LOSS_USD
+    """Restaura los ajustes guardados desde la web (SL global, multiplicador del TP,
+    EMA rápida/lenta). Sobrescriben los valores de entorno."""
+    global DEFAULT_STOP_LOSS_USD, TAKE_PROFIT_FRACTION, EMA_FAST, EMA_SLOW
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
+    except Exception:
+        return
+    try:
         val = float(data.get("default_stop_loss_usd"))
         if val < 0:
             DEFAULT_STOP_LOSS_USD = val
     except Exception:
         pass
+    try:
+        tp = float(data.get("take_profit_fraction"))
+        if TP_MIN <= tp <= TP_MAX:
+            TAKE_PROFIT_FRACTION = tp
+    except Exception:
+        pass
+    try:
+        f, sl = int(data.get("ema_fast")), int(data.get("ema_slow"))
+        if 2 <= f < sl <= EMA_MAX_PERIOD:
+            EMA_FAST, EMA_SLOW = f, sl
+    except Exception:
+        pass
+
+
+def _save_settings() -> Optional[str]:
+    """Guarda TODOS los ajustes editables en disco (atómico). Devuelve error o None."""
+    tmp = f"{SETTINGS_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({
+                "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
+                "take_profit_fraction":  TAKE_PROFIT_FRACTION,
+                "ema_fast":              EMA_FAST,
+                "ema_slow":              EMA_SLOW,
+            }, fh)
+        os.replace(tmp, SETTINGS_FILE)
+        return None
+    except Exception as exc:
+        return str(exc)
 
 
 _load_settings()
@@ -585,6 +627,10 @@ class TradingBot:
         # ── Guardia anti doble cierre ─────────────────────────────────────
         self._closing_symbols: set[str] = set()
 
+        # ── Cierre masivo "una a una" (estado visible en la web) ──────────
+        self._close_all_active = False        # mientras es True no se abren entradas/DCA nuevos
+        self.close_all_state: Dict[str, Any] = self._empty_close_all()
+
         # ── Executor bridge ───────────────────────────────────────────────
         self._trade_id_seq: int = 0
         self.executor = ExecutorBridge(
@@ -770,6 +816,7 @@ class TradingBot:
             top_n                    = EMA_TOP_N,
             fast_period              = EMA_FAST,
             slow_period              = EMA_SLOW,
+            max_candles              = EMA_MAX_CANDLES,
             universe_provider        = self._top_active_symbols,
             pinned_provider          = self._open_position_symbols,
             universe_refresh_seconds = EMA_UNIVERSE_REFRESH_S,
@@ -777,7 +824,7 @@ class TradingBot:
         self.kline_cache.set_signal_callback(self._on_cross)
         self.kline_cache.start()
         self.log(f"KlineCache EMA{EMA_FAST}/EMA{EMA_SLOW} {EMA_INTERVAL} iniciado "
-                 f"(top {EMA_TOP_N} por volumen)")
+                 f"(top {EMA_TOP_N} por volumen · hasta {EMA_MAX_CANDLES} velas por símbolo)")
 
     def _on_cross(self, symbol: str, direction: str, price: float, close_ms: int) -> None:
         """Callback del kline cache (hilo del WS de velas): solo traspasa al loop del bot."""
@@ -793,6 +840,8 @@ class TradingBot:
         """Cruce EMA recién cerrado: UP → LONG, DOWN → SHORT. Abre el 1.er tramo.
         Si ya hay posición abierta el cruce se ignora (el DCA/TP/SL la gestionan)."""
         if not self._is_tradable(symbol):
+            return
+        if self._close_all_active:            # cierre masivo en curso: no abrir nada nuevo
             return
         side = "LONG" if direction == "UP" else "SHORT"
         now = time.time()
@@ -1213,6 +1262,8 @@ class TradingBot:
     def _check_dca(self, symbol: str, price: float) -> None:
         """Tramos siguientes del DCA: se abren cuando el precio va EN CONTRA de la
         1.ª entrada los % de ENTRY_LEVELS (el nivel 0 ya lo abrió el cruce EMA)."""
+        if self._close_all_active:            # cierre masivo en curso: sin DCA nuevo
+            return
         if symbol in self._entry_inflight or symbol in self._closing_symbols:
             return
         if time.time() < self._entry_backoff.get(symbol, 0.0):
@@ -1618,13 +1669,9 @@ class TradingBot:
                 pos.refresh_auto_sl()
                 if pos.sl_usd != before:
                     updated.append(sym)
-        tmp = f"{SETTINGS_FILE}.tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"default_stop_loss_usd": DEFAULT_STOP_LOSS_USD}, fh)
-            os.replace(tmp, SETTINGS_FILE)
-        except Exception as exc:
-            self.log(f"No pude guardar ajustes: {exc}")
+        err = _save_settings()
+        if err:
+            self.log(f"No pude guardar ajustes: {err}")
         self.log(f"SL GLOBAL = {DEFAULT_STOP_LOSS_USD:.4f} USD "
                  f"(posiciones actualizadas: {', '.join(updated) or 'ninguna'}"
                  f"{' | manuales sobrescritos' if override_manual else ''})")
@@ -1654,6 +1701,151 @@ class TradingBot:
         symbol = symbol.upper().strip()
         price = self._display_price(symbol)
         return await self._close_position(symbol, price, "MANUAL")
+
+    # ── Multiplicador del TP editable en caliente ─────────────────────────────
+
+    def set_take_profit(self, fraction: float) -> dict:
+        """Cambia el multiplicador del TP (objetivo = notional × fraction). Se aplica
+        ya a TODAS las posiciones abiertas y se guarda en disco. ValueError si es inválido."""
+        global TAKE_PROFIT_FRACTION
+        fraction = float(fraction)
+        if not (TP_MIN <= fraction <= TP_MAX):
+            raise ValueError(f"El multiplicador del TP debe estar entre {TP_MIN:g} y {TP_MAX:g}")
+        TAKE_PROFIT_FRACTION = fraction
+        err = _save_settings()
+        if err:
+            self.log(f"No pude guardar ajustes: {err}")
+        self.log(f"TP MULTIPLICADOR = {fraction:g} ({fraction * 100:g}% del notional) — "
+                 f"aplicado a las posiciones abiertas")
+        self.persist_state()
+        for sym in self._open_position_symbols():
+            self._enqueue(sym)              # reevalúa ya con el nuevo objetivo
+        return {"take_profit_fraction": fraction, "take_profit_pct": fraction * 100.0}
+
+    # ── EMA rápida / lenta editables en caliente ──────────────────────────────
+
+    def set_ema_periods(self, fast: int, slow: int) -> dict:
+        """Cambia EMA rápida/lenta. El cache recalcula con los cierres guardados
+        (hasta 1500 por símbolo) sin descargar nada y sin emitir cruces falsos.
+        ValueError si los periodos no son válidos."""
+        global EMA_FAST, EMA_SLOW
+        kc = self.kline_cache
+        if kc is None:
+            raise RuntimeError("El detector de EMA no está activo todavía")
+        recomputed = kc.set_periods(fast, slow)          # valida y recalcula (ValueError si falla)
+        EMA_FAST, EMA_SLOW = kc.fast_period, kc.slow_period
+        err = _save_settings()
+        if err:
+            self.log(f"No pude guardar ajustes: {err}")
+        self.log(f"EMA cambiada a {EMA_FAST}/{EMA_SLOW} ({EMA_INTERVAL}) — "
+                 f"{recomputed} símbolos recalculados con su historial")
+        self.persist_state()
+        return {"ema_fast": EMA_FAST, "ema_slow": EMA_SLOW, "recomputed": recomputed}
+
+    # ── Cierre masivo, una operación tras otra ────────────────────────────────
+
+    @staticmethod
+    def _empty_close_all() -> Dict[str, Any]:
+        return {"running": False, "cancel": False, "total": 0, "done": 0, "ok": 0,
+                "failed": 0, "current": "", "failed_symbols": [],
+                "started": 0.0, "finished": 0.0}
+
+    def close_all_view(self) -> dict:
+        with self.lock:
+            v = dict(self.close_all_state)
+            v["failed_symbols"] = list(v.get("failed_symbols", []))
+        return v
+
+    def start_close_all(self) -> dict:
+        """Lanza el cierre secuencial de TODAS las posiciones abiertas (desde Flask).
+        Devuelve al instante; el progreso se lee en close_all_view()."""
+        if not self.loop or not self.loop.is_running():
+            return {"ok": False, "error": "Bot loop no está activo", "code": 503}
+        with self.lock:
+            if self.close_all_state.get("running"):
+                return {"ok": False, "error": "Ya hay un cierre masivo en curso", "code": 409}
+            n_open = sum(1 for p in self.positions.values() if p.status == "OPEN" and p.fills)
+            if n_open == 0:
+                return {"ok": False, "error": "No hay posiciones abiertas", "code": 404}
+            self.close_all_state = self._empty_close_all()
+            self.close_all_state.update(running=True, total=n_open, started=time.time())
+            self._close_all_active = True
+        asyncio.run_coroutine_threadsafe(self._close_all_sequential(), self.loop)
+        return {"ok": True, "total": n_open}
+
+    def cancel_close_all(self) -> bool:
+        with self.lock:
+            if not self.close_all_state.get("running"):
+                return False
+            self.close_all_state["cancel"] = True
+        self.log("Cierre masivo: cancelación solicitada (termina la operación en curso)")
+        return True
+
+    def _is_open(self, symbol: str) -> bool:
+        with self.lock:
+            pos = self.positions.get(symbol)
+            return bool(pos and pos.status == "OPEN" and pos.fills)
+
+    async def _close_one_for_bulk(self, symbol: str) -> bool:
+        """Cierra UNA posición a mercado. Reintenta hasta 3 veces (p. ej. si un TP/SL
+        la está cerrando justo ahora). True si la posición ya no está abierta."""
+        for _ in range(3):
+            if not self._is_open(symbol):
+                return True
+            price = self._display_price(symbol)
+            if price > 0:
+                try:
+                    if await self._close_position(symbol, price, "MANUAL"):
+                        return True
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    self.log(f"Cierre masivo: error cerrando {symbol}: {exc}")
+            await asyncio.sleep(0.6)
+        return not self._is_open(symbol)
+
+    async def _close_all_sequential(self) -> None:
+        st = self.close_all_state
+        ok_set: set = set()
+        bad_set: set = set()
+        attempts: Dict[str, int] = {}
+        self.log(f"CIERRE MASIVO iniciado: {st.get('total', 0)} posición(es), una a una")
+        try:
+            while not st["cancel"]:
+                todo = [s for s in self._open_position_symbols() if attempts.get(s, 0) < 2]
+                if not todo:
+                    break
+                with self.lock:
+                    st["total"] = max(st["total"], len(ok_set | bad_set | set(todo)))
+                for sym in todo:
+                    if st["cancel"]:
+                        break
+                    attempts[sym] = attempts.get(sym, 0) + 1
+                    with self.lock:
+                        st["current"] = sym
+                    closed = await self._close_one_for_bulk(sym)
+                    with self.lock:
+                        if closed:
+                            ok_set.add(sym); bad_set.discard(sym)
+                        else:
+                            bad_set.add(sym); ok_set.discard(sym)
+                        st["ok"], st["failed"] = len(ok_set), len(bad_set)
+                        st["done"] = len(ok_set) + len(bad_set)
+                        st["failed_symbols"] = sorted(bad_set)
+                    await asyncio.sleep(0.15)          # respiro entre órdenes
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.log(f"Cierre masivo: error inesperado: {exc!r}")
+        finally:
+            with self.lock:
+                st["running"]  = False
+                st["current"]  = ""
+                st["finished"] = time.time()
+                cancelled = st["cancel"]
+                summary = (f"{st['ok']} cerrada(s), {st['failed']} con error"
+                           + (f" ({', '.join(st['failed_symbols'])})" if st["failed_symbols"] else ""))
+            self._close_all_active = False
+            self.log(f"CIERRE MASIVO {'CANCELADO' if cancelled else 'terminado'}: {summary}")
+            self.persist_state()
 
     # ── Mantenimiento (housekeeping; NO es la vía de detección) ───────────────
 
@@ -1751,6 +1943,7 @@ class TradingBot:
             "latency_avg_ms":   self.latency_avg_ms,
             "latency_max_ms":   self.latency_max_ms,
             "watch_count":      len(self.watch),
+            "close_all":        self.close_all_view(),
         }
 
     def _build_snapshot(self) -> dict:
@@ -1872,6 +2065,15 @@ class TradingBot:
             "exchange_symbols":  self.exchange_symbols,
             "entry_levels":      ENTRY_LEVELS,
             "entry_notionals":   ENTRY_NOTIONALS,
+            "take_profit_fraction": TAKE_PROFIT_FRACTION,
+            "tp_min":            TP_MIN,
+            "tp_max":            TP_MAX,
+            "ema_fast":          EMA_FAST,
+            "ema_slow":          EMA_SLOW,
+            "ema_interval":      EMA_INTERVAL,
+            "ema_max_period":    EMA_MAX_PERIOD,
+            "ema_max_candles":   EMA_MAX_CANDLES,
+            "close_all":         self.close_all_view(),
             "take_profit_pct":   TAKE_PROFIT_FRACTION * 100,
             "default_stop_loss_usd":      DEFAULT_STOP_LOSS_USD,
             "first_tranche_sl_fraction":  FIRST_TRANCHE_SL_FRACTION,
@@ -1897,6 +2099,8 @@ class TradingBot:
             },
             "kline_ws": {
                 "pairs_with_data": kl_stats.get("ready_symbols", 0),
+                "tracked":         kl_stats.get("tracked_symbols", 0),
+                "stored_candles":  kl_stats.get("stored_candles", 0),
                 "total_messages":  kl_stats.get("closed_candles", 0),
                 "active_conns":    int(bool(kl_stats.get("connected", False))),
             },
@@ -2115,6 +2319,20 @@ HTML = r"""<!doctype html>
     .btn-sm { padding: 6px 12px; min-height: 34px; font-size: 12px; }
     .msg { font-size: 12px; margin-top: 8px; min-height: 16px; }
 
+    /* ── Tarjetas nuevas: multiplicador DCA · EMA · cierre masivo ── */
+    .dcacard   { border-color: rgba(167,139,250,.5); }
+    .emacard   { border-color: rgba(96,165,250,.5); }
+    .closecard { border-color: rgba(248,113,113,.5); }
+    .dcacard .slcur b   { color: var(--violet); }
+    .emacard .slcur b   { color: var(--blue); font-size: 22px; }
+    .closecard .slcur b { color: var(--red); }
+    .dcacard input[type=number]:focus { border-color: var(--violet); }
+    .emacard input[type=number]:focus { border-color: var(--blue); }
+    .btn-violet { background: linear-gradient(135deg, #c4b5fd, #a78bfa); }
+    .btn-blue   { background: linear-gradient(135deg, #93c5fd, #60a5fa); }
+    .bar { height: 8px; background: #0b1226; border-radius: 999px; overflow: hidden; margin-top: 14px; display: none; }
+    .bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #f87171, #fb923c); transition: width .25s; }
+
     /* ── Posiciones (tarjetas) ── */
     .poslist { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
     .pos { padding: 14px; }
@@ -2209,6 +2427,9 @@ HTML = r"""<!doctype html>
   <nav>
     <a href="#sec-pos">Posiciones</a>
     <a href="#sec-sl">SL global</a>
+    <a href="#sec-tp">TP</a>
+    <a href="#sec-ema">EMAs</a>
+    <a href="#sec-closeall">Cerrar todo</a>
     <a href="#sec-radar">Radar</a>
     <a href="#sec-stats">Estadísticas</a>
     <a href="#sec-hist">Historial</a>
@@ -2251,6 +2472,54 @@ HTML = r"""<!doctype html>
     <label class="check"><input id="gslOverride" type="checkbox"> También sobrescribir los SL manuales de las posiciones abiertas</label>
     <div id="gslMsg" class="msg"></div>
     <p class="note" id="gslNote">El valor se guarda y sobrevive a reinicios. Los SL fijados a mano en una posición se respetan salvo que marques la casilla.</p>
+  </section>
+
+  <!-- Multiplicador TP -->
+  <section id="sec-tp" class="anchor card dcacard">
+    <h2 class="sec">🎯 Multiplicador del Take Profit <span class="sub">objetivo = notional × multiplicador</span></h2>
+    <div class="slrow">
+      <div class="slcur"><div class="label">Valor actual</div><b id="tpCurrent">—</b></div>
+      <div class="field">
+        <label for="tpInput">Nuevo multiplicador (ej. 0.05, 0.07, 0.10)</label>
+        <input id="tpInput" type="number" step="0.005" min="0.001" max="5" inputmode="decimal" placeholder="0.07">
+      </div>
+      <button id="tpSave" class="btn btn-violet">Aplicar</button>
+    </div>
+    <div class="pills" id="tpPreview" style="margin-top:12px"></div>
+    <div id="tpMsg" class="msg"></div>
+    <p class="note">El TP de cada posición = notional × multiplicador (0.07 = 7 %). Se aplica <b>ya</b> a todas las posiciones abiertas, se guarda y sobrevive a reinicios.</p>
+  </section>
+
+  <!-- EMAs -->
+  <section id="sec-ema" class="anchor card emacard">
+    <h2 class="sec">📈 Cruce de EMAs <span class="sub" id="emaSub"></span></h2>
+    <div class="slrow">
+      <div class="slcur"><div class="label">Valor actual</div><b id="emaCurrent">—</b></div>
+      <div class="field">
+        <label for="emaFastInput">EMA rápida</label>
+        <input id="emaFastInput" type="number" step="1" min="2" inputmode="numeric" placeholder="100">
+      </div>
+      <div class="field">
+        <label for="emaSlowInput">EMA lenta</label>
+        <input id="emaSlowInput" type="number" step="1" min="3" inputmode="numeric" placeholder="200">
+      </div>
+      <button id="emaSave" class="btn btn-blue">Aplicar</button>
+    </div>
+    <div id="emaMsg" class="msg"></div>
+    <p class="note" id="emaNote">Al cambiarlas, las EMAs se recalculan al instante con las velas ya guardadas (sin descargar nada) y el cambio no genera cruces falsos. Las posiciones abiertas no se tocan: solo cambian las señales futuras.</p>
+  </section>
+
+  <!-- Cerrar todas -->
+  <section id="sec-closeall" class="anchor card closecard">
+    <h2 class="sec">🧹 Cerrar todas las operaciones <span class="sub">una a una, a precio de mercado</span></h2>
+    <div class="slrow">
+      <div class="slcur"><div class="label">Posiciones abiertas</div><b id="caOpen">—</b></div>
+      <button id="caStart" class="btn btn-danger">Cerrar todas una a una</button>
+      <button id="caCancel" class="btn btn-ghost" style="display:none">Detener</button>
+    </div>
+    <div class="bar" id="caBarWrap"><i id="caBar"></i></div>
+    <div id="caMsg" class="msg"></div>
+    <p class="note">Cierra cada posición esperando a que termine la anterior. Mientras dura, el bot no abre entradas ni DCA nuevos. Cada símbolo cerrado queda en cooldown, igual que un cierre manual.</p>
   </section>
 
   <!-- Radar -->
@@ -2355,6 +2624,7 @@ HTML = r"""<!doctype html>
       <div class="chip">kline pares: <b id="klPairs">—</b></div>
       <div class="chip">kline msgs: <b id="klMsgs">—</b></div>
       <div class="chip">kline conns: <b id="klConns">—</b></div>
+      <div class="chip">velas guardadas: <b id="klCandles">—</b></div>
       <div class="chip">polls estado: <b id="pollCount">0</b></div>
       <div class="chip">polls precios: <b id="livePollCount">0</b></div>
     </div>
@@ -2480,6 +2750,32 @@ function render(d) {
   q('klPairs').textContent = n(kw.pairs_with_data);
   q('klMsgs').textContent = n(kw.total_messages);
   q('klConns').textContent = n(kw.active_conns);
+  q('klCandles').textContent = n(kw.stored_candles);
+
+  // Multiplicador TP
+  const tpf = n(d.take_profit_fraction || 0.07);
+  setTxt('tpCurrent', String(+tpf.toFixed(4)));
+  const ti = q('tpInput');
+  if (ti && document.activeElement !== ti && !ti.dataset.dirty) ti.value = +tpf.toFixed(4);
+  const tpHtml = [5, 10, 20, 50].map(v => `<span class="pill">${v} USDT → +${+(v * tpf).toFixed(3)}</span>`).join('')
+    + `<span class="pill" style="border-color:var(--violet)">= ${+(tpf * 100).toFixed(2)}% del notional</span>`;
+  if (q('tpPreview').dataset.sig !== tpHtml) { q('tpPreview').dataset.sig = tpHtml; q('tpPreview').innerHTML = tpHtml; }
+
+  // EMAs
+  if (d.ema_fast !== undefined) {
+    setTxt('emaCurrent', `${n(d.ema_fast)} / ${n(d.ema_slow)}`);
+    const ef = q('emaFastInput'), es = q('emaSlowInput');
+    const editing = [ef, es].some(el => document.activeElement === el || el.dataset.dirty);
+    if (!editing) { ef.value = n(d.ema_fast); es.value = n(d.ema_slow); }
+    ef.max = es.max = n(d.ema_max_period || 500);
+    setTxt('emaSub', `${d.ema_interval || ''} · lenta máx. ${n(d.ema_max_period)}`);
+    setTxt('emaNote', `Velas guardadas: ${n(kw.stored_candles)} (hasta ${n(d.ema_max_candles)} por símbolo, ${n(kw.pairs_with_data)} símbolos listos). `
+      + 'Al cambiar las EMAs se recalculan al instante con esas velas, sin descargar nada y sin generar cruces falsos. '
+      + 'Las posiciones abiertas no se tocan: solo cambian las señales futuras.');
+  }
+
+  // Cierre masivo
+  renderCloseAll(d.close_all, positions.length);
   q('pollCount').textContent = pollCount;
   q('livePollCount').textContent = livePollCount;
 
@@ -2637,6 +2933,8 @@ function applyLive(d) {
   }
   if (wins.length !== _winSyms.size) mismatch = true;
 
+  if (d.close_all) renderCloseAll(d.close_all, keys.length);
+
   const pu = n(d.total_unrealized);
   setTxt('pnl', sgn(pu)); q('pnl').className = 'value ' + cls(pu);
   setTxt('scanCount', String(n(d.scan_count)));
@@ -2720,6 +3018,99 @@ async function saveGlobalSl() {
   }
 }
 
+// ── Multiplicador TP ────────────────────────────────────────────────────────
+async function saveTp() {
+  const msg = q('tpMsg'), btn = q('tpSave');
+  const v = parseFloat(String(q('tpInput').value).replace(',', '.'));
+  msg.className = 'msg';
+  if (isNaN(v) || v < 0.001 || v > 5) {
+    msg.className = 'msg negative'; msg.textContent = 'El multiplicador debe estar entre 0.001 y 5 (por ejemplo 0.07).'; return;
+  }
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const resp = await fetch('/api/set-take-profit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+      body: JSON.stringify({ fraction: v }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      delete q('tpInput').dataset.dirty;
+      msg.className = 'msg positive';
+      msg.textContent = `✓ Multiplicador TP = ${+v.toFixed(4)} (${+(v * 100).toFixed(2)}% del notional) · aplicado a las posiciones abiertas`;
+      requestFull(true);
+    } else { msg.className = 'msg negative'; msg.textContent = data.error || `Error HTTP ${resp.status}`; }
+  } catch (err) {
+    msg.className = 'msg negative'; msg.textContent = 'Error de red: ' + err.message;
+  } finally { btn.disabled = false; btn.textContent = 'Aplicar'; }
+}
+
+// ── EMAs ────────────────────────────────────────────────────────────────────
+async function saveEma() {
+  const msg = q('emaMsg'), btn = q('emaSave');
+  const f = parseInt(q('emaFastInput').value, 10), sl = parseInt(q('emaSlowInput').value, 10);
+  msg.className = 'msg';
+  if (isNaN(f) || isNaN(sl)) { msg.className = 'msg negative'; msg.textContent = 'Escribe un número entero en cada EMA.'; return; }
+  if (f >= sl) { msg.className = 'msg negative'; msg.textContent = 'La EMA rápida debe ser menor que la lenta.'; return; }
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const resp = await fetch('/api/set-ema', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+      body: JSON.stringify({ fast: f, slow: sl }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      delete q('emaFastInput').dataset.dirty; delete q('emaSlowInput').dataset.dirty;
+      msg.className = 'msg positive';
+      msg.textContent = `✓ EMA ${data.ema_fast} / ${data.ema_slow} · ${data.recomputed} símbolos recalculados`;
+      requestFull(true);
+    } else { msg.className = 'msg negative'; msg.textContent = data.error || `Error HTTP ${resp.status}`; }
+  } catch (err) {
+    msg.className = 'msg negative'; msg.textContent = 'Error de red: ' + err.message;
+  } finally { btn.disabled = false; btn.textContent = 'Aplicar'; }
+}
+
+// ── Cerrar todas una a una ──────────────────────────────────────────────────
+function renderCloseAll(ca, openN) {
+  ca = ca || {};
+  const running = !!ca.running, total = n(ca.total), done = n(ca.done);
+  setTxt('caOpen', String(openN));
+  const btn = q('caStart'), cancel = q('caCancel'), wrap = q('caBarWrap'), msg = q('caMsg');
+  setTxt('caStart', running ? `Cerrando ${done}/${total}…` : 'Cerrar todas una a una');
+  btn.disabled = running || openN === 0;
+  cancel.style.display = running ? '' : 'none';
+  cancel.disabled = !!ca.cancel;
+  const showBar = running || n(ca.started) > 0;
+  wrap.style.display = showBar ? 'block' : 'none';
+  q('caBar').style.width = (running ? (total ? done / total * 100 : 0) : 100) + '%';
+  if (running) {
+    msg.className = 'msg warn';
+    msg.textContent = (ca.cancel ? '⏹ Deteniendo… ' : '⏳ ') + (ca.current ? `cerrando ${ca.current}` : 'preparando')
+      + ` · ${n(ca.ok)} cerradas` + (n(ca.failed) ? ` · ${n(ca.failed)} con error` : '');
+  } else if (n(ca.started) > 0) {
+    const bad = (ca.failed_symbols || []).join(', ');
+    msg.className = 'msg ' + (n(ca.failed) ? 'negative' : 'positive');
+    msg.textContent = `${ca.cancel ? '⏹ Cancelado' : '✓ Terminado'}: ${n(ca.ok)} cerrada(s)`
+      + (n(ca.failed) ? ` · ${n(ca.failed)} con error: ${bad}` : '');
+  } else { msg.textContent = ''; }
+}
+
+async function closeAll() {
+  const k = _posSyms.size;
+  if (!k) return;
+  if (!confirm(`¿Cerrar las ${k} posiciones abiertas, una por una, a precio de mercado?\n\nEsta acción es irreversible y cada símbolo cerrado entra en cooldown.`)) return;
+  q('caStart').disabled = true;
+  try {
+    const resp = await fetch('/api/close-all', { method: 'POST', cache: 'no-store' });
+    const data = await resp.json();
+    if (!data.ok) { alert(data.error || `Error HTTP ${resp.status}`); }
+    requestFull(true);
+  } catch (err) { alert('Error de red: ' + err.message); }
+  finally { q('caStart').disabled = false; }
+}
+async function cancelCloseAll() {
+  try { await fetch('/api/close-all/cancel', { method: 'POST', cache: 'no-store' }); requestFull(true); } catch (e) { /* silencioso */ }
+}
+
 // ── Modal SL por posición ───────────────────────────────────────────────────
 let _slModalSymbol = null;
 function editStopLoss(symbol, currentSl) {
@@ -2766,6 +3157,16 @@ document.addEventListener('DOMContentLoaded', () => {
   q('gslSave').addEventListener('click', saveGlobalSl);
   q('gslInput').addEventListener('input', () => { q('gslInput').dataset.dirty = '1'; });
   q('gslInput').addEventListener('keydown', e => { if (e.key === 'Enter') saveGlobalSl(); });
+  q('tpSave').addEventListener('click', saveTp);
+  q('tpInput').addEventListener('input', () => { q('tpInput').dataset.dirty = '1'; });
+  q('tpInput').addEventListener('keydown', e => { if (e.key === 'Enter') saveTp(); });
+  q('emaSave').addEventListener('click', saveEma);
+  ['emaFastInput', 'emaSlowInput'].forEach(id => {
+    q(id).addEventListener('input', () => { q(id).dataset.dirty = '1'; });
+    q(id).addEventListener('keydown', e => { if (e.key === 'Enter') saveEma(); });
+  });
+  q('caStart').addEventListener('click', closeAll);
+  q('caCancel').addEventListener('click', cancelCloseAll);
 });
 
 // ── Cierre manual ───────────────────────────────────────────────────────────
@@ -3008,6 +3409,65 @@ def api_set_default_sl():
     override = bool(data.get("override_manual", False))
     result = bot.set_default_stop_loss(sl_usd, override_manual=override)
     return jsonify({"ok": True, **result})
+
+
+@app.post("/api/set-take-profit")
+def api_set_take_profit():
+    """Cambia el multiplicador del TP (fracción del notional) sin reiniciar el bot."""
+    data = request.get_json(silent=True) or {}
+    try:
+        fraction = float(data.get("fraction"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "fraction inválido"}), 400
+    try:
+        result = bot.set_take_profit(fraction)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/set-ema")
+def api_set_ema():
+    """Cambia la EMA rápida y la lenta en caliente (recalcula con el historial guardado)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        fast, slow = int(data.get("fast")), int(data.get("slow"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "fast y slow deben ser enteros"}), 400
+    try:
+        result = bot.set_ema_periods(fast, slow)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc) or type(exc).__name__}), 500
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/close-all")
+def api_close_all():
+    """Cierra TODAS las posiciones abiertas, una tras otra. Responde al instante;
+    el progreso llega en close_all de /api/status y /api/live."""
+    res = bot.start_close_all()
+    if res.get("ok"):
+        return jsonify({"ok": True, "total": res["total"]})
+    return jsonify({"ok": False, "error": res.get("error", "error")}), res.get("code", 500)
+
+
+@app.post("/api/close-all/cancel")
+def api_close_all_cancel():
+    """Detiene el cierre masivo tras la operación en curso."""
+    if bot.cancel_close_all():
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "No hay un cierre masivo en curso"}), 409
+
+
+@app.get("/api/close-all")
+def api_close_all_status():
+    resp = jsonify(bot.close_all_view())
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 @app.get("/health")
