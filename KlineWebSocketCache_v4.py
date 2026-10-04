@@ -1,74 +1,60 @@
 """
-KlineWebSocketCache — v4  (WebSocket-first · Zero-REST en operación normal)
-===========================================================================
+KlineWebSocketCache — v5  (detector de cruces EMA100 / EMA200 · memoria mínima)
+===============================================================================
 
-ARQUITECTURA
-────────────
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  ARRANQUE                                                           │
-  │    1. Backfill inicial por REST (histórico completo)                │
-  │    2. Conexiones WebSocket (multiplexadas)                          │
-  │    3. Monitor de reloj – 1s, cierra velas por close_time           │
-  │    4. Safety refresh – cada N min, último recurso                   │
-  └─────────────────────────────────────────────────────────────────────┘
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  OPERACIÓN NORMAL (WS conectado)                                    │
-  │    • WS abre, actualiza y cierra velas → CERO peticiones REST       │
-  │    • Monitor de reloj cierra velas donde Binance omite x=true       │
-  └─────────────────────────────────────────────────────────────────────┘
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  DESCONEXIÓN / RECONEXIÓN                                           │
-  │    • Al caer el WS → se guarda el timestamp de desconexión          │
-  │    • Al reconectar  → REST quirúrgico SOLO del período ausente      │
-  │    • Health monitor → detecta streams muertos y fuerza reconexión   │
-  └─────────────────────────────────────────────────────────────────────┘
+QUÉ HACE
+────────
+  • Sigue las N (200) criptos USDT-M más activas (por volumen 24h).
+  • NO guarda velas. Por cada símbolo guarda solo 6 números: EMA rápida,
+    EMA lenta, último signo del cruce, open_time de la última vela, n y
+    un flag. Cada vela cerrada actualiza ambas EMA en O(1):
+        ema += alpha * (close - ema)
+  • Cuando en una vela CERRADA la EMA rápida cruza la lenta, dispara el
+    callback  cb(symbol, "UP" | "DOWN", close_price, close_time_ms).
+        UP   = EMA100 cruza hacia ARRIBA de la EMA200
+        DOWN = EMA100 cruza hacia ABAJO  de la EMA200
 
-DIFERENCIAS vs v3
-─────────────────
-  ❌ Eliminado : _per_interval_scheduler  (1 tarea por par×intervalo → REST en
-                  cada cierre aunque el WS funcione → principal desperdicio)
-  ❌ Eliminado : integrity checks en flujo normal
-  ❌ Eliminado : _upsert_rows_into_buffer en mensajes WS fuera de orden
-  ❌ Eliminado : _build_backfill_groups / _refresh_groups (complejidad inútil)
-  ✅ Añadido   : _fill_reconnect_gap — REST quirúrgico post-desconexión
-  ✅ Mejorado  : _handle_ws_kline — O(1), sin sort, sin upsert
-  ✅ Mejorado  : _safety_refresh  — solo actúa con gaps REALES (> 1 intervalo)
-  ✅ Mejorado  : health monitor   — umbral por grupo (no por stream individual)
+POR QUÉ NO NUMBA / PANDAS
+─────────────────────────
+  La EMA incremental son 2 multiplicaciones por vela cerrada y por
+  símbolo (~400 cierres/min en total). Numba cargaría LLVM (~100+ MB de
+  RAM) para acelerar algo que ya cuesta microsegundos; pandas, otros
+  ~60 MB solo por importarse. Aquí solo se importan aiohttp y websockets.
+  El estado completo de 200 símbolos pesa unas decenas de KB.
+
+FLUJO
+─────
+  1. Universo: provider() devuelve símbolos ordenados por actividad (se
+     refresca cada universe_refresh_seconds). Histéresis: un símbolo ya
+     seguido no sale hasta caer del puesto top_n + rank_margin, y los
+     símbolos "pinned" (posiciones abiertas) nunca salen.
+  2. Warm-up por REST: UNA petición (limit=500, peso 2) por símbolo nuevo
+     para sembrar las EMA. Las velas se descartan al instante.
+  3. WebSocket único con SUBSCRIBE/UNSUBSCRIBE en caliente. Solo se
+     parsean los mensajes con x=true (vela cerrada).
+  4. Si falta una vela (corte de red) se detecta por el hueco en
+     open_time y SOLO ese símbolo se re-siembra por REST.
 """
 
 from __future__ import annotations
 
 import asyncio
-import gc
 import json
+import os
 import random
 import threading
 import time
-from collections import defaultdict, deque
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
-import pandas as pd
 import websockets
 
 
 # =============================================================================
-# TOKEN BUCKET  —  rate-limiter global para peticiones REST
+# TOKEN BUCKET (rate-limiter REST)
 # =============================================================================
 
 class _TokenBucket:
-    """
-    Limita peticiones REST a Binance Futures.
-
-    Parámetros conservadores para USDT-M Futures:
-      capacity    = 1 200  →  slots en ventana de 1 min
-      refill_rate =    20  →  tokens nuevos / segundo
-
-    Peso por limit:
-      ≤  100  → 1  |  ≤  500 → 2  |  ≤ 1000 → 5  |  > 1000 → 10
-    """
-
     def __init__(self, capacity: int = 1_200, refill_rate: float = 20.0) -> None:
         self.capacity    = capacity
         self.refill_rate = refill_rate
@@ -86,10 +72,8 @@ class _TokenBucket:
     async def acquire(self, weight: int = 1) -> None:
         async with self._lock:
             now = time.monotonic()
-            self._tokens = min(
-                self.capacity,
-                self._tokens + (now - self._last) * self.refill_rate,
-            )
+            self._tokens = min(self.capacity,
+                               self._tokens + (now - self._last) * self.refill_rate)
             self._last = now
             if self._tokens >= weight:
                 self._tokens -= weight
@@ -98,9 +82,24 @@ class _TokenBucket:
             await asyncio.sleep(wait)
             self._tokens = 0.0
 
-    def refund(self, weight: int) -> None:
-        """Devuelve tokens si la petición fue cancelada antes de enviarse."""
-        self._tokens = min(self.capacity, self._tokens + weight)
+
+# =============================================================================
+# ESTADO POR SÍMBOLO (6 campos, sin velas)
+# =============================================================================
+
+class _EmaState:
+    __slots__ = ("fast", "slow", "sign", "last_ot", "n", "ready")
+
+    def __init__(self) -> None:
+        self.fast    = 0.0
+        self.slow    = 0.0
+        self.sign    = 0      # último signo NO cero de (fast - slow)
+        self.last_ot = 0      # open_time (ms) de la última vela procesada
+        self.n       = 0      # velas procesadas (para exigir historial mínimo)
+        self.ready   = False  # False mientras se siembra por REST
+
+
+SignalCallback = Callable[[str, str, float, int], None]
 
 
 # =============================================================================
@@ -108,225 +107,438 @@ class _TokenBucket:
 # =============================================================================
 
 class KlineWebSocketCache:
-    """
-    Cache de klines en tiempo real para Binance USDT-M Futures.
+    """Detector de cruces EMA fast/slow sobre las N criptos más activas."""
 
-    Operación normal : WebSocket exclusivo → CERO REST.
-    REST solo en     : backfill inicial · gap post-desconexión · safety 10 min.
-    """
-
-    BASE_WS_URL   = "wss://fstream.binance.com/stream"
     BASE_REST_URL = "https://fapi.binance.com"
-
-    # ms de gracia tras close_time para marcar una vela como cerrada.
-    # Evita cerrar velas cuyo close_time llega levemente adelantado.
-    CLOSE_GRACE_MS = 500
-
-    # Intervalo del monitor de reloj (segundos)
-    CLOCK_MONITOR_INTERVAL = 1
-
-    # Advertir si el peso REST supera este valor (de 2 400 total)
-    REST_WEIGHT_WARN = 1_900
+    # Mismo endpoint que usa WS.py (por defecto). Sobrescribible con KLINE_WS_URL.
+    DEFAULT_WS_URL = os.environ.get("KLINE_WS_URL", "wss://fstream.binance.com/market/stream")
 
     def __init__(
         self,
-        pairs: Dict[str, List[str]],
         *,
-        max_candles: int = 1_500,
-        include_open_candle: bool = True,
-        backfill_on_start: bool = True,
-        streams_per_connection: int = 50,
-        rest_limits: Optional[Dict[str, int]] = None,
-        rest_timeout: float = 6.0,
-        rest_min_sleep: float = 0.05,
-        rest_concurrency: int = 20,
+        interval: str = "1m",
+        top_n: int = 200,
+        fast_period: int = 100,
+        slow_period: int = 200,
+        warmup_candles: int = 500,
+        min_candles: Optional[int] = None,
+        universe_provider: Optional[Callable[[], List[str]]] = None,
+        pinned_provider: Optional[Callable[[], List[str]]] = None,
+        universe_refresh_seconds: float = 900.0,
+        rank_margin: int = 50,
+        max_signal_age_seconds: float = 20.0,
+        silence_threshold_seconds: float = 60.0,
+        rest_concurrency: int = 4,
+        rest_timeout: float = 8.0,
         rest_retries: int = 4,
-        rest_backoff_max: float = 30.0,
-        backfill_batch_size: int = 5,
-        backfill_batch_delay: float = 0.10,
-        rate_limit_capacity: int = 1_200,
-        rate_limit_refill: float = 20.0,
-        stream_silence_threshold_seconds: int = 120,
-        stream_health_check_seconds: int = 60,
-        safety_refresh_interval_seconds: int = 600,
+        ws_url: Optional[str] = None,
     ) -> None:
+        self.interval       = interval
+        self.top_n          = int(top_n)
+        self.fast_period    = int(fast_period)
+        self.slow_period    = int(slow_period)
+        self.warmup_candles = max(int(warmup_candles), self.slow_period + 10)
+        self.min_candles    = int(min_candles) if min_candles else self.slow_period
+        self._af = 2.0 / (self.fast_period + 1)
+        self._as = 2.0 / (self.slow_period + 1)
+        self._iv_ms = self._interval_ms(interval)
 
-        # --- Pares ---
-        self.pairs: Dict[str, List[str]] = {
-            s.upper(): ([i] if isinstance(i, str) else list(i))
-            for s, i in pairs.items()
-        }
-        self.max_candles            = int(max_candles)
-        self.include_open           = bool(include_open_candle)
-        self.streams_per_connection = int(streams_per_connection)
-        self.backfill_on_start      = bool(backfill_on_start)
-
-        # --- REST ---
-        self.rest_limits      = rest_limits or {}
-        self.rest_timeout     = float(rest_timeout)
-        self.rest_min_sleep   = float(rest_min_sleep)
+        self._provider        = universe_provider
+        self._pinned_provider = pinned_provider
+        self.universe_refresh_s = float(universe_refresh_seconds)
+        self.rank_margin      = int(rank_margin)
+        self.max_signal_age_ms = float(max_signal_age_seconds) * 1000.0
+        self.silence_s        = float(silence_threshold_seconds)
         self.rest_concurrency = int(rest_concurrency)
+        self.rest_timeout     = float(rest_timeout)
         self.rest_retries     = int(rest_retries)
-        self.rest_backoff_max = float(rest_backoff_max)
+        self.ws_url           = ws_url or self.DEFAULT_WS_URL
 
-        # --- Backfill ---
-        self.backfill_batch_size  = max(1, int(backfill_batch_size))
-        self.backfill_batch_delay = float(backfill_batch_delay)
+        # Estado
+        self._states:  Dict[str, _EmaState] = {}
+        self._pending: Dict[str, List[Tuple[int, float, int]]] = {}
+        self._warming: Set[str] = set()
+        self._signal_cb: Optional[SignalCallback] = None
 
-        # --- Salud / safety ---
-        self.stream_silence_threshold_seconds = int(stream_silence_threshold_seconds)
-        self.stream_health_check_seconds      = int(stream_health_check_seconds)
-        self.safety_refresh_interval_seconds  = int(safety_refresh_interval_seconds)
+        # WS
+        self._ws = None
+        self._subscribed: Set[str] = set()
+        self._req_id = 0
+        self._last_msg = 0.0
+        self._connected = False
+        self._sub_lock: Optional[asyncio.Lock] = None
 
-        # --- Rate limiter ---
-        self._bucket = _TokenBucket(
-            capacity=rate_limit_capacity,
-            refill_rate=rate_limit_refill,
-        )
-        # asyncio.Event para pausa global 429/418 (se crea en el loop)
-        self._rate_limit_pause: Optional[asyncio.Event] = None
-
-        # --- Buffers ---
-        self.buffers: Dict[Tuple[str, str], deque] = defaultdict(
-            lambda: deque(maxlen=self.max_candles)
-        )
-        self.lock = threading.Lock()
-
-        # --- Métricas ---
-        self.last_message_time: Dict[Tuple[str, str], float] = {}
-        self.message_counts:    Dict[Tuple[str, str], int]   = defaultdict(int)
-        self.clock_closes:      Dict[Tuple[str, str], int]   = defaultdict(int)
-        self.gap_fills:         Dict[Tuple[str, str], int]   = defaultdict(int)
-
-        # --- WS: timestamp de desconexión por grupo ---
-        # None = conectado  |  float = epoch de desconexión
-        self._ws_disconnect_time: Dict[int, Optional[float]] = {}
-
-        # --- Infraestructura ---
-        self._loop:   Optional[asyncio.AbstractEventLoop] = None
-        self._running = False
-        self._tasks:  Dict[tuple, asyncio.Future] = {}
-        self._thread: Optional[threading.Thread]  = None
-        self._startup_future = None
-
-        self.connection_stats: Dict[str, dict] = defaultdict(lambda: {
-            "reconnects": 0, "last_error": None, "streams": [], "active": False,
-        })
-
-        # --- Mapeo WS ---
-        self.stream_mapping:     Dict[str, Tuple[str, str]] = {}
-        self.subscribed_streams: set = set()
-
-        # --- Sesión REST compartida ---
+        # REST
         self._session: Optional[aiohttp.ClientSession] = None
+        self._bucket:  Optional[_TokenBucket] = None
+        self._sem:     Optional[asyncio.Semaphore] = None
+        self._pause_until = 0.0
 
-    # =========================================================================
-    # UTILIDADES
-    # =========================================================================
+        # Métricas
+        self.closed_candles = 0
+        self.signals        = 0
+        self.stale_signals  = 0
+        self.gap_resyncs    = 0
+        self.reconnects     = 0
+        self.last_error     = ""
 
-    def _interval_ms(self, interval: str) -> int:
-        """Convierte un intervalo de Binance a milisegundos."""
-        units = {
-            "s": 1_000,
-            "m": 60_000,
-            "h": 3_600_000,
-            "d": 86_400_000,
-            "w": 604_800_000,
-        }
-        n = int("".join(filter(str.isdigit, interval)))
-        u = "".join(filter(str.isalpha, interval))
+        # Infra
+        self._loop:   Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._tasks:  Set[asyncio.Task] = set()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Utilidades
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _interval_ms(interval: str) -> int:
+        units = {"s": 1_000, "m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
+        n = int("".join(c for c in interval if c.isdigit()))
+        u = "".join(c for c in interval if c.isalpha())
         return n * units.get(u, 60_000)
 
-    @staticmethod
-    def _parse_rest_row(k: list, symbol: str, interval: str, is_closed: bool) -> dict:
-        return {
-            "open_time":              int(k[0]),
-            "close_time":             int(k[6]),
-            "symbol":                 symbol.upper(),
-            "interval":               interval,
-            "open":                   float(k[1]),
-            "high":                   float(k[2]),
-            "low":                    float(k[3]),
-            "close":                  float(k[4]),
-            "volume":                 float(k[5]),
-            "quote_volume":           float(k[7]),
-            "trades":                 int(k[8]),
-            "taker_buy_volume":       float(k[9]),
-            "taker_buy_quote_volume": float(k[10]),
-            "is_closed":              is_closed,
-        }
+    def set_signal_callback(self, cb: Optional[SignalCallback]) -> None:
+        """cb(symbol, "UP"|"DOWN", close_price, close_time_ms). Se llama desde
+        el hilo del WS: debe ser instantáneo (encolar y salir)."""
+        self._signal_cb = cb
 
-    @staticmethod
-    def _build_ws_row(k: dict, is_closed: bool) -> dict:
-        return {
-            "open_time":              int(k["t"]),
-            "close_time":             int(k["T"]),
-            "symbol":                 str(k["s"]).upper(),
-            "interval":               str(k["i"]),
-            "open":                   float(k["o"]),
-            "high":                   float(k["h"]),
-            "low":                    float(k["l"]),
-            "close":                  float(k["c"]),
-            "volume":                 float(k["v"]),
-            "quote_volume":           float(k["q"]),
-            "trades":                 int(k["n"]),
-            "taker_buy_volume":       float(k["V"]),
-            "taker_buy_quote_volume": float(k["Q"]),
-            "is_closed":              is_closed,
-        }
-
-    def _upsert_buffer(self, key: Tuple[str, str], rows: List[dict]) -> None:
-        """
-        Merge + sort en el buffer.
-        SOLO para datos REST (backfill y gap fill).
-        Los mensajes WS se insertan O(1) en _handle_ws_kline.
-        """
-        if not rows:
-            return
-        with self.lock:
-            buf = self.buffers[key]
-            merged = {r["open_time"]: r for r in buf}
-            for r in rows:
-                merged[r["open_time"]] = r
-            sorted_rows = sorted(merged.values(), key=lambda x: x["open_time"])
-            if len(sorted_rows) > self.max_candles:
-                sorted_rows = sorted_rows[-self.max_candles:]
-            buf.clear()
-            buf.extend(sorted_rows)
-
-    def _register_task(self, key: tuple, task: "asyncio.Task") -> "asyncio.Task":
-        """
-        Registra una tarea para poder cancelarla durante el apagado.
-        La tarea se elimina sola del registro cuando termina.
-        """
-        self._tasks[key] = task
-
-        def _cleanup(done_task: "asyncio.Task", task_key: tuple = key) -> None:
-            self._tasks.pop(task_key, None)
-
-        task.add_done_callback(_cleanup)
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.get_running_loop().create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return task
 
+    # ─────────────────────────────────────────────────────────────────────
+    # EMA incremental + detección de cruce  (núcleo, O(1))
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _step(self, st: _EmaState, close: float) -> int:
+        """Actualiza las EMA con una vela cerrada.
+        Devuelve +1 (cruce hacia arriba), -1 (hacia abajo) o 0 (sin cruce)."""
+        if st.n == 0:
+            st.fast = st.slow = close
+        else:
+            st.fast += self._af * (close - st.fast)
+            st.slow += self._as * (close - st.slow)
+        st.n += 1
+        d   = st.fast - st.slow
+        new = 1 if d > 0.0 else (-1 if d < 0.0 else 0)
+        cross = 0
+        if new != 0:
+            if st.sign != 0 and new != st.sign:
+                cross = new
+            st.sign = new
+        return cross
+
+    def _on_closed(self, sym: str, ot: int, close: float, ct: int) -> None:
+        st = self._states.get(sym)
+        if st is None:
+            return
+        if not st.ready:
+            pend = self._pending.get(sym)
+            if pend is not None and len(pend) < 8:
+                pend.append((ot, close, ct))
+            return
+        if ot <= st.last_ot:
+            return                                   # duplicada / desordenada
+        if st.last_ot and ot > st.last_ot + self._iv_ms:
+            # Hueco: se perdió ≥1 vela. Re-sembrar SOLO este símbolo.
+            st.ready = False
+            self._pending[sym] = [(ot, close, ct)]
+            self.gap_resyncs += 1
+            self._schedule_warmup(sym)
+            return
+        st.last_ot = ot
+        cross = self._step(st, close)
+        if cross and st.n >= self.min_candles:
+            self._emit(sym, cross, close, ct)
+
+    def _emit(self, sym: str, cross: int, close: float, ct: int) -> None:
+        self.signals += 1
+        if (time.time() * 1000.0 - ct) > self.max_signal_age_ms:
+            self.stale_signals += 1                  # cruce de una vela vieja: no es "recién"
+            return
+        cb = self._signal_cb
+        if cb is None:
+            return
+        try:
+            cb(sym, "UP" if cross > 0 else "DOWN", close, ct)
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    # REST
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _fetch(self, url: str, params: dict, weight: int):
+        attempt = 0
+        while True:
+            wait = self._pause_until - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            await self._bucket.acquire(weight)
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.rest_timeout)
+                async with self._session.get(url, params=params, timeout=timeout) as resp:
+                    if resp.status in (418, 429):
+                        default = 300.0 if resp.status == 418 else 60.0
+                        ra = float(resp.headers.get("Retry-After", default))
+                        self._pause_until = time.time() + ra + random.uniform(2, 10)
+                        print(f"🚫 Kline REST pausado {ra:.0f}s (HTTP {resp.status})")
+                        attempt += 1
+                        if attempt > self.rest_retries:
+                            raise RuntimeError(f"HTTP {resp.status} persistente")
+                        continue
+                    resp.raise_for_status()
+                    return await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                attempt += 1
+                if attempt > self.rest_retries:
+                    raise
+                await asyncio.sleep(min(30.0, 0.5 * (2 ** attempt)) + random.uniform(0, 0.5))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Warm-up (siembra de EMA; las velas se descartan)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _schedule_warmup(self, sym: str) -> None:
+        if not self._running or sym in self._warming or sym not in self._states:
+            return
+        self._warming.add(sym)
+        self._pending.setdefault(sym, [])
+        self._spawn(self._warmup(sym))
+
+    async def _warmup(self, sym: str) -> None:
+        retry = False
+        try:
+            limit  = self.warmup_candles
+            params = {"symbol": sym, "interval": self.interval, "limit": limit}
+            async with self._sem:
+                data = await self._fetch(
+                    f"{self.BASE_REST_URL}/fapi/v1/klines", params,
+                    _TokenBucket.weight_for_limit(limit),
+                )
+            if sym not in self._states:
+                return                               # salió del universo mientras se descargaba
+
+            now_ms = int(time.time() * 1000)
+            new = _EmaState()
+            for k in data:
+                if int(k[6]) >= now_ms:              # vela aún abierta
+                    continue
+                new.last_ot = int(k[0])
+                self._step(new, float(k[4]))
+            del data
+            new.ready = new.n > 0
+            self._states[sym] = new
+
+            for ot, c, ct in self._pending.pop(sym, []):   # velas llegadas durante la siembra
+                self._on_closed(sym, ot, c, ct)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.last_error = f"warmup {sym}: {e}"
+            print(f"⚠️  Warm-up {sym} falló: {e}")
+            retry = True
+        finally:
+            self._warming.discard(sym)
+            if retry and self._running and sym in self._states:
+                self._loop.call_later(15.0, self._schedule_warmup, sym)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Universo (top N más activas)
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _load_ranked(self) -> List[str]:
+        if self._provider is not None:
+            try:
+                return [s.upper() for s in await asyncio.to_thread(self._provider)]
+            except Exception as e:
+                print(f"⚠️  universe_provider falló: {e}")
+                return []
+        # Sin provider: REST (peso 40, una vez por refresco)
+        try:
+            data = await self._fetch(f"{self.BASE_REST_URL}/fapi/v1/ticker/24hr", {}, 40)
+        except Exception as e:
+            print(f"⚠️  ticker/24hr falló: {e}")
+            return []
+        rows = [(d["symbol"], float(d.get("quoteVolume", 0) or 0)) for d in data
+                if d.get("symbol", "").endswith("USDT") and "_" not in d["symbol"]]
+        rows.sort(key=lambda r: r[1], reverse=True)
+        return [s for s, _ in rows]
+
+    async def _refresh_universe(self) -> bool:
+        ranked = await self._load_ranked()
+        if not ranked:
+            return False
+
+        top       = ranked[: self.top_n]
+        keep_zone = set(ranked[: self.top_n + self.rank_margin])
+        pinned: Set[str] = set()
+        if self._pinned_provider is not None:
+            try:
+                pinned = {s.upper() for s in self._pinned_provider()}
+            except Exception:
+                pinned = set()
+
+        wanted = set(top) | pinned | {s for s in self._states if s in keep_zone}
+        cur    = set(self._states)
+        to_add = sorted(wanted - cur)
+        to_del = sorted(cur - wanted)
+
+        for s in to_del:
+            self._states.pop(s, None)
+            self._pending.pop(s, None)
+        for s in to_add:
+            self._states[s] = _EmaState()
+            self._schedule_warmup(s)
+
+        await self._reconcile()
+        if to_add or to_del or not cur:
+            print(f"🔄 Universo EMA: {len(self._states)} símbolos "
+                  f"(+{len(to_add)} / -{len(to_del)})")
+        return True
+
+    async def _universe_loop(self) -> None:
+        while self._running:
+            ok = False
+            try:
+                ok = await self._refresh_universe()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.last_error = f"universo: {e}"
+                print(f"⚠️  Refresco de universo: {e}")
+            await asyncio.sleep(self.universe_refresh_s if ok else 5.0)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # WebSocket
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _stream_name(self, sym: str) -> str:
+        return f"{sym.lower()}@kline_{self.interval}"
+
+    async def _reconcile(self) -> None:
+        """Alinea las suscripciones del socket con el universo actual
+        (SUBSCRIBE/UNSUBSCRIBE en caliente, ≤ ~5 msg/s)."""
+        if self._sub_lock is None:
+            self._sub_lock = asyncio.Lock()
+        async with self._sub_lock:
+            ws = self._ws
+            if ws is None:
+                return
+            wanted = {self._stream_name(s) for s in list(self._states)}
+            to_add = sorted(wanted - self._subscribed)
+            to_del = sorted(self._subscribed - wanted)
+            try:
+                for method, items in (("SUBSCRIBE", to_add), ("UNSUBSCRIBE", to_del)):
+                    for i in range(0, len(items), 50):
+                        if self._ws is not ws:
+                            return
+                        part = items[i:i + 50]
+                        self._req_id += 1
+                        await ws.send(json.dumps(
+                            {"method": method, "params": part, "id": self._req_id}))
+                        if method == "SUBSCRIBE":
+                            self._subscribed.update(part)
+                        else:
+                            self._subscribed.difference_update(part)
+                        await asyncio.sleep(0.2)
+            except Exception as e:
+                print(f"⚠️  Reconcile WS: {e}")        # la reconexión re-suscribe todo
+
+    def _handle_raw(self, raw) -> None:
+        # Filtro barato: solo velas cerradas. Evita parsear ~99% de mensajes.
+        if '"x":true' not in raw:
+            return
+        try:
+            ev = json.loads(raw).get("data")
+            if not ev or ev.get("e") != "kline":
+                return
+            k = ev["k"]
+            self.closed_candles += 1
+            self._on_closed(ev["s"], int(k["t"]), float(k["c"]), int(k["T"]))
+        except Exception:
+            pass
+
+    async def _ws_loop(self) -> None:
+        delay = 1.0
+        while self._running:
+            try:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20, ping_timeout=20, close_timeout=5,
+                    max_size=2 ** 20, max_queue=512, compression=None,
+                ) as ws:
+                    self._ws = ws
+                    self._subscribed = set()
+                    self._last_msg = time.time()
+                    await self._reconcile()
+                    self._connected = True
+                    delay = 1.0
+                    print(f"✅ Kline WS conectado — {len(self._subscribed)} streams")
+
+                    while self._running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            if time.time() - self._last_msg > self.silence_s:
+                                raise RuntimeError("stream silencioso")
+                            continue
+                        self._last_msg = time.time()
+                        self._handle_raw(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.reconnects += 1
+                self.last_error = f"ws: {e}"
+                print(f"🔴 Kline WS: {e} — reconectando en {delay:.1f}s")
+            finally:
+                self._ws = None
+                self._connected = False
+            if not self._running:
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, 30.0)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Ciclo de vida
+    # ─────────────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        thread = threading.Thread(
+            target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()),
+            daemon=True, name="KlineEMALoop",
+        )
+        thread.start()
+        self._thread = thread
+
+        async def _startup() -> None:
+            self._bucket = _TokenBucket()
+            self._sem    = asyncio.Semaphore(self.rest_concurrency)
+            self._sub_lock = asyncio.Lock()
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=self.rest_concurrency * 2,
+                                               keepalive_timeout=30))
+            self._spawn(self._ws_loop())
+            self._spawn(self._universe_loop())
+            print(f"🚀 KlineEMA v5: EMA{self.fast_period}/EMA{self.slow_period} "
+                  f"· {self.interval} · top {self.top_n} más activas")
+
+        asyncio.run_coroutine_threadsafe(_startup(), loop)
+
     async def _shutdown_async(self) -> None:
-        """
-        Cierre limpio ejecutado dentro del loop:
-          • cancela todas las tareas activas
-          • cierra la sesión REST
-          • libera buffers y métricas
-          • ayuda al GC a soltar memoria
-        """
-        current = asyncio.current_task()
-
-        pending = [
-            task for task in asyncio.all_tasks()
-            if task is not current and not task.done()
-        ]
-        for task in pending:
-            task.cancel()
-
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
+        for t in list(self._tasks):
+            t.cancel()
+        if self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
         if self._session and not self._session.closed:
             try:
                 await self._session.close()
@@ -334,1014 +546,70 @@ class KlineWebSocketCache:
                 pass
         self._session = None
 
-        with self.lock:
-            for buf in self.buffers.values():
-                buf.clear()
-            self.buffers.clear()
-
-        self.last_message_time.clear()
-        self.message_counts.clear()
-        self.clock_closes.clear()
-        self.gap_fills.clear()
-        self._ws_disconnect_time.clear()
-        self.connection_stats.clear()
-        self.stream_mapping.clear()
-        self.subscribed_streams.clear()
-        self._tasks.clear()
-
-        self._rate_limit_pause = None
-        gc.collect()
-
-    # =========================================================================
-    # RATE LIMITER — pausa global 429 / 418
-    # =========================================================================
-
-    async def _wait_global_pause(self) -> None:
-        if self._rate_limit_pause is not None:
-            await self._rate_limit_pause.wait()
-
-    async def _trigger_pause(self, seconds: float, code: str) -> None:
-        if self._rate_limit_pause is None:
-            return
-        self._rate_limit_pause.clear()
-        print(f"🚫 REST pausado {seconds:.0f}s (HTTP {code})")
-        await asyncio.sleep(seconds)
-        self._rate_limit_pause.set()
-        print(f"✅ REST reanudado tras {seconds:.0f}s")
-
-    # =========================================================================
-    # REST — FETCH CON REINTENTOS, RATE LIMIT Y 429/418
-    # =========================================================================
-
-    async def _fetch(
-        self,
-        url: str,
-        params: dict,
-        weight: int = 1,
-    ) -> list:
-        """
-        GET JSON a Binance con:
-          • Espera de pausa global (429/418).
-          • Token bucket.
-          • Reintentos exponenciales + jitter.
-          • Manejo explícito de 429 y 418.
-        """
-        if self._session is None or self._session.closed:
-            raise RuntimeError("Sesión REST no disponible")
-
-        await self._wait_global_pause()
-        await self._bucket.acquire(weight)
-
-        attempt = 0
-        while True:
-            try:
-                timeout = aiohttp.ClientTimeout(total=self.rest_timeout)
-                async with self._session.get(url, params=params, timeout=timeout) as resp:
-
-                    # Advertencia de peso alto
-                    used_w = resp.headers.get("X-MBX-USED-WEIGHT-1M")
-                    if used_w and int(used_w) > self.REST_WEIGHT_WARN:
-                        print(f"⚠️  Peso REST: {used_w}/2400 (umbral {self.REST_WEIGHT_WARN})")
-
-                    # 429 — demasiadas peticiones
-                    if resp.status == 429:
-                        retry_after = float(resp.headers.get("Retry-After", 60))
-                        pause = retry_after + 5
-                        asyncio.ensure_future(self._trigger_pause(pause, "429"))
-                        self._bucket.refund(weight)
-                        await asyncio.sleep(pause)
-                        attempt += 1
-                        if attempt > self.rest_retries:
-                            raise RuntimeError("HTTP 429 persistente")
-                        await self._bucket.acquire(weight)
-                        continue
-
-                    # 418 — IP baneada
-                    if resp.status == 418:
-                        retry_after = float(resp.headers.get("Retry-After", 300))
-                        pause = retry_after + random.uniform(10, 30)
-                        asyncio.ensure_future(self._trigger_pause(pause, "418"))
-                        self._bucket.refund(weight)
-                        await asyncio.sleep(pause)
-                        attempt += 1
-                        if attempt > self.rest_retries:
-                            raise RuntimeError("HTTP 418 (IP ban) persistente")
-                        await self._bucket.acquire(weight)
-                        continue
-
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    await asyncio.sleep(self.rest_min_sleep)
-                    return data
-
-            except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-                attempt += 1
-                if attempt > self.rest_retries:
-                    raise
-                backoff = min(self.rest_backoff_max, 0.5 * (2 ** attempt))
-                jitter  = random.uniform(0.0, 0.5)
-                print(
-                    f"⚠️  REST reintento {attempt}/{self.rest_retries} "
-                    f"en {backoff + jitter:.1f}s — {type(e).__name__}: {e}"
-                )
-                await asyncio.sleep(backoff + jitter)
-
-    # =========================================================================
-    # REST — FETCH Y RELLENO DE GAP  (uso: backfill · reconexión · safety)
-    # =========================================================================
-
-    async def _fetch_and_fill(
-        self,
-        symbol: str,
-        interval: str,
-        start_ms: int,
-        end_ms: Optional[int] = None,
-        *,
-        label: str = "gap",
-    ) -> int:
-        """
-        Descarga velas REST en [start_ms, end_ms] y las inserta en el buffer.
-        Retorna el número de velas insertadas.
-        """
-        key         = (symbol.upper(), interval)
-        interval_ms = self._interval_ms(interval)
-        now_ms      = int(time.time() * 1_000)
-        end_ms      = end_ms or now_ms
-
-        if start_ms >= end_ms:
-            return 0
-
-        # Cuántas velas entran en el rango (+ 2 de margen)
-        n_candles = max(1, int((end_ms - start_ms) / interval_ms) + 2)
-        limit     = min(n_candles, 1_500)
-        weight    = _TokenBucket.weight_for_limit(limit)
-
-        params: dict = {
-            "symbol":    symbol.upper(),
-            "interval":  interval,
-            "startTime": start_ms,
-            "endTime":   end_ms,
-            "limit":     limit,
-        }
-
-        try:
-            data = await self._fetch(f"{self.BASE_REST_URL}/fapi/v1/klines", params, weight=weight)
-        except Exception as e:
-            print(f"❌ REST {label} {symbol} {interval}: {e}")
-            return 0
-
-        if not data:
-            return 0
-
-        now_ms2 = int(time.time() * 1_000)
-        rows    = []
-        for k in data:
-            try:
-                rows.append(self._parse_rest_row(k, symbol, interval, int(k[6]) < now_ms2))
-            except Exception:
-                continue
-
-        if rows:
-            self._upsert_buffer(key, rows)
-            closed = sum(1 for r in rows if r["is_closed"])
-            self.gap_fills[key] += 1
-            print(f"📥 [{label}] {symbol} {interval}: {closed} cerradas / {len(rows)} total")
-
-        return len(rows)
-
-    # =========================================================================
-    # REST — BACKFILL INICIAL
-    # =========================================================================
-
-    async def _backfill_one(
-        self,
-        session: aiohttp.ClientSession,
-        sem: asyncio.Semaphore,
-        symbol: str,
-        interval: str,
-    ) -> None:
-        """Descarga el histórico completo de un par·intervalo al arrancar."""
-        key   = (symbol.upper(), interval)
-        limit = int(min(
-            self.rest_limits.get(interval, min(1_500, self.max_candles)),
-            self.max_candles,
-        ))
-        if limit <= 0:
-            return
-
-        weight = _TokenBucket.weight_for_limit(limit)
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-
-        async with sem:
-            try:
-                data = await self._fetch(
-                    f"{self.BASE_REST_URL}/fapi/v1/klines", params, weight=weight
-                )
-            except Exception as e:
-                print(f"🔴 Backfill {symbol} {interval}: {e}")
-                return
-
-        if not data:
-            print(f"⚠️  Backfill sin datos: {symbol} {interval}")
-            return
-
-        now_ms = int(time.time() * 1_000)
-        rows   = []
-        for k in data:
-            try:
-                rows.append(self._parse_rest_row(k, symbol, interval, int(k[6]) < now_ms))
-            except Exception:
-                continue
-
-        self._upsert_buffer(key, rows)
-        print(f"✅ Backfill {symbol} {interval}: {len(rows)} velas")
-
-    async def _backfill_all(self) -> None:
-        """Backfill inicial de todos los pares en paralelo (con batch + semáforo)."""
-        all_pairs = [(s, i) for s, ivs in self.pairs.items() for i in ivs]
-        total     = len(all_pairs)
-        print(f"📥 Backfill inicial: {total} pares")
-
-        # Sesión temporal solo para el backfill (alta concurrencia inicial)
-        connector = aiohttp.TCPConnector(limit=self.rest_concurrency * 2)
-        sem       = asyncio.Semaphore(self.rest_concurrency)
-
-        async with aiohttp.ClientSession(connector=connector) as session:
-            # Guardamos sesión temporalmente para que _backfill_one llame a _fetch
-            # a través de la misma lógica de rate limit
-            _prev, self._session = self._session, session
-            try:
-                for batch_start in range(0, total, self.backfill_batch_size):
-                    if not self._running:
-                        break
-                    batch = all_pairs[batch_start : batch_start + self.backfill_batch_size]
-                    results = await asyncio.gather(
-                        *[self._backfill_one(session, sem, s, i) for s, i in batch],
-                        return_exceptions=True,
-                    )
-                    for r in results:
-                        if isinstance(r, Exception):
-                            print(f"❌ Error backfill: {r}")
-                    if batch_start + self.backfill_batch_size < total:
-                        await asyncio.sleep(self.backfill_batch_delay)
-            finally:
-                self._session = _prev
-
-        print(f"✅ Backfill completado ({total} pares)")
-
-    # =========================================================================
-    # WEBSOCKET — HANDLER DE KLINE  (O(1), sin sort, sin upsert)
-    # =========================================================================
-
-    def _handle_ws_kline(self, symbol: str, interval: str, k: dict) -> None:
-        """
-        Actualiza el buffer con un mensaje kline del WebSocket.
-
-        Lógica:
-          • Mismo open_time  → actualiza la vela en su lugar (in-place update).
-          • open_time nuevo  → cierra la vela anterior y añade la nueva.
-          • open_time viejo  → mensaje desordenado, se descarta silenciosamente.
-                               (los gaps se rellenan por REST en reconexión/safety)
-
-        Complejidad: O(1). Sin sort, sin merge de dicts completos.
-        """
-        now_ms     = int(time.time() * 1_000)
-        is_closed  = bool(k.get("x", False))
-        close_time = int(k.get("T", 0))
-
-        # Cerrar por reloj si close_time ya pasó (pares ilíquidos sin x=true)
-        if close_time > 0 and (close_time + self.CLOSE_GRACE_MS) < now_ms:
-            is_closed = True
-
-        row = self._build_ws_row(k, is_closed)
-
-        # Si include_open=False solo nos interesan velas ya cerradas
-        if not is_closed and not self.include_open:
-            return
-
-        key = (symbol, interval)
-
-        with self.lock:
-            buf = self.buffers[key]
-
-            if not buf:
-                buf.append(row)
-                return
-
-            last_ot = buf[-1]["open_time"]
-
-            if row["open_time"] == last_ot:
-                # Misma vela: actualización in-place
-                buf[-1] = row
-
-            elif row["open_time"] > last_ot:
-                # Nueva vela: cierra la anterior si seguía abierta
-                if not buf[-1].get("is_closed", False):
-                    prev            = dict(buf[-1])
-                    prev["is_closed"] = True
-                    buf[-1]         = prev
-                buf.append(row)
-
-            # else: open_time < last_ot → mensaje desordenado → descartar
-
-    # =========================================================================
-    # WEBSOCKET — CONEXIÓN Y RECONEXIÓN
-    # =========================================================================
-
-    async def _ws_stream(self, stream_names: List[str], group_id: int) -> None:
-        """
-        Mantiene una conexión WebSocket multiplexada para un grupo de streams.
-
-        Al reconectar: solicita _fill_reconnect_gap para rellenar el período
-        en que estuvo desconectado mediante una sola llamada REST quirúrgica.
-        """
-        url   = f"{self.BASE_WS_URL}?streams={'/'.join(stream_names)}"
-        gname = f"group_{group_id}"
-
-        self.connection_stats[gname]["streams"] = stream_names
-
-        reconnect_delay    = 1.0
-        consecutive_errors = 0
-
-        while self._running:
-            try:
-                async with websockets.connect(
-                    url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=10,
-                    max_size=10 ** 7,
-                    max_queue=2_000,
-                    compression=None,
-                ) as ws:
-                    # ── Reconexión: rellenar gap ──────────────────────────────
-                    disconnect_time = self._ws_disconnect_time.pop(group_id, None)
-                    if disconnect_time is not None:
-                        elapsed = time.time() - disconnect_time
-                        print(
-                            f"🔄 {gname}: reconectado tras {elapsed:.1f}s "
-                            f"— rellenando gap por REST..."
-                        )
-                        self._register_task(
-                            ("gapfill", group_id, int(time.time() * 1000)),
-                            asyncio.create_task(
-                                self._fill_reconnect_gap(group_id, stream_names, disconnect_time)
-                            ),
-                        )
-
-                    self.connection_stats[gname]["active"] = True
-                    reconnect_delay    = 1.0
-                    consecutive_errors = 0
-                    print(f"✅ WS {gname}: {len(stream_names)} streams")
-
-                    # ── Bucle de mensajes ─────────────────────────────────────
-                    while self._running:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=45)
-                        except asyncio.TimeoutError:
-                            # Keepalive: Binance no respondió; enviamos ping manual
-                            await ws.ping()
-                            continue
-                        except websockets.ConnectionClosed as e:
-                            print(f"🔶 WS cerrado {gname}: {e}")
-                            raise
-
-                        try:
-                            msg = json.loads(raw)
-                            if "stream" not in msg or "data" not in msg:
-                                continue
-                            ev = msg["data"]
-                            if ev.get("e") != "kline":
-                                continue
-                            stream_name = msg["stream"]
-                            if stream_name not in self.stream_mapping:
-                                continue
-
-                            symbol, interval = self.stream_mapping[stream_name]
-                            k = ev.get("k", {})
-
-                            key = (symbol, interval)
-                            self.last_message_time[key] = time.time()
-                            self.message_counts[key]   += 1
-
-                            self._handle_ws_kline(symbol, interval, k)
-
-                        except Exception:
-                            pass   # No dejar caer el bucle por un mensaje malformado
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                consecutive_errors += 1
-
-                # Guardar timestamp de desconexión (para gap fill al reconectar)
-                if group_id not in self._ws_disconnect_time:
-                    self._ws_disconnect_time[group_id] = time.time()
-
-                self.connection_stats[gname].update({
-                    "reconnects": self.connection_stats[gname]["reconnects"] + 1,
-                    "last_error": str(e),
-                    "active":     False,
-                })
-                reconnect_delay = min(reconnect_delay * 1.5, 30.0)
-                if consecutive_errors > 5:
-                    reconnect_delay = 60.0
-
-                print(
-                    f"🔴 {gname}: {e} "
-                    f"— reconectando en {reconnect_delay:.1f}s (intento {consecutive_errors})"
-                )
-                await asyncio.sleep(reconnect_delay)
-
-        self.connection_stats[gname]["active"] = False
-
-    # =========================================================================
-    # GAP FILL POST-RECONEXIÓN
-    # =========================================================================
-
-    async def _fill_reconnect_gap(
-        self,
-        group_id: int,
-        stream_names: List[str],
-        disconnect_time: float,
-    ) -> None:
-        """
-        Descarga via REST SOLO las velas del período de desconexión.
-        Se llama una única vez al reconectar, con concurrencia limitada.
-        """
-        # 2 segundos antes de la desconexión como margen de seguridad
-        start_ms     = int(disconnect_time * 1_000) - 2_000
-        pairs        = [self.stream_mapping[s] for s in stream_names if s in self.stream_mapping]
-        sem          = asyncio.Semaphore(5)   # concurrencia baja: no saturar REST
-
-        async def _one(symbol: str, interval: str) -> None:
-            async with sem:
-                await self._fetch_and_fill(symbol, interval, start_ms, label="reconnect")
-
-        results = await asyncio.gather(
-            *[_one(s, i) for s, i in pairs],
-            return_exceptions=True,
-        )
-        for r in results:
-            if isinstance(r, Exception):
-                print(f"❌ Gap fill reconexión: {r}")
-
-    # =========================================================================
-    # MONITOR DE RELOJ  —  cierre duro de velas por close_time
-    # =========================================================================
-
-    async def _candle_close_monitor(self) -> None:
-        """
-        Cierra velas por reloj cada CLOCK_MONITOR_INTERVAL segundos.
-
-        Por qué existe: Binance puede omitir el campo x=true para pares ilíquidos.
-        Este monitor es la fuente autoritativa de cierre.
-
-        Costo: O(pares activos) cada segundo, solo lectura del último elemento.
-        """
-        print(f"⏰ Monitor de reloj: cada {self.CLOCK_MONITOR_INTERVAL}s")
-        while self._running:
-            try:
-                await asyncio.sleep(self.CLOCK_MONITOR_INTERVAL)
-                now_ms = int(time.time() * 1_000)
-                with self.lock:
-                    for key, buf in self.buffers.items():
-                        if not buf:
-                            continue
-                        last = buf[-1]
-                        if last.get("is_closed", False):
-                            continue
-                        ct = last.get("close_time", 0)
-                        if ct > 0 and (ct + self.CLOSE_GRACE_MS) < now_ms:
-                            closed             = dict(last)
-                            closed["is_closed"] = True
-                            buf[-1]            = closed
-                            self.clock_closes[key] += 1
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"❌ Monitor reloj: {e}")
-                await asyncio.sleep(5)
-
-    # =========================================================================
-    # SAFETY REFRESH  —  red de seguridad de último recurso (cada N min)
-    # =========================================================================
-
-    async def _safety_refresh(self) -> None:
-        """
-        Se ejecuta cada safety_refresh_interval_seconds (default: 10 min).
-
-        Actúa SOLO si encuentra un gap REAL: la última vela cerrada es más
-        antigua de lo que debería ser dado el tiempo transcurrido.
-        Esto cubre el caso teórico de que tanto WS como el gap fill fallen.
-
-        En operación normal → nunca hace peticiones REST.
-        """
-        print(f"🛡  Safety refresh: cada {self.safety_refresh_interval_seconds}s (último recurso)")
-        await asyncio.sleep(120)   # Esperar estabilización del sistema
-
-        while self._running:
-            try:
-                await asyncio.sleep(self.safety_refresh_interval_seconds)
-                if not self._running:
-                    break
-
-                now_ms    = int(time.time() * 1_000)
-                gaps_found = 0
-
-                for symbol, intervals in self.pairs.items():
-                    for interval in intervals:
-                        key         = (symbol.upper(), interval)
-                        interval_ms = self._interval_ms(interval)
-
-                        with self.lock:
-                            buf = list(self.buffers.get(key, deque()))
-
-                        if not buf:
-                            continue
-
-                        # Buscar última vela cerrada
-                        closed = [r for r in buf if r.get("is_closed", False)]
-                        if not closed:
-                            continue
-
-                        last_closed      = closed[-1]
-                        expected_next_ot = last_closed["open_time"] + interval_ms
-                        expected_next_ct = expected_next_ot + interval_ms - 1
-
-                        # Solo actuar si hay al menos UN intervalo completo sin cubrir
-                        if now_ms < expected_next_ct + interval_ms:
-                            continue   # Demasiado pronto, no es un gap real
-
-                        # Hay un gap real: descargarlo
-                        start_ms = expected_next_ot
-                        gaps_found += 1
-                        self._register_task(
-                            ("safety", symbol.upper(), interval, int(time.time() * 1000)),
-                            asyncio.create_task(
-                                self._fetch_and_fill(symbol, interval, start_ms, label="safety")
-                            ),
-                        )
-
-                if gaps_found:
-                    print(f"🛡  Safety: {gaps_found} pares con gaps reales → reparando")
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"❌ Safety refresh: {e}")
-                await asyncio.sleep(60)
-
-    # =========================================================================
-    # MONITOR DE SALUD DE STREAMS
-    # =========================================================================
-
-    async def _stream_health_monitor(self) -> None:
-        """
-        Detecta grupos WS silenciosos y fuerza reconexión.
-
-        Un grupo se considera muerto si la MAYORÍA de sus pares llevan más de
-        stream_silence_threshold_seconds sin mensajes.
-        Usar mayoría (≥ 50 %) evita reconexiones falsas por pares muy ilíquidos.
-        """
-        print(
-            f"🏥 Health monitor: check cada {self.stream_health_check_seconds}s "
-            f"(umbral silencio: {self.stream_silence_threshold_seconds}s)"
-        )
-        await asyncio.sleep(90)   # Esperar a que el sistema esté estable
-
-        while self._running:
-            try:
-                await asyncio.sleep(self.stream_health_check_seconds)
-                if not self._running:
-                    break
-
-                now = time.time()
-
-                for gname, stats in list(self.connection_stats.items()):
-                    if not stats.get("active"):
-                        continue
-                    streams = stats.get("streams", [])
-                    if not streams:
-                        continue
-
-                    pairs_in_group = [
-                        self.stream_mapping[s]
-                        for s in streams
-                        if s in self.stream_mapping
-                    ]
-                    if not pairs_in_group:
-                        continue
-
-                    # Contar pares que han recibido al menos un mensaje y están silenciosos
-                    heard = [p for p in pairs_in_group if p in self.last_message_time]
-                    if not heard:
-                        continue   # Nunca recibieron mensajes (pares muy ilíquidos normales)
-
-                    silent = [
-                        p for p in heard
-                        if (now - self.last_message_time[p]) > self.stream_silence_threshold_seconds
-                    ]
-
-                    # Solo reconectar si ≥ 50 % de los pares con historia están silenciosos
-                    if len(silent) < max(1, len(heard) // 2):
-                        continue
-
-                    try:
-                        gid = int(gname.split("_")[1])
-                    except (IndexError, ValueError):
-                        continue
-
-                    print(
-                        f"⚠️  {gname}: {len(silent)}/{len(heard)} streams silenciosos "
-                        f"→ forzando reconexión"
-                    )
-
-                    old_task = self._tasks.get(("stream", gid))
-                    if old_task and not old_task.done():
-                        old_task.cancel()
-                        await asyncio.sleep(1.0)
-
-                    if self._running:
-                        new_task = self._register_task(
-                            ("stream", gid),
-                            asyncio.create_task(self._ws_stream(streams, gid)),
-                        )
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"❌ Health monitor: {e}")
-                await asyncio.sleep(60)
-
-    # =========================================================================
-    # MONITOR DE CONEXIONES  (log periódico de estado)
-    # =========================================================================
-
-    async def _monitor_connections(self) -> None:
-        while self._running:
-            await asyncio.sleep(60)
-            if not self._running:
-                break
-            active     = sum(1 for s in self.connection_stats.values() if s.get("active"))
-            total      = len(self.connection_stats)
-            gap_total  = sum(self.gap_fills.values())
-            clock_total = sum(self.clock_closes.values())
-            msg_total  = sum(self.message_counts.values())
-            print(
-                f"🔌 WS: {active}/{total} activas "
-                f"| Msgs: {msg_total} "
-                f"| Cierres reloj: {clock_total} "
-                f"| Gap fills: {gap_total} "
-                f"| Tokens RL: {self._bucket._tokens:.0f}"
-            )
-
-    # =========================================================================
-    # GRUPOS DE STREAMS
-    # =========================================================================
-
-    def _create_stream_groups(self) -> List[List[str]]:
-        """Construye los grupos multiplexados de streams WS."""
-        all_streams: List[str] = []
-        self.stream_mapping.clear()
-        self.subscribed_streams.clear()
-
-        for symbol, intervals in self.pairs.items():
-            for interval in intervals:
-                name = f"{symbol.lower()}@kline_{interval}"
-                all_streams.append(name)
-                self.stream_mapping[name]  = (symbol.upper(), interval)
-                self.subscribed_streams.add((symbol.upper(), interval))
-
-        groups = [
-            all_streams[i : i + self.streams_per_connection]
-            for i in range(0, len(all_streams), self.streams_per_connection)
-        ]
-        print(f"📋 {len(all_streams)} streams → {len(groups)} conexiones WS")
-        for idx, g in enumerate(groups, 1):
-            print(f"   Grupo {idx}: {len(g)} streams")
-        return groups
-
-    # =========================================================================
-    # CICLO DE VIDA
-    # =========================================================================
-
-    def start(self) -> None:
-        print("\n" + "=" * 70)
-        print("🚀 KlineWebSocketCache v4  —  WS-first · Zero-REST normal")
-        print("=" * 70)
-
-        self._running = True
-        loop          = asyncio.new_event_loop()
-        self._loop    = loop
-
-        thread = threading.Thread(
-            target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()),
-            daemon=True,
-            name="KlineWSLoop",
-        )
-        thread.start()
-        self._thread = thread
-
-        async def _startup() -> None:
-            # Event para pausa global 429/418 (set = libre; clear = bloqueado)
-            self._rate_limit_pause = asyncio.Event()
-            self._rate_limit_pause.set()
-
-            # Sesión REST compartida de larga vida
-            connector = aiohttp.TCPConnector(
-                limit=self.rest_concurrency * 2,
-                limit_per_host=self.rest_concurrency,
-                keepalive_timeout=30,
-            )
-            self._session = aiohttp.ClientSession(connector=connector)
-
-            stream_groups = self._create_stream_groups()
-
-            # ── Backfill inicial ──────────────────────────────────────────────
-            if self.backfill_on_start:
-                print("\n📥 Ejecutando backfill inicial…")
-                await self._backfill_all()
-
-            # ── WebSocket connections ─────────────────────────────────────────
-            for idx, group in enumerate(stream_groups, 1):
-                task = self._register_task(
-                    ("stream", idx),
-                    asyncio.create_task(self._ws_stream(group, idx)),
-                )
-
-            # ── Tareas de mantenimiento ───────────────────────────────────────
-            self._register_task(("maintenance", "candle_close"), asyncio.create_task(self._candle_close_monitor()))   # siempre activo
-            self._register_task(("maintenance", "safety"), asyncio.create_task(self._safety_refresh()))          # último recurso
-            self._register_task(("maintenance", "health"), asyncio.create_task(self._stream_health_monitor()))   # detecta WS muertos
-            self._register_task(("maintenance", "monitor"), asyncio.create_task(self._monitor_connections()))     # log periódico
-
-            n = sum(len(ivs) for ivs in self.pairs.values())
-            print(f"\n✅ KlineWebSocketCache v4 iniciado")
-            print(f"   • Pares/intervalos   : {len(self.pairs)}/{n}")
-            print(f"   • Fuente primaria    : WebSocket (zero REST en normal)")
-            print(f"   • Gap fill           : REST quirúrgico al reconectar")
-            print(f"   • Monitor de reloj   : cada {self.CLOCK_MONITOR_INTERVAL}s")
-            print(f"   • Safety refresh     : cada {self.safety_refresh_interval_seconds}s (último recurso)")
-            print(f"   • Rate limiter       : {self._bucket.capacity} cap / {self._bucket.refill_rate} t·s⁻¹")
-            print(f"   • Buffer             : ventana {self.max_candles} velas/par")
-            print("=" * 70 + "\n")
-
-        self._startup_future = asyncio.run_coroutine_threadsafe(_startup(), loop)
-
     def stop(self) -> None:
-        print("🛑 Deteniendo KlineWebSocketCache…")
         self._running = False
-
-        if self._loop and self._loop.is_running():
-            shutdown = asyncio.run_coroutine_threadsafe(self._shutdown_async(), self._loop)
+        loop = self._loop
+        if loop and loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(self._shutdown_async(), loop)
             try:
-                shutdown.result(timeout=15)
-            except Exception as e:
-                print(f"⚠️  Error en apagado limpio: {e}")
-
-            self._loop.call_soon_threadsafe(self._loop.stop)
-
+                fut.result(timeout=10)
+            except Exception:
+                pass
+            loop.call_soon_threadsafe(loop.stop)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
-
         self._loop = None
         self._thread = None
-        self._startup_future = None
+        self._states.clear()
+        self._pending.clear()
+        self._warming.clear()
+        self._subscribed.clear()
+        print("✅ KlineEMA detenido")
 
-        # Fallback: si stop() se llama sin loop activo, igual libera estado.
-        with self.lock:
-            for buf in self.buffers.values():
-                buf.clear()
-            self.buffers.clear()
+    # ─────────────────────────────────────────────────────────────────────
+    # Consulta
+    # ─────────────────────────────────────────────────────────────────────
 
-        self.last_message_time.clear()
-        self.message_counts.clear()
-        self.clock_closes.clear()
-        self.gap_fills.clear()
-        self._ws_disconnect_time.clear()
-        self.connection_stats.clear()
-        self.stream_mapping.clear()
-        self.subscribed_streams.clear()
-        self._tasks.clear()
-        self._rate_limit_pause = None
+    def symbols(self) -> List[str]:
+        return sorted(self._states)
 
-        gc.collect()
-        print("✅ KlineWebSocketCache detenido")
-
-    def force_refresh(
-        self,
-        symbol: Optional[str] = None,
-        interval: Optional[str] = None,
-    ) -> None:
-        """
-        Fuerza una descarga REST inmediata.
-        - symbol+interval → rellena solo las velas faltantes de ese par.
-        - Sin argumentos  → backfill completo de todos los pares.
-        """
-        if not self._loop:
-            print("⚠️  Loop no activo. Llama a start() primero.")
-            return
-
-        async def _do() -> None:
-            if symbol and interval:
-                key         = (symbol.upper(), interval)
-                interval_ms = self._interval_ms(interval)
-                with self.lock:
-                    buf = list(self.buffers.get(key, deque()))
-                closed = [r for r in buf if r.get("is_closed", False)]
-                if closed:
-                    start_ms = closed[-1]["open_time"] + interval_ms
-                    await self._fetch_and_fill(symbol, interval, start_ms, label="force_refresh")
-                else:
-                    # Sin datos: descarga completa
-                    limit  = min(self.rest_limits.get(interval, 1_500), self.max_candles)
-                    weight = _TokenBucket.weight_for_limit(limit)
-                    data   = await self._fetch(
-                        f"{self.BASE_REST_URL}/fapi/v1/klines",
-                        {"symbol": symbol.upper(), "interval": interval, "limit": limit},
-                        weight=weight,
-                    )
-                    now_ms = int(time.time() * 1_000)
-                    rows   = [
-                        self._parse_rest_row(k, symbol, interval, int(k[6]) < now_ms)
-                        for k in data
-                    ]
-                    self._upsert_buffer(key, rows)
-                    print(f"✅ force_refresh {symbol} {interval}: {len(rows)} velas")
-            else:
-                await self._backfill_all()
-
-        asyncio.run_coroutine_threadsafe(_do(), self._loop)
-
-    # =========================================================================
-    # CONSULTA DE DATOS
-    # =========================================================================
-
-    def get_dataframe(
-        self,
-        symbol: str,
-        interval: str,
-        only_closed: bool = False,
-    ) -> pd.DataFrame:
-        """Retorna el buffer como DataFrame. Thread-safe."""
-        key = (symbol.upper(), interval)
-        with self.lock:
-            rows = list(self.buffers.get(key, deque()))
-
-        if not rows:
-            return pd.DataFrame(columns=[
-                "timestamp", "open", "high", "low", "close", "volume",
-                "close_time", "trades", "quote_volume",
-                "taker_buy_volume", "taker_buy_quote_volume", "is_closed",
-            ])
-
-        df = pd.DataFrame(rows)
-        if only_closed:
-            df = df[df["is_closed"]].copy()
-
-        df["timestamp"]  = pd.to_datetime(df["open_time"],  unit="ms")
-        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-
-        return df[[
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "trades", "quote_volume",
-            "taker_buy_volume", "taker_buy_quote_volume", "is_closed",
-        ]].reset_index(drop=True)
-
-    def get_last_closed(self, symbol: str, interval: str) -> Optional[dict]:
-        """Retorna la última vela CERRADA como dict, o None si no hay."""
-        df = self.get_dataframe(symbol, interval, only_closed=True)
-        return None if df.empty else df.iloc[-1].to_dict()
-
-    def get_stream_health(self) -> dict:
-        """Estado de salud por (symbol, interval)."""
-        now = time.time()
-        return {
-            key: {
-                "last_message_ago": (
-                    f"{now - self.last_message_time[key]:.0f}s"
-                    if key in self.last_message_time else "never"
-                ),
-                "message_count": self.message_counts.get(key, 0),
-                "clock_closes":  self.clock_closes.get(key, 0),
-                "gap_fills":     self.gap_fills.get(key, 0),
-                "is_healthy": (
-                    (now - self.last_message_time.get(key, 0))
-                    < self.stream_silence_threshold_seconds
-                    if key in self.last_message_time else False
-                ),
-            }
-            for key in self.subscribed_streams
-        }
+    def get_ema(self, symbol: str) -> Optional[Tuple[float, float, int]]:
+        """(ema_rápida, ema_lenta, signo) o None si no está seguido / no listo."""
+        st = self._states.get(symbol.upper())
+        if st is None or not st.ready:
+            return None
+        return st.fast, st.slow, st.sign
 
     def get_stats(self) -> dict:
-        """Resumen general del estado del sistema."""
-        with self.lock:
-            total_candles = sum(len(b) for b in self.buffers.values())
-            with_data     = sum(1 for b in self.buffers.values() if b)
+        states = list(self._states.values())
         return {
-            "total_pairs":          len(self.buffers),
-            "pairs_with_data":      with_data,
-            "total_candles":        total_candles,
-            "avg_candles_per_pair": total_candles / max(with_data, 1),
-            "total_messages":       sum(self.message_counts.values()),
-            "total_clock_closes":   sum(self.clock_closes.values()),
-            "total_gap_fills":      sum(self.gap_fills.values()),
-            "active_connections":   sum(1 for s in self.connection_stats.values() if s.get("active")),
-            "total_connections":    len(self.connection_stats),
-            "rate_limiter_tokens":  round(self._bucket._tokens, 1),
+            "tracked_symbols":   len(states),
+            "ready_symbols":     sum(1 for s in states if s.ready and s.n >= self.min_candles),
+            "warming":           len(self._warming),
+            "closed_candles":    self.closed_candles,
+            "signals":           self.signals,
+            "stale_signals":     self.stale_signals,
+            "gap_resyncs":       self.gap_resyncs,
+            "connected":         self._connected,
+            "reconnects":        self.reconnects,
+            "last_error":        self.last_error,
         }
 
 
 # =============================================================================
-# EJEMPLO DE USO
+# PRUEBA RÁPIDA
 # =============================================================================
 
 if __name__ == "__main__":
-    import os
+    def _cb(sym: str, direction: str, price: float, ct: int) -> None:
+        print(f"⚡ CRUCE {direction:4s} {sym:12s} px={price}")
 
-    pairs = {
-        "BTCUSDT": ["1m", "5m", "15m", "1h"],
-        "ETHUSDT": ["1m", "5m"],
-        "BNBUSDT": ["1m"],
-        "SOLUSDT": ["1m", "5m"],
-    }
-
-    cache = KlineWebSocketCache(
-        pairs=pairs,
-        max_candles=1_500,
-        include_open_candle=True,
-        backfill_on_start=True,
-        streams_per_connection=40,
-        rest_concurrency=20,
-        rest_retries=4,
-        rest_backoff_max=30.0,
-        rest_min_sleep=0.05,
-        backfill_batch_size=5,
-        backfill_batch_delay=0.1,
-        rate_limit_capacity=1_200,
-        rate_limit_refill=20.0,
-        stream_silence_threshold_seconds=120,
-        stream_health_check_seconds=60,
-        safety_refresh_interval_seconds=600,
-    )
-
+    cache = KlineWebSocketCache(top_n=200)
+    cache.set_signal_callback(_cb)
     cache.start()
-
     try:
         while True:
-            time.sleep(10)
-            os.system("cls" if os.name == "nt" else "clear")
-
-            print("=" * 70)
-            print(f"📊 KlineWebSocketCache v4 — {datetime.now().strftime('%H:%M:%S')}")
-            print("=" * 70)
-
-            stats = cache.get_stats()
-            print(f"\n📈 General:")
-            print(f"  WS activas          : {stats['active_connections']}/{stats['total_connections']}")
-            print(f"  Pares con datos     : {stats['pairs_with_data']}/{stats['total_pairs']}")
-            print(f"  Total velas         : {stats['total_candles']}")
-            print(f"  Prom. velas/par     : {stats['avg_candles_per_pair']:.1f}")
-            print(f"  Msgs WS recibidos   : {stats['total_messages']}")
-            print(f"  Cierres por reloj   : {stats['total_clock_closes']}")
-            print(f"  Gap fills REST      : {stats['total_gap_fills']}")
-            print(f"  Tokens rate-limiter : {stats['rate_limiter_tokens']}")
-
-            health  = cache.get_stream_health()
-            healthy = sum(1 for h in health.values() if h["is_healthy"])
-            print(f"\n🏥 Streams saludables: {healthy}/{len(health)}")
-
-            unhealthy = [(k, v) for k, v in health.items() if not v["is_healthy"]]
-            if unhealthy:
-                print("  ⚠️  Con problemas:")
-                for key, info in unhealthy[:5]:
-                    sym, itv = key
-                    print(f"     • {sym} {itv}: {info['last_message_ago']} sin mensajes")
-
-            print(f"\n📊 Últimas velas cerradas:")
-            print("-" * 70)
-            for symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
-                for interval in ["1m", "5m", "15m", "1h"]:
-                    if symbol in cache.pairs and interval in cache.pairs[symbol]:
-                        last = cache.get_last_closed(symbol, interval)
-                        if last:
-                            df = cache.get_dataframe(symbol, interval, only_closed=True)
-                            print(
-                                f"{symbol:10s} {interval:3s}: "
-                                f"${last['close']:10.2f}  "
-                                f"Vol:{last['volume']:10.2f}  "
-                                f"Velas:{len(df):4d}  "
-                                f"Msgs:{cache.message_counts.get((symbol, interval), 0):5d}  "
-                                f"Gaps:{cache.gap_fills.get((symbol, interval), 0):3d}  "
-                                f"[{last['timestamp']}]"
-                            )
-
-            print("\n" + "=" * 70)
-            print("Ctrl+C para detener")
-
+            time.sleep(30)
+            print(cache.get_stats())
     except KeyboardInterrupt:
-        print("\n🛑 Deteniendo…")
         cache.stop()
-        print("✅ Finalizado")
