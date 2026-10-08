@@ -52,7 +52,7 @@ if _HERE not in sys.path:
 # no son GET. Se instala ANTES de importar WS y KlineWebSocketCache_v4 y cubre
 # urllib, requests y aiohttp: también enruta la descarga de velas de esos módulos.
 
-_PROXY_URLS_RAW       = os.getenv("PROXY_URLS", "")
+_PROXY_URLS_RAW       = os.getenv("PROXY_URLS", "http://fixie:7xOistPTXaKiKbh@ventoux.usefixie.com:80,http://fixie:TRPp7JUSFpzGPQn@ventoux.usefixie.com:80,http://fixie:CuLSweHyTOG4Lg3@ventoux.usefixie.com:80,http://fixie:wg6P9WLEMevEurg@ventoux.usefixie.com:80")
 PROXY_BOOTSTRAP_HOURS = max(0.0, float(os.getenv("PROXY_BOOTSTRAP_HOURS", "4") or 0))
 PROXY_MODE            = (os.getenv("PROXY_MODE", "auto") or "auto").strip().lower()
 PROXY_WEIGHT_LIMIT    = int(os.getenv("PROXY_WEIGHT_LIMIT", "2000"))   # Binance Futures: 2400 de peso/min por IP
