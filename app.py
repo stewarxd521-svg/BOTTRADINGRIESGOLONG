@@ -2,29 +2,718 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import csv
+import gzip
 import hashlib
+import http.client
 import io
 import hmac
 import json
 import os
+import re
+import socket
 import sys
 import tempfile
 import threading
 import time
+import zlib
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from math import floor
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 import urllib.error
 import urllib.request
+import urllib.response
 
 from flask import Flask, jsonify, make_response, render_template_string, request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROXIES DE ARRANQUE PARA EL REST DE BINANCE (primeras PROXY_BOOTSTRAP_HOURS)
+# ─────────────────────────────────────────────────────────────────────────────
+# Problema: al arrancar, Binance suele tener bloqueada la IP del servidor
+# (HTTP 418) y la descarga de velas se queda esperando horas.
+# Solución: durante las primeras PROXY_BOOTSTRAP_HOURS (4 h por defecto) las
+# peticiones REST PÚBLICAS a Binance (velas, exchangeInfo…) pueden salir por
+# los proxies de PROXY_URLS (separados por comas), rotándolos:
+#   • PROXY_MODE=auto (por defecto): sale directo mientras la IP del servidor
+#     responda; en cuanto Binance la bloquea o la limita (418/429), la rechaza
+#     (403/451) o su peso del minuto se acerca al tope, la petición sale por el
+#     siguiente proxy. Así no se gasta cuota de los proxies si no hace falta.
+#   • PROXY_MODE=always: durante la ventana todo sale por los proxies (la IP
+#     del servidor solo se usa si ningún proxy responde).
+# Pasada la ventana, todo vuelve a salir directo aunque la IP esté bloqueada.
+# Nunca pasan por un proxy las peticiones firmadas (órdenes, cuenta) ni las que
+# no son GET. Se instala ANTES de importar WS y KlineWebSocketCache_v4 y cubre
+# urllib, requests y aiohttp: también enruta la descarga de velas de esos módulos.
+
+_PROXY_URLS_RAW       = os.getenv("PROXY_URLS", "")
+PROXY_BOOTSTRAP_HOURS = max(0.0, float(os.getenv("PROXY_BOOTSTRAP_HOURS", "4") or 0))
+PROXY_MODE            = (os.getenv("PROXY_MODE", "auto") or "auto").strip().lower()
+PROXY_WEIGHT_LIMIT    = int(os.getenv("PROXY_WEIGHT_LIMIT", "2000"))   # Binance Futures: 2400 de peso/min por IP
+PROXY_TIMEOUT_S       = float(os.getenv("PROXY_TIMEOUT_S", "30"))
+_BINANCE_REST_HOST_RE = re.compile(r"^(fapi|dapi|api)\d*\.binance\.com$", re.I)
+
+
+def _fmt_secs(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    h, m, r = s // 3600, (s % 3600) // 60, s % 60
+    if h:
+        return f"{h} h {m:02d} min"
+    if m:
+        return f"{m} min {r:02d} s"
+    return f"{r} s"
+
+
+def _mask_proxy(url: str) -> str:
+    """http://usuario:clave@host:80 → usuario:***@host:80 (nunca muestra la clave)."""
+    try:
+        u = urlsplit(url)
+        port = f":{u.port}" if u.port else ""
+        user = f"{u.username}:***@" if u.username else ""
+        return f"{user}{u.hostname or '?'}{port}"
+    except Exception:
+        return "proxy"
+
+
+def _parse_proxy_urls(raw: str) -> List[str]:
+    """Lista de proxies de PROXY_URLS (comas, espacios o ';'; acepta comillas)."""
+    out: List[str] = []
+    for part in re.split(r"[\s,;]+", (raw or "").strip()):
+        p = part.strip().strip("'\"")
+        if not p:
+            continue
+        if "://" not in p:
+            p = "http://" + p
+        try:
+            u = urlsplit(p)
+            ok = u.scheme in ("http", "https") and bool(u.hostname)
+            _ = u.port                      # ValueError si el puerto no es un número
+        except ValueError:
+            ok = False
+        if not ok:
+            print(f"PROXY_URLS: entrada no válida ignorada ({_mask_proxy(p)})", flush=True)
+            continue
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _estimate_weight(url: str, params: Any = None) -> int:
+    """Peso aproximado de Binance Futures para una petición pública."""
+    try:
+        u = urlsplit(url)
+        path = u.path.rstrip("/").lower()
+        qs = {k.lower(): v[-1] for k, v in parse_qs(u.query).items()}
+    except Exception:
+        return 5
+    if isinstance(params, dict):
+        qs.update({str(k).lower(): str(v) for k, v in params.items()})
+    elif isinstance(params, (list, tuple)):
+        for item in params:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                qs[str(item[0]).lower()] = str(item[1])
+    if path.endswith("klines"):                   # klines, continuousKlines, markPriceKlines…
+        try:
+            limit = int(float(qs.get("limit", "500")))
+        except ValueError:
+            limit = 500
+        return 1 if limit < 100 else 2 if limit < 500 else 5 if limit <= 1000 else 10
+    if path.endswith(("/exchangeinfo", "/time", "/ping")):
+        return 1
+    if "/ticker/" in path:
+        return 2 if "symbol" in qs else 40
+    if path.endswith("/depth"):
+        return 20
+    return 5
+
+
+def _retry_after(headers: Any) -> Optional[float]:
+    try:
+        v = headers.get("Retry-After") if headers is not None else None
+    except Exception:
+        v = None
+    if not v:
+        return None
+    try:
+        return max(1.0, float(str(v).strip()))
+    except ValueError:
+        return None
+
+
+def _proxy_status_from_exc(exc: BaseException) -> Optional[int]:
+    """Código HTTP de un fallo del proxy (p. ej. 'Tunnel connection failed: 407 …')."""
+    st = getattr(exc, "status", None)
+    if isinstance(st, int):
+        return st
+    m = re.search(r"Tunnel connection failed:\s*(\d{3})", str(exc))
+    if m is None:
+        m = re.search(r"\b(407)\b", str(exc))
+    return int(m.group(1)) if m else None
+
+
+def _clone_request(req: urllib.request.Request,
+                   extra: Optional[Dict[str, str]] = None) -> urllib.request.Request:
+    """Copia limpia de una Request (urllib la modifica al pasar por un proxy)."""
+    hdrs = dict(req.header_items())
+    if extra:
+        hdrs.update(extra)
+    return urllib.request.Request(req.full_url, data=None, headers=hdrs, method=req.get_method())
+
+
+def _rewrap_response(resp: Any, body: bytes) -> Any:
+    """Devuelve el cuerpo ya descomprimido con la misma interfaz que urlopen."""
+    msg = resp.headers
+    try:
+        del msg["Content-Encoding"]
+        if msg.get("Content-Length") is not None:
+            msg.replace_header("Content-Length", str(len(body)))
+    except Exception:
+        pass
+    out = urllib.response.addinfourl(io.BytesIO(body), msg, resp.geturl(),
+                                     getattr(resp, "status", None) or 200)
+    out.reason = getattr(resp, "reason", "OK")
+    try:
+        resp.close()
+    except Exception:
+        pass
+    return out
+
+
+class _Route:
+    """Una salida a Binance: la IP del servidor (url=None) o un proxy."""
+
+    def __init__(self, idx: int, url: Optional[str]) -> None:
+        self.idx = idx
+        self.url = url
+        self.name = "Directo" if url is None else f"Proxy {idx}"
+        self.label = "IP del servidor" if url is None else _mask_proxy(url)
+        self.cool_until = 0.0
+        self.cool_reason = ""
+        self.cool_kind = ""
+        self.min_key = 0            # minuto (time // 60) al que corresponde min_weight
+        self.min_weight = 0         # peso usado en ese minuto (cabecera X-MBX-USED-WEIGHT-1M)
+        self.ok = 0
+        self.fail = 0
+        self.last_status = 0
+        self.last_ts = 0.0
+        self.bytes = 0
+        self.opener: Optional[urllib.request.OpenerDirector] = None
+
+
+class BinanceRestRouter:
+    """Reparte las peticiones REST públicas a Binance entre la IP del servidor y
+    los proxies durante la ventana de arranque (ver comentario de arriba)."""
+
+    def __init__(self, proxy_urls: List[str], hours: float, mode: str,
+                 weight_limit: int, base_url: str, timeout_s: float) -> None:
+        self.direct = _Route(0, None)
+        self.proxies = [_Route(i + 1, u) for i, u in enumerate(proxy_urls)]
+        for r in self.proxies:
+            op = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": r.url, "https": r.url}))
+            op._rest_router_internal = True          # su .open() no se vuelve a enrutar
+            r.opener = op
+        self.hours = max(0.0, float(hours))
+        self.mode = mode if mode in ("auto", "always") else "auto"
+        self.weight_limit = max(50, int(weight_limit))
+        self.timeout_s = float(timeout_s)
+        self.started = time.time()
+        self.window_end = self.started + self.hours * 3600.0
+        self.configured = bool(self.proxies) and self.hours > 0
+        self.lock = threading.Lock()
+        self.logger = None                           # se conecta a bot.log al arrancar
+        self._rr = 0                                 # siguiente proxy de la rotación
+        self._direct_ok = False                      # la IP del servidor respondió bien
+        self._direct_probe = False                   # hay una petición directa de prueba en vuelo
+        self._ended_logged = False
+        self._klines_warned = False
+        self.stats: Dict[str, Any] = {"routed": 0, "via_proxy": 0, "direct": 0,
+                                      "klines": 0, "libs": {}}
+        host = (urlsplit(base_url).hostname or "").lower()
+        self.hosts = {h for h in (host, "fapi.binance.com", "dapi.binance.com", "api.binance.com") if h}
+
+    # ── Estado ────────────────────────────────────────────────────────────────
+
+    def active(self) -> bool:
+        return self.configured and time.time() < self.window_end
+
+    def _emit(self, msgs: List[str]) -> None:
+        for m in msgs:
+            try:
+                (self.logger or (lambda s: print(s, flush=True)))(m)
+            except Exception:
+                pass
+
+    def startup_message(self) -> str:
+        if not self.configured:
+            if self.proxies and self.hours <= 0:
+                return "[proxy] PROXY_BOOTSTRAP_HOURS=0: proxies de arranque desactivados"
+            return "[proxy] PROXY_URLS vacío: el REST de Binance sale siempre directo"
+        how = ("directo y, si Binance limita la IP del servidor, por los proxies"
+               if self.mode == "auto" else "siempre por los proxies")
+        return (f"[proxy] {len(self.proxies)} proxies para el REST de Binance durante las primeras "
+                f"{self.hours:g} h (modo {self.mode}: {how}): "
+                + ", ".join(r.label for r in self.proxies))
+
+    def should_route(self, url: str, method: Optional[str], params: Any = None) -> bool:
+        if not self.active():
+            return False
+        if (method or "GET").upper() not in ("GET", "HEAD"):
+            return False
+        try:
+            u = urlsplit(str(url))
+        except Exception:
+            return False
+        if u.scheme not in ("http", "https"):
+            return False
+        host = (u.hostname or "").lower()
+        if host not in self.hosts and not _BINANCE_REST_HOST_RE.match(host):
+            return False
+        if "signature=" in (u.query or "") or (params is not None and "signature" in str(params)):
+            return False                             # órdenes/cuenta: siempre directo
+        return True
+
+    # ── Selección de ruta ────────────────────────────────────────────────────
+
+    def _pick(self, weight: int, tried: set) -> Tuple[Optional[_Route], float]:
+        """(ruta, 0) o (None, segundos a esperar; 0 = no hay nada que esperar)."""
+        now = time.time()
+        mk = int(now // 60)
+        with self.lock:
+            n = len(self.proxies)
+            rot = [self.proxies[(self._rr + i) % n] for i in range(n)]
+            order = rot + [self.direct] if self.mode == "always" else [self.direct] + rot
+            soonest: Optional[float] = None
+            for r in order:
+                if r in tried:
+                    continue
+                if r.cool_until > now:
+                    soonest = r.cool_until if soonest is None else min(soonest, r.cool_until)
+                    continue
+                if r is self.direct and not self._direct_ok and self._direct_probe:
+                    continue                         # ya hay una prueba en vuelo: no insistir en paralelo
+                used = r.min_weight if r.min_key == mk else 0
+                if used + weight > self.weight_limit:
+                    nxt = (mk + 1) * 60 + 1.0
+                    soonest = nxt if soonest is None else min(soonest, nxt)
+                    continue
+                if r.min_key != mk:
+                    r.min_key, r.min_weight = mk, 0
+                r.min_weight += weight               # reserva (la cabecera de Binance la corrige)
+                if r is self.direct:
+                    if not self._direct_ok:
+                        self._direct_probe = True
+                else:
+                    self._rr = (self.proxies.index(r) + 1) % n
+                return r, 0.0
+        if soonest is not None and soonest - now <= 65.0:
+            return None, max(0.2, soonest - now)
+        return None, 0.0
+
+    def _done(self, route: _Route) -> None:
+        if route is self.direct:
+            with self.lock:
+                self._direct_probe = False
+
+    def _note(self, route: _Route, status: Optional[int], headers: Any, nbytes: int = 0) -> None:
+        """Registra una respuesta de Binance (peso usado, aciertos, recuperación)."""
+        now = time.time()
+        msgs: List[str] = []
+        try:
+            w = headers.get("X-MBX-USED-WEIGHT-1M") if headers is not None else None
+            weight = int(str(w).strip()) if w not in (None, "") else None
+        except Exception:
+            weight = None
+        with self.lock:
+            route.last_status = int(status or 0)
+            route.last_ts = now
+            route.bytes += max(0, int(nbytes))
+            if weight is not None:
+                mk = int(now // 60)
+                if route.min_key == mk:
+                    route.min_weight = max(route.min_weight, weight)
+                else:
+                    route.min_key, route.min_weight = mk, weight
+            if status is not None and 200 <= int(status) < 400:
+                route.ok += 1
+                if route is self.direct:
+                    self._direct_ok = True
+                    self.stats["direct"] += 1
+                else:
+                    self.stats["via_proxy"] += 1
+                    if route.ok == 1:
+                        msgs.append(f"[proxy] {route.name} ({route.label}) funciona: primera descarga OK")
+                if route.cool_kind and route.cool_until <= now:
+                    if route is self.direct and self.mode == "auto" and self.active():
+                        msgs.append("[proxy] La IP del servidor vuelve a responder: el REST sale directo")
+                    route.cool_kind = route.cool_reason = ""
+        self._emit(msgs)
+
+    def _cool(self, route: _Route, secs: Optional[float], reason: str, kind: str) -> None:
+        """Aparta una ruta `secs` segundos (None = hasta el final de la ventana)."""
+        now = time.time()
+        until = self.window_end if secs is None else now + float(secs)
+        msgs: List[str] = []
+        with self.lock:
+            route.fail += 1
+            changed = route.cool_until <= now or route.cool_kind != kind
+            route.cool_until = max(route.cool_until, until)
+            route.cool_reason, route.cool_kind = reason, kind
+            if route is self.direct:
+                self._direct_ok = False
+            if changed:
+                left = route.cool_until - now
+                if route is self.direct:
+                    tail = " → el REST sale por los proxies" if self.proxies else ""
+                    msgs.append(f"[proxy] IP del servidor {reason} durante {_fmt_secs(left)}{tail}")
+                else:
+                    dur = ("hasta el final de la ventana" if route.cool_until >= self.window_end - 1
+                           else f"durante {_fmt_secs(left)}")
+                    msgs.append(f"[proxy] {route.name} ({route.label}) fuera {dur}: {reason}")
+        self._emit(msgs)
+
+    def _judge_status(self, route: _Route, status: int, retry_after: Optional[float]) -> bool:
+        """True si la respuesta es un bloqueo de ESTA salida y hay que probar otra."""
+        if status in (418, 429):
+            secs = retry_after or (300.0 if status == 418 else 60.0)
+            what = ("bloqueada por Binance (HTTP 418)" if status == 418
+                    else "limitada por Binance (HTTP 429)")
+            if route is not self.direct:
+                what = what.replace("bloqueada", "bloqueado").replace("limitada", "limitado")
+            self._cool(route, secs, what, f"http{status}")
+            return True
+        if status in (403, 451):
+            if route is self.direct:
+                self._cool(route, 600.0, f"rechazada por Binance (HTTP {status})", f"http{status}")
+            else:
+                self._cool(route, None, f"Binance rechaza la IP de este proxy (HTTP {status}, "
+                                        f"p. ej. ubicación restringida)", f"http{status}")
+            return True
+        if status == 407 and route is not self.direct:
+            self._cool(route, None, "el proxy rechazó la conexión (407: credenciales o cuota "
+                                    "mensual agotada)", "http407")
+            return True
+        return False
+
+    def _net_fail(self, route: _Route, exc: BaseException) -> None:
+        st = _proxy_status_from_exc(exc)
+        if route is not self.direct and st == 407:
+            self._judge_status(route, 407, None)
+            return
+        if route is not self.direct and st in (403, 451):
+            self._judge_status(route, st, None)
+            return
+        detail = str(getattr(exc, "reason", None) or exc or type(exc).__name__)[:120]
+        self._cool(route, 30.0 if route is self.direct else 60.0, f"sin conexión ({detail})", "net")
+
+    def _count(self, lib: str, url: str) -> None:
+        first = False
+        with self.lock:
+            self.stats["routed"] += 1
+            self.stats["libs"][lib] = self.stats["libs"].get(lib, 0) + 1
+            if str(url).split("?", 1)[0].lower().endswith("klines"):
+                self.stats["klines"] += 1
+                first = self.stats["klines"] == 1
+        if first:
+            self._emit([f"[proxy] Descarga de velas detectada ({lib}): pasa por el enrutador de arranque"])
+
+    # ── urllib ────────────────────────────────────────────────────────────────
+
+    def _urllib_via_proxy(self, route: _Route, req: urllib.request.Request, timeout: float) -> Any:
+        want_gzip = not req.has_header("Accept-encoding")   # ahorra cuota de datos del proxy
+        clone = _clone_request(req, {"Accept-Encoding": "gzip"} if want_gzip else None)
+        resp = route.opener.open(clone, timeout=timeout)
+        if want_gzip and (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+            raw = resp.read()
+            body = gzip.decompress(raw)
+            resp = _rewrap_response(resp, body)
+            resp._router_bytes = len(raw)
+        return resp
+
+    def fetch_urllib(self, orig_open, caller_opener, req: urllib.request.Request, timeout: Any) -> Any:
+        url = req.full_url
+        self._count("urllib", url)
+        weight = _estimate_weight(url)
+        to = timeout if isinstance(timeout, (int, float)) else self.timeout_s
+        tried: set = set()
+        last_exc: Optional[BaseException] = None
+        waited = 0
+        while True:
+            route, wait = self._pick(weight, tried)
+            if route is None:
+                if wait > 0 and waited < 2:
+                    waited += 1
+                    time.sleep(min(wait, 65.0))
+                    continue
+                break
+            tried.add(route)
+            try:
+                if route is self.direct:
+                    resp = orig_open(caller_opener, _clone_request(req), None, timeout)
+                else:
+                    resp = self._urllib_via_proxy(route, req, to)
+            except urllib.error.HTTPError as exc:
+                self._note(route, exc.code, exc.headers)
+                if self._judge_status(route, exc.code, _retry_after(exc.headers)):
+                    if isinstance(last_exc, urllib.error.HTTPError):
+                        try:
+                            last_exc.close()
+                        except Exception:
+                            pass
+                    last_exc = exc
+                    continue
+                raise
+            except (urllib.error.URLError, OSError, http.client.HTTPException, EOFError, zlib.error) as exc:
+                self._net_fail(route, exc)
+                last_exc = exc
+                continue
+            finally:
+                self._done(route)
+            self._note(route, getattr(resp, "status", None) or resp.getcode(), resp.headers,
+                       getattr(resp, "_router_bytes", 0))
+            return resp
+        if last_exc is not None:
+            raise last_exc
+        return orig_open(caller_opener, req, None, timeout)  # nada disponible: comportamiento original
+
+    # ── requests ──────────────────────────────────────────────────────────────
+
+    def fetch_requests(self, orig_send, adapter, request, kwargs: dict) -> Any:
+        import requests as _rq
+        url = request.url
+        self._count("requests", url)
+        weight = _estimate_weight(url)
+        tried: set = set()
+        last_exc: Optional[BaseException] = None
+        last_resp = None
+        waited = 0
+        while True:
+            route, wait = self._pick(weight, tried)
+            if route is None:
+                if wait > 0 and waited < 2:
+                    waited += 1
+                    time.sleep(min(wait, 65.0))
+                    continue
+                break
+            tried.add(route)
+            kw = dict(kwargs)
+            if route is not self.direct:
+                kw["proxies"] = {"http": route.url, "https": route.url}
+                if kw.get("timeout") is None:
+                    kw["timeout"] = self.timeout_s
+            try:
+                resp = orig_send(adapter, request, **kw)
+            except (_rq.exceptions.ConnectionError, _rq.exceptions.Timeout) as exc:
+                self._net_fail(route, exc)
+                last_exc = exc
+                continue
+            finally:
+                self._done(route)
+            self._note(route, resp.status_code, resp.headers)
+            if self._judge_status(route, resp.status_code, _retry_after(resp.headers)):
+                if last_resp is not None:
+                    last_resp.close()
+                last_resp = resp
+                continue
+            if last_resp is not None:
+                last_resp.close()
+            return resp
+        if last_resp is not None:
+            return last_resp
+        if last_exc is not None:
+            raise last_exc
+        return orig_send(adapter, request, **kwargs)
+
+    # ── aiohttp ───────────────────────────────────────────────────────────────
+
+    async def fetch_aiohttp(self, orig_request, session, method, str_or_url, kwargs: dict) -> Any:
+        import aiohttp as _aio
+        url = str(str_or_url)
+        self._count("aiohttp", url)
+        weight = _estimate_weight(url, kwargs.get("params"))
+        tried: set = set()
+        last_exc: Optional[BaseException] = None
+        last_resp = None
+        waited = 0
+        while True:
+            route, wait = self._pick(weight, tried)
+            if route is None:
+                if wait > 0 and waited < 2:
+                    waited += 1
+                    await asyncio.sleep(min(wait, 65.0))
+                    continue
+                break
+            tried.add(route)
+            kw = dict(kwargs)
+            if route is not self.direct:
+                kw["proxy"] = route.url
+                kw.pop("proxy_auth", None)
+            try:
+                resp = await orig_request(session, method, str_or_url, **kw)
+            except _aio.ClientHttpProxyError as exc:          # el proxy respondió con error (407…)
+                self._net_fail(route, exc)
+                last_exc = exc
+                continue
+            except _aio.ClientResponseError as exc:           # raise_for_status=True
+                self._note(route, exc.status, exc.headers)
+                if self._judge_status(route, exc.status, _retry_after(exc.headers)):
+                    last_exc = exc
+                    continue
+                raise
+            except (_aio.ClientConnectionError, asyncio.TimeoutError) as exc:
+                self._net_fail(route, exc)
+                last_exc = exc
+                continue
+            finally:
+                self._done(route)
+            self._note(route, resp.status, resp.headers)
+            if self._judge_status(route, resp.status, _retry_after(resp.headers)):
+                if last_resp is not None:
+                    last_resp.release()
+                last_resp = resp
+                continue
+            if last_resp is not None:
+                last_resp.release()
+            return resp
+        if last_resp is not None:
+            return last_resp
+        if last_exc is not None:
+            raise last_exc
+        return await orig_request(session, method, str_or_url, **kwargs)
+
+    # ── Mantenimiento y vista para la web ─────────────────────────────────────
+
+    def housekeeping(self) -> None:
+        if not self.configured:
+            return
+        now = time.time()
+        msgs: List[str] = []
+        with self.lock:
+            if now >= self.window_end and not self._ended_logged:
+                self._ended_logged = True
+                per = ", ".join(f"{r.name} {r.ok}" for r in self.proxies)
+                msgs.append(f"[proxy] Terminaron las {self.hours:g} h de proxies de arranque "
+                            f"({self.stats['via_proxy']} descargas por proxy: {per}). "
+                            f"Desde ahora el REST de Binance sale directo.")
+            if (not self._klines_warned and self.stats["klines"] == 0
+                    and now - self.started > 300 and now < self.window_end):
+                self._klines_warned = True
+                msgs.append("[proxy] En 5 min no ha pasado ninguna descarga de velas por el enrutador. "
+                            "Si KlineWebSocketCache_v4 descarga con otra librería (no urllib, "
+                            "requests ni aiohttp), esas descargas no van por los proxies.")
+        self._emit(msgs)
+
+    def view(self) -> dict:
+        now = time.time()
+        mk = int(now // 60)
+        with self.lock:
+            routes = []
+            for r in [self.direct] + self.proxies:
+                cooling = r.cool_until > now
+                used = r.min_weight if r.min_key == mk else 0
+                if cooling and r is not self.direct and r.cool_until >= self.window_end - 1:
+                    state = "off"
+                elif cooling:
+                    state = "cooling"
+                elif used >= self.weight_limit:
+                    state = "limit"
+                else:
+                    state = "ok"
+                routes.append({
+                    "name": r.name, "label": r.label,
+                    "kind": "direct" if r is self.direct else "proxy",
+                    "state": state, "ok": r.ok, "fail": r.fail,
+                    "last_status": r.last_status, "last_ts": r.last_ts,
+                    "cool_left_s": (r.cool_until - now) if cooling else 0.0,
+                    "reason": r.cool_reason if cooling else "",
+                    "weight": used, "kb": round(r.bytes / 1024.0, 1),
+                })
+            stats = {k: (dict(v) if isinstance(v, dict) else v) for k, v in self.stats.items()}
+        return {
+            "configured": self.configured, "mode": self.mode, "hours": self.hours,
+            "active": self.configured and now < self.window_end,
+            "window_left_s": max(0.0, self.window_end - now) if self.configured else 0.0,
+            "weight_limit": self.weight_limit, "n_proxies": len(self.proxies),
+            "routes": routes, **stats,
+        }
+
+
+_ACTIVE_ROUTER: Optional[BinanceRestRouter] = None
+_ROUTER_PATCHED = False
+
+
+def _install_rest_router(router: BinanceRestRouter) -> None:
+    """Activa `router` en urllib, requests y aiohttp (los parches se ponen una vez;
+    con el router fuera de su ventana pasan la petición tal cual)."""
+    global _ACTIVE_ROUTER, _ROUTER_PATCHED
+    _ACTIVE_ROUTER = router
+    if _ROUTER_PATCHED or not router.configured:
+        return
+    _ROUTER_PATCHED = True
+
+    orig_open = urllib.request.OpenerDirector.open
+
+    def _open(opener, fullurl, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+        r = _ACTIVE_ROUTER
+        if r is None or getattr(opener, "_rest_router_internal", False) or not r.active():
+            return orig_open(opener, fullurl, data, timeout)
+        req = fullurl if isinstance(fullurl, urllib.request.Request) else None
+        url = req.full_url if req is not None else str(fullurl)
+        method = req.get_method() if req is not None else "GET"
+        if data is not None or (req is not None and req.data is not None) or not r.should_route(url, method):
+            return orig_open(opener, fullurl, data, timeout)
+        return r.fetch_urllib(orig_open, opener, req if req is not None else urllib.request.Request(url),
+                              timeout)
+
+    urllib.request.OpenerDirector.open = _open
+
+    try:
+        import requests.adapters as _rq_adapters
+    except Exception:
+        _rq_adapters = None
+    if _rq_adapters is not None:
+        orig_send = _rq_adapters.HTTPAdapter.send
+
+        def _send(adapter, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+            r = _ACTIVE_ROUTER
+            kwargs = dict(stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies)
+            if (r is None or not r.active() or request.body
+                    or not r.should_route(request.url, request.method)):
+                return orig_send(adapter, request, **kwargs)
+            return r.fetch_requests(orig_send, adapter, request, kwargs)
+
+        _rq_adapters.HTTPAdapter.send = _send
+
+    try:
+        import aiohttp as _aio
+    except Exception:
+        _aio = None
+    if _aio is not None:
+        orig_request = _aio.ClientSession._request
+
+        async def _request(session, method, str_or_url, **kwargs):
+            r = _ACTIVE_ROUTER
+            if (r is None or not r.active() or kwargs.get("data") is not None
+                    or kwargs.get("json") is not None
+                    or not r.should_route(str(str_or_url), method, kwargs.get("params"))):
+                return await orig_request(session, method, str_or_url, **kwargs)
+            return await r.fetch_aiohttp(orig_request, session, method, str_or_url, kwargs)
+
+        _aio.ClientSession._request = _request
+
+
+REST_ROUTER = BinanceRestRouter(
+    _parse_proxy_urls(_PROXY_URLS_RAW), PROXY_BOOTSTRAP_HOURS, PROXY_MODE,
+    PROXY_WEIGHT_LIMIT, os.getenv("BASE_URL", "https://fapi.binance.com"), PROXY_TIMEOUT_S,
+)
+_install_rest_router(REST_ROUTER)       # antes de importar los módulos que descargan velas
+print(REST_ROUTER.startup_message(), flush=True)
 
 from WS import SymbolWebSocketPriceCache, _ALL_MARKET_ENABLED  # noqa: E402
 from KlineWebSocketCache_v4 import KlineWebSocketCache      # noqa: E402
@@ -44,8 +733,18 @@ class _ExecutorSignalConfig:
     timeout_state:   int = 8
 
 
+def _host_of(url: str) -> str:
+    try:
+        return urlsplit(url).netloc or url
+    except Exception:
+        return url or ""
+
+
 class ExecutorBridge:
-    """Envía señales de apertura/cierre al Executor y consulta su estado."""
+    """Envía señales de apertura/cierre al Executor y consulta su estado.
+    El link se puede cambiar en caliente (set_url) y cada señal puede ir a un
+    link concreto (url=…): así una posición recibe su DCA y su cierre en el
+    executor donde se abrió aunque luego cambies el link."""
 
     def __init__(
         self,
@@ -55,11 +754,25 @@ class ExecutorBridge:
         logger=None,
     ) -> None:
         self.config = _ExecutorSignalConfig(
-            executor_url=executor_url.strip().rstrip("/"),
+            executor_url=self.normalize_url(executor_url),
             signal_secret=signal_secret,
             poll_secs=int(poll_secs),
         )
         self.logger = logger or print
+        self._stats_lock = threading.Lock()
+        self.sent_ok = 0
+        self.sent_err = 0
+        self.last_ok_ts = 0.0
+        self.last_err = ""
+        self.last_err_ts = 0.0
+        self._tasks: set = set()
+
+    @staticmethod
+    def normalize_url(url: Optional[str]) -> str:
+        return (url or "").strip().rstrip("/")
+
+    def set_url(self, url: str) -> None:
+        self.config.executor_url = self.normalize_url(url)
 
     def _log(self, message: str) -> None:
         try:
@@ -67,10 +780,11 @@ class ExecutorBridge:
         except Exception:
             pass
 
-    def _build_signal_request(self, payload: dict) -> urllib.request.Request:
+    def _build_signal_request(self, payload: dict, url: Optional[str] = None) -> urllib.request.Request:
         body = json.dumps(payload).encode("utf-8")
+        target = (self.config.executor_url if url is None else self.normalize_url(url))
         return urllib.request.Request(
-            f"{self.config.executor_url}/signal",
+            f"{target}/signal",
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -79,26 +793,59 @@ class ExecutorBridge:
             method="POST",
         )
 
-    def send_signal_sync(self, payload: dict) -> None:
+    def send_signal_sync(self, payload: dict, url: Optional[str] = None) -> None:
         """Envía una señal al Executor. No lanza excepción: solo registra el error."""
-        if not self.config.executor_url:
+        target = (self.config.executor_url if url is None else self.normalize_url(url))
+        if not target:
             return
         try:
-            req = self._build_signal_request(payload)
+            req = self._build_signal_request(payload, target)
             with urllib.request.urlopen(req, timeout=self.config.timeout_signal) as resp:
                 resp.read()
-                self._log(
-                    f"[executor] ✓ señal enviada: {payload.get('action')} {payload.get('symbol')}"
-                )
+            with self._stats_lock:
+                self.sent_ok += 1
+                self.last_ok_ts = time.time()
+            self._log(
+                f"[executor] ✓ señal enviada: {payload.get('action')} {payload.get('symbol')}"
+                f" → {_host_of(target)}"
+            )
         except Exception as exc:
+            with self._stats_lock:
+                self.sent_err += 1
+                self.last_err = f"{payload.get('action')} {payload.get('symbol')}: {exc}"[:200]
+                self.last_err_ts = time.time()
             self._log(
                 f"[executor] error enviando {payload.get('action')} "
-                f"{payload.get('symbol')}: {exc}"
+                f"{payload.get('symbol')} a {_host_of(target)}: {exc}"
             )
 
-    async def send_signal_async(self, payload: dict) -> None:
+    async def send_signal_async(self, payload: dict, url: Optional[str] = None) -> None:
         """Versión no bloqueante para usar desde el event loop."""
-        await asyncio.to_thread(self.send_signal_sync, payload)
+        await asyncio.to_thread(self.send_signal_sync, payload, url)
+
+    def stats_view(self) -> dict:
+        with self._stats_lock:
+            return {"sent_ok": self.sent_ok, "sent_err": self.sent_err,
+                    "last_ok_ts": self.last_ok_ts, "last_err": self.last_err,
+                    "last_err_ts": self.last_err_ts}
+
+    def probe(self, url: Optional[str] = None, timeout: float = 20.0) -> dict:
+        """Comprueba que el link responde (GET /api/state). No envía señales."""
+        target = (self.config.executor_url if url is None else self.normalize_url(url))
+        if not target:
+            return {"ok": False, "error": "No hay link de executor"}
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(f"{target}/api/state", method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp.read(4096)
+                return {"ok": True, "status": resp.status, "ms": round((time.time() - t0) * 1000)}
+        except urllib.error.HTTPError as exc:     # responde, aunque no tenga /api/state
+            return {"ok": True, "status": exc.code, "ms": round((time.time() - t0) * 1000)}
+        except Exception as exc:
+            reason = getattr(exc, "reason", None) or exc
+            return {"ok": False, "error": str(reason)[:200] or type(exc).__name__,
+                    "ms": round((time.time() - t0) * 1000)}
 
     def fetch_state_sync(self) -> Optional[dict]:
         """Lee /api/state del Executor."""
@@ -122,6 +869,7 @@ class ExecutorBridge:
         quantity: float,
         notional: float = 0.0,
         level: float = 0.0,
+        url: Optional[str] = None,
     ) -> None:
         """Notifica apertura de posición al Executor sin bloquear el loop."""
         payload = {
@@ -134,7 +882,7 @@ class ExecutorBridge:
             "notional":  notional,
             "level":     level,
         }
-        self.notify_async(payload)
+        self.notify_async(payload, url)
 
     def notify_close(
         self,
@@ -144,6 +892,7 @@ class ExecutorBridge:
         reason: str,
         close_price: float,
         pnl: float = 0.0,
+        url: Optional[str] = None,
     ) -> None:
         """Notifica cierre de posición al Executor sin bloquear el loop."""
         payload = {
@@ -155,22 +904,25 @@ class ExecutorBridge:
             "close_price": close_price,
             "pnl":         pnl,
         }
-        self.notify_async(payload)
+        self.notify_async(payload, url)
 
-    def notify_async(self, payload: dict) -> None:
+    def notify_async(self, payload: dict, url: Optional[str] = None) -> None:
         """Dispara el envío sin bloquear el event loop."""
-        if not self.config.executor_url:
+        target = (self.config.executor_url if url is None else self.normalize_url(url))
+        if not target:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             threading.Thread(
                 target=self.send_signal_sync,
-                args=(payload,),
+                args=(payload, target),
                 daemon=True,
             ).start()
             return
-        loop.create_task(self.send_signal_async(payload))
+        task = loop.create_task(self.send_signal_async(payload, target))
+        self._tasks.add(task)                       # referencia viva hasta que termine
+        task.add_done_callback(self._tasks.discard)
 
 
 
@@ -318,8 +1070,74 @@ DEFAULT_STOP_LOSS_USD = float(os.getenv("DEFAULT_STOP_LOSS_USD", "-8.0"))
 FIRST_TRANCHE_SL_FRACTION = float(os.getenv("FIRST_TRANCHE_SL_FRACTION", "0.251"))
 
 # ── Executor externo ──────────────────────────────────────────────────────────
-EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
+# EXECUTOR_URL es el link de arranque; desde la web se puede cambiar en caliente
+# (se guarda en SETTINGS_FILE y desde entonces manda el de la web).
+EXECUTOR_URL    = os.getenv("EXECUTOR_URL",    "https://executor-5lu0.onrender.com").strip().rstrip("/")
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
+PAUSE_MAX_MIN   = 10080                     # pausas con tiempo: de 1 min a 7 días
+
+
+@dataclass
+class ExecutorSettings:
+    url:          str   = EXECUTOR_URL
+    # Pausa del envío: con el link en pausa las posiciones NUEVAS no se envían al
+    # executor; las que ya están en él siguen recibiendo su DCA y su cierre.
+    paused:       bool  = False
+    pause_reason: str   = ""
+    paused_at:    float = 0.0
+    pause_until:  float = 0.0               # 0 = hasta que la reanudes a mano
+
+
+EXEC = ExecutorSettings()
+
+
+def _v_exec_url(v: Any) -> str:
+    """Valida el link del executor. Vacío = sin executor (no se envían señales)."""
+    s = str(v or "").strip().rstrip("/")
+    if not s:
+        return ""
+    if len(s) > 300:
+        raise ValueError("El link es demasiado largo")
+    if any(c.isspace() for c in s):
+        raise ValueError("El link no puede tener espacios")
+    if "://" not in s:
+        s = "https://" + s
+    try:
+        u = urlsplit(s)
+        _ = u.port
+    except ValueError:
+        raise ValueError("El link no es válido")
+    host = u.hostname or ""
+    if u.scheme not in ("http", "https") or not host or ("." not in host and host != "localhost"):
+        raise ValueError("El link debe ser del tipo https://mi-executor.onrender.com")
+    if u.query or u.fragment:
+        raise ValueError("El link no debe llevar ? ni #")
+    return s
+
+
+def _v_pause_minutes(v: Any) -> Optional[float]:
+    """Minutos de una pausa con tiempo. None/""/0 = hasta reanudar a mano."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        m = float(str(v).replace(",", "."))
+    except (TypeError, ValueError):
+        raise ValueError("Los minutos de pausa deben ser un número")
+    if m != m:
+        raise ValueError("Los minutos de pausa deben ser un número")
+    if m == 0:
+        return None
+    if not 1 <= m <= PAUSE_MAX_MIN:
+        raise ValueError(f"La pausa va de 1 a {PAUSE_MAX_MIN} minutos (7 días)")
+    return m
+
+
+def _fmt_minutes(m: float) -> str:
+    m = round(float(m), 1)
+    if m >= 60 and abs(m - round(m)) < 1e-9:
+        h, r = divmod(int(round(m)), 60)
+        return f"{h} h" + (f" {r} min" if r else "")
+    return f"{m:g} min"
 
 # ── Persistencia de estadísticas (MFE/MAE) y ajustes editables desde la web ───
 # IMPORTANTE: en hosting con disco efímero (Render free, etc.) apunta estas rutas
@@ -345,7 +1163,8 @@ SETTINGS_FILE = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.jso
 #    los siguientes DCA solo entran si LONG: precio > EMA(dca_ema_period) y
 #    SHORT: precio < EMA(dca_ema_period), sobre las velas de EMA_INTERVAL.
 #  • Pausa: entries_paused bloquea posiciones NUEVAS (el DCA, TP y SL de las
-#    abiertas siguen funcionando).
+#    abiertas siguen funcionando). Puede ser hasta reanudarla a mano o durar
+#    N minutos (pause_until): al cumplirse se reanuda sola.
 # Ninguna de estas guardas toca la detección de cruces ni el seguimiento de
 # símbolos: solo deciden si una señal ya detectada puede abrir.
 
@@ -366,6 +1185,8 @@ class RiskSettings:
     global_stop_enabled:  bool  = _env_bool("GLOBAL_STOP_ENABLED", True)
     global_stop_usd:      float = float(os.getenv("GLOBAL_STOP_USD", "-5"))
     global_stop_pause:    bool  = _env_bool("GLOBAL_STOP_PAUSE", True)
+    # Minutos que dura la pausa del stop global (0 = hasta reanudarla a mano)
+    global_stop_pause_min: float = float(os.getenv("GLOBAL_STOP_PAUSE_MIN", "0") or 0)
     exposure_enabled:     bool  = _env_bool("MAX_EXPOSURE_ENABLED", True)
     max_exposure_usd:     float = float(os.getenv("MAX_EXPOSURE_USD", "800"))
     exposure_include_dca: bool  = _env_bool("MAX_EXPOSURE_INCLUDE_DCA", False)
@@ -385,9 +1206,26 @@ class RiskSettings:
     entries_paused:       bool  = False
     pause_reason:         str   = ""
     paused_at:            float = 0.0
+    pause_until:          float = 0.0     # 0 = hasta reanudar a mano; si no, se reanuda sola
 
 
 RISK = RiskSettings()
+
+
+# ── Modo invertido (espejo del bot) ───────────────────────────────────────────
+# Un solo interruptor (web: POST /api/invert). Activo → las posiciones NUEVAS se
+# abren en el lado contrario a la señal (UP → SHORT, DOWN → LONG) y con todas
+# las reglas en espejo: su TP es el SL del normal con el signo cambiado, su SL
+# es el TP del normal con el signo cambiado, el stop global de −X pasa a ser un
+# TP global de +X, y los DCA entran en los mismos precios que en el bot normal.
+# Las posiciones ya abiertas siguen con las reglas con las que se abrieron.
+@dataclass
+class ModeSettings:
+    inverted:   bool  = _env_bool("INVERTED_MODE", False)
+    changed_at: float = 0.0
+
+
+MODE = ModeSettings()
 
 # Validadores: clave → (tipo, función de validación que lanza ValueError)
 def _v_bool(v: Any) -> bool:
@@ -436,6 +1274,9 @@ RISK_FIELDS = {
     "global_stop_enabled":  _v_bool,
     "global_stop_usd":      _v_float(-1_000_000, -0.01, "El stop global debe ser un número negativo (ej. -5)"),
     "global_stop_pause":    _v_bool,
+    "global_stop_pause_min": _v_float(0, PAUSE_MAX_MIN,
+                                      f"La pausa tras el stop global va de 0 (hasta reanudarla) "
+                                      f"a {PAUSE_MAX_MIN} minutos"),
     "exposure_enabled":     _v_bool,
     "max_exposure_usd":     _v_float(1, 100_000_000, "La exposición máxima debe ser un número positivo (ej. 800)"),
     "exposure_include_dca": _v_bool,
@@ -494,6 +1335,30 @@ def _load_settings() -> None:
             RISK.paused_at = float(risk.get("paused_at", 0) or 0)
         except Exception:
             RISK.paused_at = 0.0
+        try:
+            RISK.pause_until = float(risk.get("pause_until", 0) or 0)
+        except Exception:
+            RISK.pause_until = 0.0
+    md = data.get("mode")
+    if isinstance(md, dict):
+        MODE.inverted = bool(md.get("inverted", MODE.inverted))
+        try:
+            MODE.changed_at = float(md.get("changed_at", 0) or 0)
+        except Exception:
+            MODE.changed_at = 0.0
+    ex = data.get("executor")
+    if isinstance(ex, dict):
+        try:
+            EXEC.url = _v_exec_url(ex.get("url", EXEC.url))
+        except ValueError as exc:
+            print(f"Link de executor guardado no válido ({exc}); uso EXECUTOR_URL", flush=True)
+        EXEC.paused       = bool(ex.get("paused", False))
+        EXEC.pause_reason = str(ex.get("pause_reason", "") or "")
+        for key in ("paused_at", "pause_until"):
+            try:
+                setattr(EXEC, key, float(ex.get(key, 0) or 0))
+            except Exception:
+                setattr(EXEC, key, 0.0)
     try:
         val = float(data.get("default_stop_loss_usd"))
         if val < 0:
@@ -533,6 +1398,8 @@ def _save_settings() -> Optional[str]:
                         "notionals": [nt for _, nt in ENTRY_LADDER],
                     },
                     "risk":                  asdict(RISK),
+                    "executor":              asdict(EXEC),
+                    "mode":                  asdict(MODE),
                 }, fh)
             os.replace(tmp, SETTINGS_FILE)
         return None
@@ -556,6 +1423,11 @@ class Fill:
     opened_at:   float = field(default_factory=time.time)
 
 
+def _opp(side: str) -> str:
+    """Lado contrario: LONG ↔ SHORT."""
+    return "LONG" if side == "SHORT" else "SHORT"
+
+
 @dataclass
 class BotPosition:
     symbol:       str
@@ -563,11 +1435,19 @@ class BotPosition:
     realized_pnl: float = 0.0
     status:       str   = "OPEN"
     trade_id:     int   = 0
-    direction:    str   = "SHORT"     # "SHORT" | "LONG"
-    # Stop loss vigente en USD (pérdida absoluta, valor negativo).
+    direction:    str   = "SHORT"     # lado REAL de la posición: "SHORT" | "LONG"
+    # Importe fijo en USD (valor negativo): 1 tramo → −notional×0.251 · 2+ → SL
+    # estándar · o el fijado a mano. En una posición normal es su STOP LOSS; en
+    # una invertida es el espejo de su TAKE PROFIT (TP = −sl_usd).
     sl_usd:       float = DEFAULT_STOP_LOSS_USD
-    # True si el SL lo fijó el usuario desde el dashboard: el bot NO lo toca más.
+    # True si ese importe lo fijó el usuario desde el dashboard: el bot NO lo toca más.
     sl_manual:    bool  = False
+    # Modo invertido (espejo del bot normal): se abrió en el lado CONTRARIO a la
+    # señal y todas sus reglas son las del bot normal con el signo cambiado, así
+    # que opera en los mismos precios con el resultado opuesto:
+    #   • DCA en los mismos precios que el normal (para ella, a favor)
+    #   • TP = −(SL del normal)   · SL = −(TP del normal) = −notional × multiplicador
+    inverted:     bool  = False
     # ── Excursiones de la operación (PnL no realizado, USD y % del notional) ──
     opened_ts:    float = field(default_factory=time.time)
     mfe_usd:      float = 0.0    # máximo a favor  (>= 0)
@@ -578,6 +1458,9 @@ class BotPosition:
     mae_ts:       float = 0.0
     low_price:    float = 0.0    # precio mínimo visto (favorable en un short)
     high_price:   float = 0.0    # precio máximo visto (adverso en un short)
+    # Link del executor al que se envió la apertura ("" = no se envió: link en
+    # pausa o sin link). Su DCA y su cierre van SIEMPRE a ese mismo link.
+    exec_url:     str   = ""
 
     def update_excursions(self, price: float) -> None:
         """Actualiza MFE/MAE con el precio actual. Llamar con self.lock tomado."""
@@ -630,15 +1513,43 @@ class BotPosition:
             return 0.0
         return self.pnl_sign * sum((f.entry_price - mark_price) * f.qty for f in self.fills)
 
-    def sl_price(self) -> float:
-        """Precio al que se alcanza sl_usd (short: por encima; long: por debajo)."""
+    @property
+    def signal_dir(self) -> str:
+        """Lado que habría abierto el bot normal (el de la señal)."""
+        return _opp(self.direction) if self.inverted else self.direction
+
+    # ── Salidas en PnL REAL de la posición ───────────────────────────────────
+    def exit_tp(self) -> float:
+        """Take profit en USD (positivo). Normal: notional × multiplicador del TP.
+        Invertida: espejo del SL del normal (1 tramo → notional×0.251, 2+ → |SL estándar|)."""
+        if self.inverted:
+            return -self.sl_usd
+        return self.notional * TAKE_PROFIT_FRACTION
+
+    def exit_sl(self) -> float:
+        """Stop loss en USD (negativo). Normal: sl_usd. Invertida: espejo del TP
+        del normal = −notional × multiplicador del TP."""
+        if self.inverted:
+            return -self.notional * TAKE_PROFIT_FRACTION
+        return self.sl_usd
+
+    def price_at(self, pnl: float) -> float:
+        """Precio al que el PnL no realizado vale `pnl`."""
         q = self.qty
         if q <= 0:
             return 0.0
-        return self.avg_entry - self.pnl_sign * self.sl_usd / q
+        return self.avg_entry - self.pnl_sign * pnl / q
+
+    def sl_price(self) -> float:
+        """Precio del stop loss (short: por encima; long: por debajo)."""
+        return self.price_at(self.exit_sl())
+
+    def tp_price(self) -> float:
+        """Precio del take profit."""
+        return self.price_at(self.exit_tp())
 
     def adverse_pct(self, price: float) -> float:
-        """% que el precio se movió EN CONTRA respecto a la 1.ª entrada."""
+        """% que el precio se movió EN CONTRA de la posición respecto a la 1.ª entrada."""
         if not self.fills or price <= 0:
             return 0.0
         p0 = self.fills[0].entry_price
@@ -646,13 +1557,21 @@ class BotPosition:
             return 0.0
         return (price / p0 - 1.0) * 100.0 * self.pnl_sign
 
+    def trigger_pct(self, price: float) -> float:
+        """% que manda en el DCA: lo que el precio se movió en contra de la SEÑAL
+        desde la 1.ª entrada. Normal = en contra de la posición; invertida = a
+        favor (el bot normal añadiría justo en esos precios)."""
+        a = self.adverse_pct(price)
+        return -a if self.inverted else a
+
     def opened_levels(self) -> set:
         return {f.level for f in self.fills}
 
-    # ── Stop loss automático por tramos ──────────────────────────────────────
+    # ── Importe fijo automático por tramos (SL normal / TP invertida) ────────
     def auto_sl_usd(self) -> float:
         """1 solo tramo → -(notional del primer fill × 0.251).
-        2 o más tramos → SL estándar (DEFAULT_STOP_LOSS_USD)."""
+        2 o más tramos → SL estándar (DEFAULT_STOP_LOSS_USD).
+        En una posición invertida este valor con el signo cambiado es su TP."""
         if len(self.fills) == 1:
             return -abs(self.fills[0].notional) * FIRST_TRANCHE_SL_FRACTION
         return DEFAULT_STOP_LOSS_USD
@@ -676,6 +1595,9 @@ class BotPosition:
 class BinanceFuturesClient:
     def __init__(self) -> None:
         self.exchange_filters: Dict[str, Dict[str, float]] = {}
+        # Última respuesta de exchangeInfo (al arrancar se reutiliza para la lista
+        # de símbolos en vez de pedirla dos veces: una petición menos al proxy)
+        self.last_exchange_info: Tuple[float, Optional[dict]] = (0.0, None)
 
     async def start(self) -> None:
         await self.load_exchange_info()
@@ -716,6 +1638,7 @@ class BinanceFuturesClient:
 
     async def load_exchange_info(self) -> None:
         data    = await self.request("GET", "/fapi/v1/exchangeInfo")
+        self.last_exchange_info = (time.time(), data)
         filters: Dict[str, Dict[str, float]] = {}
         for sym in data.get("symbols", []):
             if sym.get("quoteAsset")    != QUOTE_ASSET:  continue
@@ -853,9 +1776,11 @@ class TradingBot:
         # ── Executor bridge ───────────────────────────────────────────────
         self._trade_id_seq: int = 0
         self.executor = ExecutorBridge(
-            executor_url=EXECUTOR_URL,
+            executor_url=EXEC.url,              # el guardado desde la web, o EXECUTOR_URL
             signal_secret=EXECUTOR_SECRET,
         )
+        # Cambios de pausa (entradas y executor): manual, con tiempo y reanudación automática
+        self._pause_lock = threading.RLock()
         # total PnL realizado acumulado (suma de todos los cierres)
         self.total_realized_pnl: float = 0.0
 
@@ -951,12 +1876,18 @@ class TradingBot:
             return self._trade_id_seq
 
     async def _main(self) -> None:
-        # Conectar el logger del executor al sistema de log del bot
+        # Conectar el logger del executor y del enrutador REST al sistema de log del bot
         self.executor.logger = self.log
-        if EXECUTOR_URL:
-            self.log(f"[executor] Bridge configurado → {EXECUTOR_URL}")
+        REST_ROUTER.logger = self.log
+        self.log(REST_ROUTER.startup_message())
+        if EXEC.url:
+            src = "guardado desde la web" if EXEC.url != EXECUTOR_URL else "EXECUTOR_URL"
+            self.log(f"[executor] Bridge configurado → {EXEC.url} ({src})")
+            if self._exec_paused_now():
+                self.log("[executor] ⏸ El envío de operaciones nuevas al executor sigue en pausa "
+                         + self._pause_left_txt(EXEC.pause_until))
         else:
-            self.log("[executor] EXECUTOR_URL no configurado — señales desactivadas")
+            self.log("[executor] Sin link de executor — señales desactivadas")
 
         self.log("Bot iniciado — modo " + (
             "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL"
@@ -972,6 +1903,7 @@ class TradingBot:
         # Lista de perpetuos operables (caché en disco o REST)
         await self._init_all_symbols()
         self._update_tradable()
+        self.client.last_exchange_info = (0.0, None)     # libera la copia del arranque
 
         if not _ALL_MARKET_ENABLED:
             self.log("⚠️ WS_ALL_MARKET=false: sin !ticker@arr/!markPrice@arr el bot NO puede "
@@ -1069,12 +2001,15 @@ class TradingBot:
 
     def _handle_cross(self, symbol: str, direction: str, cross_price: float) -> None:
         """Cruce EMA recién cerrado: UP → LONG, DOWN → SHORT. Abre el 1.er tramo.
+        En modo invertido abre el lado CONTRARIO (UP → SHORT, DOWN → LONG).
         Si ya hay posición abierta el cruce se ignora (el DCA/TP/SL la gestionan)."""
         if not self._is_tradable(symbol):
             return
         if self._close_all_active:            # cierre masivo en curso: no abrir nada nuevo
             return
-        side = "LONG" if direction == "UP" else "SHORT"
+        signal_side = "LONG" if direction == "UP" else "SHORT"
+        inverted = MODE.inverted
+        side = _opp(signal_side) if inverted else signal_side
         now = time.time()
         if symbol in self._entry_inflight or symbol in self._closing_symbols:
             return
@@ -1093,17 +2028,20 @@ class TradingBot:
             self._block_by_price(symbol, price)
             return
         # Guardas de riesgo (pausa · exposición · filtro BTC): la señal se detectó
-        # igual que siempre; aquí solo se decide si puede abrir.
+        # igual que siempre; aquí solo se decide si puede abrir. El filtro BTC mira
+        # el lado de la SEÑAL: en modo invertido solo se abre el espejo de lo que el
+        # bot normal habría abierto.
         first_level, first_notional = ENTRY_LADDER[0]
-        blocked = self._gate_check(side, first_notional, is_dca=False)
+        blocked = self._gate_check(signal_side, first_notional, is_dca=False)
         if blocked is not None:
             self._record_block(symbol, side, blocked[0], blocked[1], is_dca=False,
-                               extra=f"cruce {direction}")
+                               extra=f"cruce {direction}" + (", invertida" if inverted else ""))
             return
-        self.log(f"CRUCE EMA{EMA_FAST}/{EMA_SLOW} {direction} {symbol} → {side} "
-                 f"(cierre vela={cross_price:.6f} | px={price:.6f})")
+        self.log(f"CRUCE EMA{EMA_FAST}/{EMA_SLOW} {direction} {symbol} → {side}"
+                 + (f" (INVERTIDO: la señal era {signal_side})" if inverted else "")
+                 + f" (cierre vela={cross_price:.6f} | px={price:.6f})")
         self._entry_inflight.add(symbol)
-        self._spawn(self._enter_levels(symbol, [(0, first_level, first_notional)], side))
+        self._spawn(self._enter_levels(symbol, [(0, first_level, first_notional)], side, inverted))
 
     # ── Guardas de riesgo para abrir ──────────────────────────────────────────
 
@@ -1194,27 +2132,58 @@ class TradingBot:
         return value
 
     def _dca_trend_block(self, symbol: str, direction: str, idx: int,
-                         price: float) -> Optional[Tuple[str, str]]:
+                         price: float, inverted: bool = False) -> Optional[Tuple[str, str]]:
         """Si la condición EMA está activa y la posición ya tiene ≥ dca_ema_after
         tramos, el tramo idx (0 = 1.er tramo) solo entra si LONG: precio > EMA y
-        SHORT: precio < EMA. Devuelve ("ema_dca", motivo) si lo frena."""
+        SHORT: precio < EMA. `direction` es el lado de la SEÑAL (en una posición
+        invertida, el que tendría el bot normal: así el DCA es su espejo exacto).
+        Devuelve ("ema_dca", motivo) si lo frena."""
         if not RISK.dca_ema_enabled or idx < RISK.dca_ema_after:
             return None
         p = RISK.dca_ema_period
         ema = self._trend_ema(symbol, p)
         if ema is None:
             return "ema_dca", f"EMA{p} de {symbol} sin velas suficientes (condición activa)"
+        tail = f"; espejo de la señal {direction}, posición invertida" if inverted else ""
         if direction == "LONG" and not price > ema:
-            return "ema_dca", f"tramo {idx + 1}: precio {price:.6g} ≤ EMA{p} {ema:.6g} (LONG exige precio por encima)"
+            return "ema_dca", (f"tramo {idx + 1}: precio {price:.6g} ≤ EMA{p} {ema:.6g} "
+                               f"(LONG exige precio por encima{tail})")
         if direction == "SHORT" and not price < ema:
-            return "ema_dca", f"tramo {idx + 1}: precio {price:.6g} ≥ EMA{p} {ema:.6g} (SHORT exige precio por debajo)"
+            return "ema_dca", (f"tramo {idx + 1}: precio {price:.6g} ≥ EMA{p} {ema:.6g} "
+                               f"(SHORT exige precio por debajo{tail})")
         return None
+
+    @staticmethod
+    def _pause_active(paused: bool, until: float, now: Optional[float] = None) -> bool:
+        """Una pausa con tiempo deja de contar en cuanto vence (aunque el
+        mantenimiento aún no la haya quitado)."""
+        if not paused:
+            return False
+        return not (until and (now or time.time()) >= until)
+
+    def _entries_paused_now(self, now: Optional[float] = None) -> bool:
+        return self._pause_active(RISK.entries_paused, RISK.pause_until, now)
+
+    def _exec_paused_now(self, now: Optional[float] = None) -> bool:
+        return self._pause_active(EXEC.paused, EXEC.pause_until, now)
+
+    @staticmethod
+    def _hhmm_utc(ts: float) -> str:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M UTC")
+
+    @classmethod
+    def _pause_left_txt(cls, until: float) -> str:
+        if not until:
+            return "hasta que la reanudes"
+        return f"hasta las {cls._hhmm_utc(until)} (quedan {_fmt_secs(until - time.time())})"
 
     def _gate_check(self, side: str, notional: float, is_dca: bool,
                     exposure: Optional[float] = None) -> Optional[Tuple[str, str]]:
         """Devuelve (tipo, detalle) si la entrada NO puede abrirse, o None.
+        `side` es el lado de la SEÑAL (el que abriría el bot normal), que es el
+        que mira el filtro BTC también en modo invertido.
         NO toma self.lock salvo para calcular la exposición cuando no se pasa."""
-        if not is_dca and RISK.entries_paused:
+        if not is_dca and self._entries_paused_now():
             return "pausa", RISK.pause_reason or "entradas pausadas"
         if RISK.exposure_enabled and (not is_dca or RISK.exposure_include_dca):
             exp = self._exposure() if exposure is None else exposure
@@ -1297,8 +2266,13 @@ class TradingBot:
         Devuelve True si tuvo éxito.
         """
         try:
-            self.log("REST: obteniendo lista completa de símbolos de futuros USDT-M...")
-            data    = await self.client.request("GET", "/fapi/v1/exchangeInfo")
+            info_ts, info = self.client.last_exchange_info
+            if info and time.time() - info_ts < 120:
+                data = info                          # recién descargado al arrancar
+                self.log("REST: lista de símbolos tomada del exchangeInfo recién descargado")
+            else:
+                self.log("REST: obteniendo lista completa de símbolos de futuros USDT-M...")
+                data = await self.client.request("GET", "/fapi/v1/exchangeInfo")
             filters = self.client.exchange_filters
 
             symbols: List[str] = []
@@ -1634,8 +2608,8 @@ class TradingBot:
             if not pos or pos.status != "OPEN" or not pos.fills:
                 return
             pnl    = pos.unrealized_pnl(price)
-            target = pos.notional * TAKE_PROFIT_FRACTION
-            sl_usd = pos.sl_usd
+            target = pos.exit_tp()            # normal: notional×TP · invertida: espejo del SL
+            sl_usd = pos.exit_sl()            # normal: sl_usd     · invertida: −notional×TP
         if pnl <= sl_usd:
             reason = "SL"
         elif pnl >= target:
@@ -1649,6 +2623,8 @@ class TradingBot:
     def _check_dca(self, symbol: str, price: float) -> None:
         """Tramos siguientes del DCA: se abren cuando el precio va EN CONTRA de la
         1.ª entrada los % de la escalera (el tramo 1 ya lo abrió el cruce EMA).
+        En una posición invertida se abren en los MISMOS precios que en el bot
+        normal, es decir, cuando el precio va a favor de ella (espejo exacto).
         El siguiente tramo es siempre el de índice = nº de tramos ya abiertos, así
         que editar la escalera con posiciones abiertas no duplica ni salta tramos."""
         if self._close_all_active:            # cierre masivo en curso: sin DCA nuevo
@@ -1661,30 +2637,33 @@ class TradingBot:
             pos = self.positions.get(symbol)
             if pos is None or pos.status != "OPEN" or not pos.fills:
                 return
-            adverse   = pos.adverse_pct(price)
+            trigger   = pos.trigger_pct(price)
             direction = pos.direction
+            inverted  = pos.inverted
+            sig_dir   = pos.signal_dir
             n_fills   = len(pos.fills)
         ladder = ENTRY_LADDER
         due = []
         for idx in range(n_fills, len(ladder)):
             lvl, nt = ladder[idx]
-            if lvl <= 0 or adverse < lvl or (symbol, idx) in self._entry_reserved:
+            if lvl <= 0 or trigger < lvl or (symbol, idx) in self._entry_reserved:
                 break
             due.append((idx, lvl, nt))
         if not due:
             return
         first_idx, first_lvl, first_nt = due[0]
         # Límite de exposición aplicado al DCA (solo si así se configuró en la web)
-        blocked = self._gate_check(direction, first_nt, is_dca=True)
-        # Condición EMA del DCA (a partir de N tramos)
+        blocked = self._gate_check(sig_dir, first_nt, is_dca=True)
+        # Condición EMA del DCA (a partir de N tramos), evaluada sobre la señal
         if blocked is None:
-            blocked = self._dca_trend_block(symbol, direction, first_idx, price)
+            blocked = self._dca_trend_block(symbol, sig_dir, first_idx, price, inverted)
         if blocked is not None:
             self._record_block(symbol, direction, blocked[0], blocked[1], is_dca=True,
-                               extra=f"tramo {first_idx + 1} al {first_lvl:g}%")
+                               extra=f"tramo {first_idx + 1} al {first_lvl:g}%"
+                                     + (" a favor (invertida)" if inverted else ""))
             return
         self._entry_inflight.add(symbol)
-        self._spawn(self._enter_levels(symbol, due, direction))
+        self._spawn(self._enter_levels(symbol, due, direction, inverted))
 
     def _block_by_price(self, symbol: str, price: float) -> None:
         with self.lock:
@@ -1693,30 +2672,35 @@ class TradingBot:
         if newly:
             self.log(f"BLOQUEADO permanente {symbol}: precio {price:.4f} > {MAX_PRICE_BLOCK} USD")
 
-    async def _enter_levels(self, symbol: str, due: list, direction: str) -> None:
-        """Abre, en orden, los tramos vencidos [(índice, % en contra, notional), ...].
+    async def _enter_levels(self, symbol: str, due: list, direction: str,
+                            inverted: bool = False) -> None:
+        """Abre, en orden, los tramos vencidos [(índice, % de la escalera, notional), ...].
+        `direction` es el lado REAL; `inverted` dice si la posición es espejo.
         Corre como tarea: el motor no espera a la orden."""
         opened_any = False
+        sig_dir = _opp(direction) if inverted else direction
         try:
             for idx, level, notional in due:
                 price = self._price_for(symbol)
                 if price is None:
                     break
-                if idx > 0:                  # DCA: reconfirma que el precio sigue en contra
+                if idx > 0:                  # DCA: reconfirma que el precio sigue en el nivel
                     with self.lock:
                         pos = self.positions.get(symbol)
-                        adverse = pos.adverse_pct(price) if pos else 0.0
-                    if adverse < level:
+                        trigger = pos.trigger_pct(price) if pos else 0.0
+                    if trigger < level:
                         break
-                    trend = self._dca_trend_block(symbol, direction, idx, price)
+                    trend = self._dca_trend_block(symbol, sig_dir, idx, price, inverted)
                     if trend is not None:    # p. ej. el tramo 3 entra y el 4 ya exige la EMA
                         self._record_block(symbol, direction, trend[0], trend[1], is_dca=True,
-                                           extra=f"tramo {idx + 1} al {level:g}%")
+                                           extra=f"tramo {idx + 1} al {level:g}%"
+                                                 + (" a favor (invertida)" if inverted else ""))
                         break
                 if MAX_PRICE_BLOCK > 0 and price > MAX_PRICE_BLOCK:
                     self._block_by_price(symbol, price)
                     break
-                if not await self._ensure_position(symbol, idx, level, notional, price, direction):
+                if not await self._ensure_position(symbol, idx, level, notional, price, direction,
+                                                   inverted):
                     break
                 opened_any = True
         finally:
@@ -1758,8 +2742,9 @@ class TradingBot:
     # ── Estrategia ────────────────────────────────────────────────────────────
 
     async def _ensure_position(self, symbol: str, idx: int, level: float, notional: float,
-                               price: float, direction: str) -> bool:
+                               price: float, direction: str, inverted: bool = False) -> bool:
         """Abre el tramo de índice `idx` (0 = entrada del cruce). True si se abrió.
+        `direction` es el lado REAL de la orden; `inverted` marca la posición espejo.
         El tramo se RESERVA antes de enviar la orden para que ningún tick lo
         duplique mientras está en vuelo."""
         key = (symbol, idx)
@@ -1775,12 +2760,13 @@ class TradingBot:
                 if pos is not None:                       # ya hay posición: el cruce no abre otra
                     return False
             elif (pos is None or pos.status != "OPEN" or pos.direction != direction
+                  or pos.inverted != inverted
                   or len(pos.fills) != idx):              # el tramo idx solo sigue al idx-1
                 return False
             # Comprobación definitiva de las guardas (con la exposición real, incluidas
             # las órdenes en vuelo de otros símbolos) justo antes de reservar.
-            blocked = self._gate_check(direction, notional, is_dca,
-                                       exposure=self._exposure_locked())
+            blocked = self._gate_check(_opp(direction) if inverted else direction, notional,
+                                       is_dca, exposure=self._exposure_locked())
             if blocked is None:
                 trade_id = pos.trade_id if (pos is not None and pos.trade_id) else 0
                 self._entry_reserved[key] = notional
@@ -1801,34 +2787,50 @@ class TradingBot:
                 return False
 
             fill = Fill(level=level, notional=notional, entry_price=price, qty=qty)
+            exec_note = ""
             with self.lock:
                 pos = self.positions.get(symbol)
                 if pos is None:
-                    pos = BotPosition(symbol=symbol, trade_id=trade_id, direction=direction)
+                    pos = BotPosition(symbol=symbol, trade_id=trade_id, direction=direction,
+                                      inverted=inverted)
+                    # Posición NUEVA: va al executor salvo que su envío esté en pausa
+                    pos.exec_url, exec_note = self._exec_target_new()
                     self.positions[symbol] = pos
                 elif pos.trade_id == 0:
                     pos.trade_id = trade_id
                 else:
                     trade_id = pos.trade_id
                 pos.fills.append(fill)
-                pos.refresh_auto_sl()           # 1 tramo → notional×0.251 | 2+ → SL estándar | manual → intacto
-                sl_now, sl_mode, n_fills = pos.sl_usd, pos.sl_mode, len(pos.fills)
+                pos.refresh_auto_sl()           # 1 tramo → notional×0.251 | 2+ → estándar | manual → intacto
+                tp_now, sl_now = pos.exit_tp(), pos.exit_sl()
+                sl_mode, n_fills = pos.sl_mode, len(pos.fills)
+                exec_target = pos.exec_url      # DCA → al mismo executor que la apertura
 
             self._watch_add(symbol)             # la posición abierta siempre queda vigilada
+            if inverted:
+                exits = f"TP={tp_now:+.4f} USD ({sl_mode}) | SL={sl_now:.4f} USD (−notional×TP)"
+                where = f"{level:g}% a favor" if idx > 0 else "entrada"
+            else:
+                exits = f"SL={sl_now:.4f} USD ({sl_mode})"
+                where = f"{level:g}% en contra"
             self.log(
-                f"{direction} {symbol}: tramo {idx + 1} ({level:g}% en contra) | {notional:.2f} USDT | "
-                f"qty={qty} | px={price:.6f} | trade_id={trade_id} | "
-                f"tramos={n_fills} | SL={sl_now:.4f} USD ({sl_mode})"
+                f"{direction} {symbol}{' INVERTIDA' if inverted else ''}: tramo {idx + 1} ({where}) | "
+                f"{notional:.2f} USDT | qty={qty} | px={price:.6f} | trade_id={trade_id} | "
+                f"tramos={n_fills} | {exits}"
+                + ("" if exec_target else
+                   f" | sin executor ({exec_note or 'la posición no se envió al executor'})")
             )
-            self.executor.notify_open(
-                trade_id=trade_id,
-                symbol=symbol,
-                direction=direction,
-                price=price,
-                quantity=qty,
-                notional=notional,
-                level=level,
-            )
+            if exec_target:
+                self.executor.notify_open(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    direction=direction,
+                    price=price,
+                    quantity=qty,
+                    notional=notional,
+                    level=level,
+                    url=exec_target,
+                )
             self.persist_state()
             return True
         finally:
@@ -1852,10 +2854,12 @@ class TradingBot:
                 avg_ent   = (sum(f.entry_price * f.qty for f in snapshot) / qty) if qty > 0 else 0.0
                 trade_id  = pos.trade_id
                 direction = pos.direction
-                sl_usd    = pos.sl_usd
-                target    = notional * TAKE_PROFIT_FRACTION
+                inverted  = pos.inverted
+                sl_usd    = pos.exit_sl()       # SL y TP en PnL real (en una invertida, en espejo)
+                target    = pos.exit_tp()
+                exec_url  = pos.exec_url        # el cierre va al executor donde se abrió
                 pnl       = pos.pnl_sign * sum((f.entry_price - price) * f.qty for f in snapshot) if price > 0 else 0.0
-                # Re-verifica la condición con el estado actual (pudo cambiar el SL desde el dashboard)
+                # Re-verifica la condición con el estado actual (pudo cambiar el SL/TP desde el dashboard)
                 if reason == "SL" and pnl > sl_usd:
                     return False
                 if reason == "TP" and pnl < target:
@@ -1875,6 +2879,8 @@ class TradingBot:
                     "trade_id":      trade_id,
                     "symbol":        symbol,
                     "direction":     direction,
+                    "inverted":      inverted,
+                    "signal_dir":    _opp(direction) if inverted else direction,
                     "reason":        reason,
                     "opened_at_ts":  pos.opened_ts,
                     "closed_at_ts":  now_ts,
@@ -1905,7 +2911,7 @@ class TradingBot:
                 self.last_error = str(exc)
                 self._close_backoff[symbol] = time.time() + CLOSE_ERROR_BACKOFF_S
                 label = {"SL": "STOP LOSS", "TP": "take profit", "MANUAL": "cierre manual",
-                         "GLOBAL": "stop global"}.get(reason, reason)
+                         "GLOBAL": "stop global", "GLOBAL_TP": "TP global"}.get(reason, reason)
                 self.log(f"Error cerrando {label} {symbol}: {exc}")
                 return False
 
@@ -1934,6 +2940,7 @@ class TradingBot:
                     self.closed_trades.insert(0, {
                         "symbol":      symbol,
                         "direction":   direction,
+                        "inverted":    inverted,
                         "fills_n":     fills_n,
                         "pnl":         pnl,
                         "target":      target,
@@ -1949,33 +2956,41 @@ class TradingBot:
                     self.closed_trades = self.closed_trades[:500]
 
             self._record_trade_stat(stat_rec)
-            self.executor.notify_close(
-                trade_id=trade_id,
-                symbol=symbol,
-                direction=direction,
-                # Al Executor el stop global le llega como "MANUAL" (motivo que ya conoce)
-                reason="MANUAL" if reason == "GLOBAL" else reason,
-                close_price=price,
-                pnl=pnl,
-            )
+            if exec_url:
+                self.executor.notify_close(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    direction=direction,
+                    # Al Executor el stop/TP global le llega como "MANUAL" (motivo que ya conoce)
+                    reason="MANUAL" if reason in ("GLOBAL", "GLOBAL_TP") else reason,
+                    close_price=price,
+                    pnl=pnl,
+                    url=exec_url,
+                )
+            tag = " (invertida)" if inverted else ""
             if reason == "TP":
                 self.log(
-                    f"CIERRE TP {symbol}: PnL={pnl:.4f} | objetivo={target:.4f} | "
+                    f"CIERRE TP {symbol}{tag}: PnL={pnl:.4f} | objetivo={target:.4f} | "
                     f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
                 )
             elif reason == "SL":
                 self.log(
-                    f"⛔ STOP LOSS {symbol}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
+                    f"⛔ STOP LOSS {symbol}{tag}: PnL={pnl:.4f} | SL configurado={sl_usd:.4f} | "
                     f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
                 )
             elif reason == "GLOBAL":
                 self.log(
-                    f"🛑 CIERRE POR STOP GLOBAL {symbol}: PnL={pnl:.4f} | "
+                    f"🛑 CIERRE POR STOP GLOBAL {symbol}{tag}: PnL={pnl:.4f} | "
+                    f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
+                )
+            elif reason == "GLOBAL_TP":
+                self.log(
+                    f"🎯 CIERRE POR TP GLOBAL {symbol}{tag}: PnL={pnl:.4f} | "
                     f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
                 )
             else:
                 self.log(
-                    f"✋ CIERRE MANUAL {symbol}: PnL={pnl:.4f} | "
+                    f"✋ CIERRE MANUAL {symbol}{tag}: PnL={pnl:.4f} | "
                     f"px={price:.6f} | bloqueado {COOLDOWN_SECONDS // 3600}h hasta {unblock_str}"
                 )
             if leftover:
@@ -2062,11 +3077,14 @@ class TradingBot:
             recs = [r for r in self.trade_stats if "mfe_usd" in r]
         groups: Dict[str, dict] = {}
         for name, subset in (
-            ("ALL",    recs),
-            ("TP",     [r for r in recs if r.get("reason") == "TP"]),
-            ("SL",     [r for r in recs if r.get("reason") == "SL"]),
-            ("MANUAL", [r for r in recs if r.get("reason") == "MANUAL"]),
-            ("GLOBAL", [r for r in recs if r.get("reason") == "GLOBAL"]),
+            ("ALL",       recs),
+            ("TP",        [r for r in recs if r.get("reason") == "TP"]),
+            ("SL",        [r for r in recs if r.get("reason") == "SL"]),
+            ("MANUAL",    [r for r in recs if r.get("reason") == "MANUAL"]),
+            ("GLOBAL",    [r for r in recs if r.get("reason") == "GLOBAL"]),
+            ("GLOBAL_TP", [r for r in recs if r.get("reason") == "GLOBAL_TP"]),
+            ("NORMAL",    [r for r in recs if not r.get("inverted")]),
+            ("INVERTED",  [r for r in recs if r.get("inverted")]),
         ):
             groups[name] = {
                 "n":          len(subset),
@@ -2081,13 +3099,16 @@ class TradingBot:
         total_pnl = sum(float(r.get("pnl", 0)) for r in recs)
 
         # ¿Qué SL habría cortado ganadoras (TP)? (MAE <= SL → la operación se habría parado)
-        tp_mae = [float(r.get("mae_usd", 0)) for r in recs if r.get("reason") == "TP"]
+        # Solo posiciones normales: en las invertidas el importe fijo es el TP.
+        tp_mae = [float(r.get("mae_usd", 0)) for r in recs
+                  if r.get("reason") == "TP" and not r.get("inverted")]
+        tps_normal = len(tp_mae)
         sl_sim = []
         for sl in (-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -8.0, -10.0, -12.0, -15.0, -20.0):
             stopped = sum(1 for m in tp_mae if m <= sl)
             sl_sim.append({
-                "sl": sl, "tp_stopped": stopped, "tp_total": tps,
-                "pct": (stopped / tps * 100.0) if tps else 0.0,
+                "sl": sl, "tp_stopped": stopped, "tp_total": tps_normal,
+                "pct": (stopped / tps_normal * 100.0) if tps_normal else 0.0,
             })
         return {
             "count":     len(recs),
@@ -2120,7 +3141,9 @@ class TradingBot:
         err = _save_settings()
         if err:
             self.log(f"No pude guardar ajustes: {err}")
-        self.log(f"SL GLOBAL = {DEFAULT_STOP_LOSS_USD:.4f} USD "
+        mirror = (f" | TP de las invertidas = {-DEFAULT_STOP_LOSS_USD:+.4f} USD"
+                  if (MODE.inverted or self._has_open_book(True)) else "")
+        self.log(f"SL GLOBAL = {DEFAULT_STOP_LOSS_USD:.4f} USD{mirror} "
                  f"(posiciones actualizadas: {', '.join(updated) or 'ninguna'}"
                  f"{' | manuales sobrescritos' if override_manual else ''})")
         self.persist_state()
@@ -2129,19 +3152,42 @@ class TradingBot:
         return {"default_stop_loss_usd": DEFAULT_STOP_LOSS_USD, "updated": updated}
 
     def set_stop_loss(self, symbol: str, sl_usd: float) -> bool:
-        """Fija un stop loss MANUAL (USD, negativo) para una posición abierta.
-        Queda marcado como manual: el SL automático por tramos ya no lo pisa."""
+        """Fija un stop loss MANUAL (USD, negativo) para una posición NORMAL abierta.
+        Queda marcado como manual: el SL automático por tramos ya no lo pisa.
+        ValueError si la posición es invertida (en ella lo editable es el TP)."""
         symbol = symbol.upper().strip()
         with self.lock:
             pos = self.positions.get(symbol)
             if not pos or pos.status != "OPEN":
                 return False
+            if pos.inverted:
+                raise ValueError(f"{symbol} es una posición invertida: lo que se edita a mano es "
+                                 f"su take profit (POST /api/set-tp/{symbol})")
             pos.sl_usd    = sl_usd
             pos.sl_manual = True
         self.log(f"Stop loss MANUAL para {symbol}: {sl_usd:.4f} USD")
         self.persist_state()
         # Reevalúa ya con el nuevo SL (por si el precio actual ya lo cruza)
         self._enqueue(symbol)
+        return True
+
+    def set_take_profit_manual(self, symbol: str, tp_usd: float) -> bool:
+        """Fija un take profit MANUAL (USD, positivo) para una posición INVERTIDA
+        abierta (el espejo del SL manual de una normal: el bot ya no lo cambia).
+        ValueError si la posición es normal."""
+        symbol = symbol.upper().strip()
+        with self.lock:
+            pos = self.positions.get(symbol)
+            if not pos or pos.status != "OPEN":
+                return False
+            if not pos.inverted:
+                raise ValueError(f"{symbol} es una posición normal: su take profit es notional × "
+                                 f"multiplicador; lo que se edita a mano es su stop loss")
+            pos.sl_usd    = -abs(float(tp_usd))      # se guarda en espejo (TP = −sl_usd)
+            pos.sl_manual = True
+        self.log(f"Take profit MANUAL para {symbol} (invertida): {abs(tp_usd):+.4f} USD")
+        self.persist_state()
+        self._enqueue(symbol)                    # por si el precio actual ya lo alcanza
         return True
 
     async def close_position_manual(self, symbol: str) -> bool:
@@ -2163,7 +3209,9 @@ class TradingBot:
         err = _save_settings()
         if err:
             self.log(f"No pude guardar ajustes: {err}")
-        self.log(f"TP MULTIPLICADOR = {fraction:g} ({fraction * 100:g}% del notional) — "
+        mirror = (f" | SL de las invertidas = −{fraction * 100:g}% del notional"
+                  if (MODE.inverted or self._has_open_book(True)) else "")
+        self.log(f"TP MULTIPLICADOR = {fraction:g} ({fraction * 100:g}% del notional){mirror} — "
                  f"aplicado a las posiciones abiertas")
         self.persist_state()
         for sym in self._open_position_symbols():
@@ -2250,21 +3298,196 @@ class TradingBot:
             self._enqueue(sym)                  # reevalúa ya (p. ej. un DCA que la EMA frenaba)
         return {"risk": self.gate_view(full=False)}
 
-    def set_pause(self, paused: bool, reason: str = "") -> dict:
-        """Pausa / reanuda la apertura de posiciones NUEVAS (DCA/TP/SL siguen activos)."""
+    def set_pause(self, paused: bool, reason: str = "", minutes: Optional[float] = None,
+                  auto: bool = False) -> dict:
+        """Pausa / reanuda la apertura de posiciones NUEVAS (DCA/TP/SL siguen activos).
+        minutes=None → hasta reanudar a mano; N → se reanuda sola a los N minutos."""
         paused = bool(paused)
-        RISK.entries_paused = paused
-        RISK.pause_reason   = (reason or "Pausa manual") if paused else ""
-        RISK.paused_at      = time.time() if paused else 0.0
-        err = _save_settings()
+        with self._pause_lock:
+            now = time.time()
+            prev_at, prev_until = RISK.paused_at, RISK.pause_until
+            RISK.entries_paused = paused
+            RISK.pause_reason   = (reason or "Pausa manual") if paused else ""
+            RISK.paused_at      = now if paused else 0.0
+            RISK.pause_until    = (now + float(minutes) * 60.0) if (paused and minutes) else 0.0
+            err = _save_settings()
         if err:
             self.log(f"No pude guardar ajustes: {err}")
         if paused:
-            self.log(f"⏸ ENTRADAS PAUSADAS — {RISK.pause_reason}")
+            dur = (f"durante {_fmt_minutes(minutes)} (hasta las {self._hhmm_utc(RISK.pause_until)})"
+                   if minutes else "hasta que las reanudes")
+            self.log(f"⏸ ENTRADAS PAUSADAS {dur} — {RISK.pause_reason}")
+        elif auto:
+            self.log(f"▶ ENTRADAS REANUDADAS: terminó la pausa de "
+                     f"{_fmt_minutes(max(0.0, prev_until - prev_at) / 60.0)}")
         else:
             self.log("▶ ENTRADAS REANUDADAS")
         self.persist_state()
-        return {"paused": RISK.entries_paused, "pause_reason": RISK.pause_reason}
+        return {"paused": RISK.entries_paused, "pause_reason": RISK.pause_reason,
+                "paused_at": RISK.paused_at, "pause_until": RISK.pause_until}
+
+    def _check_pause_timers(self) -> None:
+        """Reanuda las pausas con tiempo que ya vencieron (lo llama el mantenimiento)."""
+        now = time.time()
+        with self._pause_lock:
+            entries_due = RISK.entries_paused and RISK.pause_until and now >= RISK.pause_until
+            exec_due    = EXEC.paused and EXEC.pause_until and now >= EXEC.pause_until
+            if entries_due:
+                self.set_pause(False, auto=True)
+            if exec_due:
+                self.set_executor_pause(False, auto=True)
+
+    # ── Executor: link en caliente y pausa del envío ──────────────────────────
+
+    def _exec_target_new(self) -> Tuple[str, str]:
+        """(link, motivo si no se envía) para una posición NUEVA."""
+        url = self.executor.config.executor_url
+        if not url:
+            return "", "sin link de executor"
+        if self._exec_paused_now():
+            return "", "envío al executor en pausa"
+        return url, ""
+
+    def executor_view(self) -> dict:
+        now = time.time()
+        paused = self._exec_paused_now(now)
+        cur = self.executor.config.executor_url
+        with self.lock:
+            open_pos = [p for p in self.positions.values() if p.status == "OPEN" and p.fills]
+        on_cur   = sum(1 for p in open_pos if p.exec_url and p.exec_url == cur)
+        on_other = sum(1 for p in open_pos if p.exec_url and p.exec_url != cur)
+        return {
+            "url":             cur,
+            "host":            _host_of(cur) if cur else "",
+            "env_url":         EXECUTOR_URL,
+            "paused":          paused,
+            "pause_reason":    EXEC.pause_reason if paused else "",
+            "paused_at":       EXEC.paused_at if paused else 0.0,
+            "pause_until":     EXEC.pause_until if paused else 0.0,
+            "pause_left_s":    max(0.0, EXEC.pause_until - now) if (paused and EXEC.pause_until) else 0.0,
+            "open_on_current": on_cur,
+            "open_on_other":   on_other,
+            "open_not_sent":   len(open_pos) - on_cur - on_other,
+            **self.executor.stats_view(),
+        }
+
+    def set_executor_url(self, url: Any, move_open: bool = False) -> dict:
+        """Cambia el link del executor sin reiniciar. Las posiciones NUEVAS van al
+        link nuevo; las abiertas siguen recibiendo su DCA y su cierre en el link
+        donde se abrieron, salvo move_open=True (mismo executor con otra dirección).
+        ValueError si el link no es válido."""
+        new = _v_exec_url(url)
+        old = self.executor.config.executor_url
+        moved: List[str] = []
+        with self.lock:
+            if move_open and old and new and new != old:
+                for sym, p in self.positions.items():
+                    if p.status == "OPEN" and p.fills and p.exec_url == old:
+                        p.exec_url = new
+                        moved.append(sym)
+            staying = sorted(sym for sym, p in self.positions.items()
+                             if p.status == "OPEN" and p.fills and p.exec_url and p.exec_url != new)
+        if new == old:
+            return {"changed": False, "moved": [], "staying": staying, "executor": self.executor_view()}
+        EXEC.url = new
+        self.executor.set_url(new)
+        err = _save_settings()
+        if err:
+            self.log(f"No pude guardar ajustes: {err}")
+        extra = ""
+        if moved:
+            one = len(moved) == 1
+            extra = (f" | {'1 posición abierta pasa' if one else f'{len(moved)} posiciones abiertas pasan'}"
+                     f" al link nuevo: {', '.join(sorted(moved))}")
+        elif staying:
+            one = len(staying) == 1
+            extra = (f" | {'1 posición abierta sigue' if one else f'{len(staying)} posiciones abiertas siguen'}"
+                     f" recibiendo DCA y cierre en su link anterior: {', '.join(staying)}")
+        self.log(f"[executor] LINK CAMBIADO: {old or '(ninguno)'} → "
+                 f"{new or '(ninguno: no se envían señales)'}{extra}")
+        self.persist_state()
+        return {"changed": True, "moved": sorted(moved), "staying": staying,
+                "executor": self.executor_view()}
+
+    def set_executor_pause(self, paused: bool, minutes: Optional[float] = None,
+                           reason: str = "", auto: bool = False) -> dict:
+        """Pausa / reanuda el envío de posiciones NUEVAS al executor. El bot sigue
+        operando igual; lo que ya está en el executor sigue con su DCA y su cierre."""
+        paused = bool(paused)
+        with self._pause_lock:
+            now = time.time()
+            prev_at, prev_until = EXEC.paused_at, EXEC.pause_until
+            EXEC.paused       = paused
+            EXEC.pause_reason = (reason or "Pausa manual") if paused else ""
+            EXEC.paused_at    = now if paused else 0.0
+            EXEC.pause_until  = (now + float(minutes) * 60.0) if (paused and minutes) else 0.0
+            err = _save_settings()
+        if err:
+            self.log(f"No pude guardar ajustes: {err}")
+        host = _host_of(self.executor.config.executor_url) or "sin link"
+        if paused:
+            dur = (f"durante {_fmt_minutes(minutes)} (hasta las {self._hhmm_utc(EXEC.pause_until)})"
+                   if minutes else "hasta que lo reanudes")
+            self.log(f"⏸ EXECUTOR EN PAUSA ({host}) {dur}: las posiciones nuevas no se le envían; "
+                     f"las que ya tiene siguen con su DCA y su cierre")
+        elif auto:
+            self.log(f"▶ EXECUTOR REANUDADO ({host}): terminó la pausa de "
+                     f"{_fmt_minutes(max(0.0, prev_until - prev_at) / 60.0)}")
+        else:
+            self.log(f"▶ EXECUTOR REANUDADO ({host}): las posiciones nuevas se vuelven a enviar")
+        self.persist_state()
+        return {"executor": self.executor_view()}
+
+    # ── Modo invertido (un solo interruptor) ──────────────────────────────────
+
+    @staticmethod
+    def mirror_rules() -> dict:
+        """Reglas que tendrá una posición invertida con los ajustes actuales."""
+        first_nt = ENTRY_LADDER[0][1] if ENTRY_LADDER else 0.0
+        return {
+            "tp_first":     abs(first_nt) * FIRST_TRANCHE_SL_FRACTION,   # TP con 1 tramo
+            "tp_first_nt":  first_nt,
+            "tp_fraction":  FIRST_TRANCHE_SL_FRACTION,
+            "tp_std":       -DEFAULT_STOP_LOSS_USD,                      # TP desde el 2.º tramo
+            "sl_fraction":  TAKE_PROFIT_FRACTION,                        # SL = −notional × esto
+            "global_tp":    -RISK.global_stop_usd,                       # TP global
+            "global_on":    RISK.global_stop_enabled,
+        }
+
+    def set_inverted(self, enabled: bool) -> dict:
+        """Activa / desactiva el modo invertido. Solo afecta a las posiciones NUEVAS:
+        las abiertas siguen con las reglas con las que se abrieron."""
+        enabled = bool(enabled)
+        changed = enabled != MODE.inverted
+        MODE.inverted = enabled
+        if changed:
+            MODE.changed_at = time.time()
+        err = _save_settings()
+        if err:
+            self.log(f"No pude guardar ajustes: {err}")
+        with self.lock:
+            others = sorted(sym for sym, p in self.positions.items()
+                            if p.status == "OPEN" and p.fills and p.inverted != enabled)
+        if changed:
+            r = self.mirror_rules()
+            keep = ""
+            if others:
+                kind = "normales" if enabled else "invertidas"
+                keep = (f". Siguen con sus reglas {len(others)} posición(es) {kind} abiertas: "
+                        f"{', '.join(others[:8])}{'…' if len(others) > 8 else ''}")
+            if enabled:
+                self.log(
+                    f"🔄 MODO INVERTIDO ACTIVADO: las posiciones nuevas se abren al revés de la señal "
+                    f"(UP → SHORT, DOWN → LONG). TP = +{r['tp_first']:.4f} USD con 1 tramo, "
+                    f"+{r['tp_std']:.2f} USD desde el 2.º | SL = −{r['sl_fraction'] * 100:g}% del notional"
+                    f" | TP global = " + (f"+{r['global_tp']:.2f} USD" if r["global_on"] else "apagado")
+                    + " | DCA en los mismos precios que el modo normal (a favor de la posición)" + keep)
+            else:
+                self.log("🔄 MODO NORMAL: las posiciones nuevas se abren en la dirección de la señal "
+                         "(UP → LONG, DOWN → SHORT)" + keep)
+        self.persist_state()
+        return {"inverted_mode": MODE.inverted, "changed": changed, "others_open": others,
+                "rules": self.mirror_rules()}
 
     def _unrealized_total_locked(self) -> Tuple[float, int]:
         """(PnL no realizado total, nº de posiciones abiertas). Requiere self.lock."""
@@ -2276,9 +3499,39 @@ class TradingBot:
             total += pos.unrealized_pnl(self._display_price(sym))
         return total, n_open
 
+    def _unrealized_books_locked(self) -> Tuple[float, int, float, int]:
+        """(PnL normales, nº normales, PnL invertidas, nº invertidas). Requiere self.lock."""
+        tot_n = tot_i = 0.0
+        n_n = n_i = 0
+        for sym, pos in self.positions.items():
+            if pos.status != "OPEN" or not pos.fills:
+                continue
+            pnl = pos.unrealized_pnl(self._display_price(sym))
+            if pos.inverted:
+                tot_i += pnl
+                n_i += 1
+            else:
+                tot_n += pnl
+                n_n += 1
+        return tot_n, n_n, tot_i, n_i
+
+    def _has_open_book(self, inverted: bool) -> bool:
+        with self.lock:
+            return any(p.status == "OPEN" and p.fills and p.inverted == inverted
+                       for p in self.positions.values())
+
+    def _open_symbols_in_book(self, book: Optional[bool]) -> List[str]:
+        """Símbolos abiertos: todos (book=None), solo normales (False) o solo invertidas (True)."""
+        with self.lock:
+            return [sym for sym, p in self.positions.items()
+                    if p.status == "OPEN" and p.fills and (book is None or p.inverted == book)]
+
     def _check_global_stop(self) -> None:
-        """Si el PnL no realizado total ≤ RISK.global_stop_usd, cierra TODO (una a una)
-        y, si así está configurado, pausa las entradas nuevas. Corre en el loop del bot."""
+        """Dos "libros", cada uno con su regla (mismo valor, signo opuesto):
+          • Normales:   PnL no realizado ≤ global_stop_usd (−5)  → STOP GLOBAL: las cierra.
+          • Invertidas: PnL no realizado ≥ −global_stop_usd (+5) → TP GLOBAL:   las cierra.
+        Tras dispararse, si así está configurado, pausa las entradas nuevas.
+        Corre en el loop del bot."""
         if not RISK.global_stop_enabled or self._close_all_active:
             return
         now = time.time()
@@ -2286,40 +3539,65 @@ class TradingBot:
             return
         self._gstop_last_check = now
         with self.lock:
-            total, n_open = self._unrealized_total_locked()
-        if n_open == 0 or total > RISK.global_stop_usd:
+            tot_n, n_n, tot_i, n_i = self._unrealized_books_locked()
+        thr = RISK.global_stop_usd                       # negativo (ej. −5)
+        if n_n and tot_n <= thr:
+            kind, total, n_open, book, target = "SL", tot_n, n_n, False, thr
+        elif n_i and tot_i >= -thr:
+            kind, total, n_open, book, target = "TP", tot_i, n_i, True, -thr
+        else:
             return
-        threshold = RISK.global_stop_usd
         self._gstop_rearm_at = now + GLOBAL_STOP_REARM_S
         self.global_stop_triggers += 1
         self.global_stop_last = {
-            "ts": now, "pnl": total, "threshold": threshold, "positions": n_open,
+            "ts": now, "pnl": total, "threshold": target, "positions": n_open, "kind": kind,
             "at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
-        self.log(f"🛑 STOP GLOBAL: PnL no realizado {total:.4f} ≤ {threshold:.2f} USD "
-                 f"→ cierre de {n_open} posición(es)")
-        if RISK.global_stop_pause and not RISK.entries_paused:
-            self.set_pause(True, f"Stop global disparado ({total:.2f} USD ≤ {threshold:.2f})")
-        res = self.start_close_all(origin="GLOBAL")
+        if kind == "SL":
+            self.log(f"🛑 STOP GLOBAL: PnL no realizado {total:.4f} ≤ {thr:.2f} USD "
+                     f"→ cierre de {n_open} posición(es)" + (" normales" if n_i else ""))
+            why = f"Stop global disparado ({total:.2f} USD ≤ {thr:.2f})"
+        else:
+            self.log(f"🎯 TP GLOBAL: PnL no realizado de las invertidas {total:+.4f} ≥ {-thr:+.2f} USD "
+                     f"→ cierre de {n_open} posición(es) invertida(s)")
+            why = f"TP global alcanzado ({total:+.2f} USD ≥ {-thr:+.2f})"
+        if RISK.global_stop_pause:
+            mins = RISK.global_stop_pause_min or None
+            want_until = (now + mins * 60.0) if mins else 0.0
+            # Pausa si no la hay, o si la que hay es con tiempo y acaba antes que esta
+            if (not self._entries_paused_now(now)
+                    or (RISK.pause_until and (not want_until or want_until > RISK.pause_until))):
+                self.set_pause(True, why, minutes=mins)
+        res = self.start_close_all(origin="GLOBAL" if kind == "SL" else "GLOBAL_TP", book=book)
         if not res.get("ok"):
-            self.log(f"Stop global: no pude lanzar el cierre masivo: {res.get('error')}")
+            self.log(f"{'Stop' if kind == 'SL' else 'TP'} global: no pude lanzar el cierre masivo: "
+                     f"{res.get('error')}")
 
     def gate_view(self, full: bool = True) -> dict:
         """Estado de las guardas de entrada para la web."""
         with self.lock:
             exposure = sum(p.notional for p in self.positions.values()
                            if p.status == "OPEN" and p.fills)
-            unreal, n_open = self._unrealized_total_locked()
+            unreal_n, n_n, unreal_i, n_i = self._unrealized_books_locked()
+        unreal, n_open = unreal_n + unreal_i, n_n + n_i
         btc_chg, btc_fresh = self.btc_change()
-        blk_long, blk_short, btc_reasons = self._btc_blocks()
+        blk_long, blk_short, btc_reasons = self._btc_blocks()     # por lado de la SEÑAL
+        inv_mode = MODE.inverted
+        # Lados REALES que pueden abrir: en modo invertido un LONG real sale de una
+        # señal SHORT (y al revés), así que lo frena lo que frene a esa señal.
+        real_blk_long, real_blk_short = (blk_short, blk_long) if inv_mode else (blk_long, blk_short)
         first_nt = ENTRY_LADDER[0][1] if ENTRY_LADDER else 0.0
         exp_blocks = bool(RISK.exposure_enabled
                           and exposure + first_nt > RISK.max_exposure_usd + 1e-9)
-        common = RISK.entries_paused or exp_blocks or self._close_all_active
+        now = time.time()
+        paused = self._entries_paused_now(now)
+        common = paused or exp_blocks or self._close_all_active
         view: Dict[str, Any] = {
-            "paused":            RISK.entries_paused,
-            "pause_reason":      RISK.pause_reason,
-            "paused_at":         RISK.paused_at,
+            "paused":            paused,
+            "pause_reason":      RISK.pause_reason if paused else "",
+            "paused_at":         RISK.paused_at if paused else 0.0,
+            "pause_until":       RISK.pause_until if paused else 0.0,
+            "pause_left_s":      max(0.0, RISK.pause_until - now) if (paused and RISK.pause_until) else 0.0,
             "close_all_active":  self._close_all_active,
             "exposure":          exposure,
             "exposure_enabled":  RISK.exposure_enabled,
@@ -2345,12 +3623,19 @@ class TradingBot:
             "gstop_enabled":     RISK.global_stop_enabled,
             "gstop_usd":         RISK.global_stop_usd,
             "gstop_pause":       RISK.global_stop_pause,
+            "gstop_pause_min":   RISK.global_stop_pause_min,
             "gstop_triggers":    self.global_stop_triggers,
             "gstop_last":        dict(self.global_stop_last),
             "unrealized":        unreal,
             "open_positions":    n_open,
-            "can_open_long":     not (common or blk_long),
-            "can_open_short":    not (common or blk_short),
+            "unreal_normal":     unreal_n,
+            "open_normal":       n_n,
+            "unreal_inverted":   unreal_i,
+            "open_inverted":     n_i,
+            "inverted_mode":     inv_mode,
+            "inverted_since":    MODE.changed_at,
+            "can_open_long":     not (common or real_blk_long),
+            "can_open_short":    not (common or real_blk_short),
         }
         with self._block_lock:
             view["blocked_counts"] = dict(self.blocked_counts)
@@ -2364,7 +3649,7 @@ class TradingBot:
     def _empty_close_all() -> Dict[str, Any]:
         return {"running": False, "cancel": False, "total": 0, "done": 0, "ok": 0,
                 "failed": 0, "current": "", "failed_symbols": [],
-                "started": 0.0, "finished": 0.0, "origin": ""}
+                "started": 0.0, "finished": 0.0, "origin": "", "book": None}
 
     def close_all_view(self) -> dict:
         with self.lock:
@@ -2372,21 +3657,23 @@ class TradingBot:
             v["failed_symbols"] = list(v.get("failed_symbols", []))
         return v
 
-    def start_close_all(self, origin: str = "MANUAL") -> dict:
-        """Lanza el cierre secuencial de TODAS las posiciones abiertas (desde Flask o
-        desde el propio loop: stop global). Devuelve al instante; el progreso se lee
-        en close_all_view(). origin: "MANUAL" | "GLOBAL"."""
+    def start_close_all(self, origin: str = "MANUAL", book: Optional[bool] = None) -> dict:
+        """Lanza el cierre secuencial de las posiciones abiertas (desde Flask o desde
+        el propio loop: stop/TP global). Devuelve al instante; el progreso se lee en
+        close_all_view(). origin: "MANUAL" | "GLOBAL" | "GLOBAL_TP".
+        book: None = todas · False = solo normales · True = solo invertidas."""
         if not self.loop or not self.loop.is_running():
             return {"ok": False, "error": "Bot loop no está activo", "code": 503}
         with self.lock:
             if self.close_all_state.get("running"):
                 return {"ok": False, "error": "Ya hay un cierre masivo en curso", "code": 409}
-            n_open = sum(1 for p in self.positions.values() if p.status == "OPEN" and p.fills)
+            n_open = sum(1 for p in self.positions.values() if p.status == "OPEN" and p.fills
+                         and (book is None or p.inverted == book))
             if n_open == 0:
                 return {"ok": False, "error": "No hay posiciones abiertas", "code": 404}
             self.close_all_state = self._empty_close_all()
             self.close_all_state.update(running=True, total=n_open, started=time.time(),
-                                        origin=origin)
+                                        origin=origin, book=book)
             self._close_all_active = True
         coro = self._close_all_sequential()
         if threading.current_thread() is self.thread:
@@ -2430,12 +3717,15 @@ class TradingBot:
         ok_set: set = set()
         bad_set: set = set()
         attempts: Dict[str, int] = {}
-        reason = "GLOBAL" if st.get("origin") == "GLOBAL" else "MANUAL"
-        self.log(f"CIERRE MASIVO iniciado ({'stop global' if reason == 'GLOBAL' else 'manual'}): "
-                 f"{st.get('total', 0)} posición(es), una a una")
+        origin = st.get("origin")
+        reason = origin if origin in ("GLOBAL", "GLOBAL_TP") else "MANUAL"
+        book = st.get("book")
+        label = {"GLOBAL": "stop global", "GLOBAL_TP": "TP global"}.get(reason, "manual")
+        which = "" if book is None else (" invertida(s)" if book else " normal(es)")
+        self.log(f"CIERRE MASIVO iniciado ({label}): {st.get('total', 0)} posición(es){which}, una a una")
         try:
             while not st["cancel"]:
-                todo = [s for s in self._open_position_symbols() if attempts.get(s, 0) < 2]
+                todo = [s for s in self._open_symbols_in_book(book) if attempts.get(s, 0) < 2]
                 if not todo:
                     break
                 with self.lock:
@@ -2490,6 +3780,10 @@ class TradingBot:
 
                 # Stop global también aquí: cubre el caso de que no lleguen ticks
                 self._check_global_stop()
+
+                # Pausas con tiempo que ya vencieron + ventana de proxies de arranque
+                self._check_pause_timers()
+                REST_ROUTER.housekeeping()
 
                 if now - last_rate >= 1.0:
                     dt = now - last_rate
@@ -2557,13 +3851,14 @@ class TradingBot:
                     "c":   self._change_for(sym, price),
                     "pnl": pnl,
                     "sl":  pos.sl_price(),
-                    "slu": pos.sl_usd,
-                    "tp":  notional * TAKE_PROFIT_FRACTION,
+                    "slu": pos.exit_sl(),
+                    "tp":  pos.exit_tp(),
                     "mfe": max(pos.mfe_usd, pnl),
                     "mae": min(pos.mae_usd, pnl),
                 }
         winners = [{"s": w["symbol"], "p": w["price"], "c": w["change"]}
                    for w in self._winners_now(set(pos_out))]
+        ex_paused = self._exec_paused_now(now)
         return {
             "ts":               now,
             "positions":        pos_out,
@@ -2571,6 +3866,10 @@ class TradingBot:
             "total_unrealized": total_unreal,
             "total_notional":   total_notional,
             "gate":             self.gate_view(full=False),
+            "executor":         {"url": self.executor.config.executor_url, "paused": ex_paused,
+                                 "pause_until": EXEC.pause_until if ex_paused else 0.0,
+                                 "pause_left_s": max(0.0, EXEC.pause_until - now)
+                                 if (ex_paused and EXEC.pause_until) else 0.0},
             "scan_count":       self.scan_count,
             "eval_rate":        self.eval_rate,
             "latency_avg_ms":   self.latency_avg_ms,
@@ -2621,6 +3920,7 @@ class TradingBot:
         open_positions = []
         total_unreal   = 0.0
         total_notional = 0.0
+        exec_cur       = self.executor.config.executor_url
         for symbol, pos in positions_raw.items():
             if pos.status != "OPEN" or not pos.fills:
                 continue
@@ -2638,13 +3938,16 @@ class TradingBot:
             ema_applies = bool(RISK.dca_ema_enabled and nxt < len(ladder)
                                and nxt >= RISK.dca_ema_after)
             ema_ok = None
+            sig_dir = pos.signal_dir             # la condición EMA mira la señal (espejo)
             if ema_val is not None and price > 0:
-                ema_ok = price > ema_val if pos.direction == "LONG" else price < ema_val
+                ema_ok = price > ema_val if sig_dir == "LONG" else price < ema_val
             dca_next = {
                 "idx":         nxt,
                 "level":       ladder[nxt][0] if nxt < len(ladder) else None,
                 "notional":    ladder[nxt][1] if nxt < len(ladder) else None,
-                "adverse":     pos.adverse_pct(price),
+                # % que manda en el DCA: en contra (normal) o a favor (invertida)
+                "adverse":     pos.trigger_pct(price),
+                "ema_dir":     sig_dir,
                 "ema_period":  RISK.dca_ema_period,
                 "ema":         ema_val,
                 "ema_applies": ema_applies,
@@ -2657,12 +3960,20 @@ class TradingBot:
                 "avg_entry":       pos.avg_entry,
                 "qty":             pos.qty,
                 "notional":        pos.notional,
-                "target":          pos.notional * TAKE_PROFIT_FRACTION,
+                "inverted":        pos.inverted,
+                "signal_dir":      pos.signal_dir,
+                "target":          pos.exit_tp(),        # TP real (USD)
+                "take_profit_price": pos.tp_price(),
                 "unrealized_pnl":  pnl,
                 "stop_loss_price": sl_price,
-                "stop_loss_usd":   pos.sl_usd,
+                "stop_loss_usd":   pos.exit_sl(),        # SL real (USD)
+                # Origen del importe fijo (1er tramo / estándar / manual): en una
+                # normal es el del SL; en una invertida, el del TP.
                 "sl_mode":         pos.sl_mode,
                 "trade_id":        pos.trade_id,
+                "exec_url":        pos.exec_url,
+                "exec_host":       _host_of(pos.exec_url) if pos.exec_url else "",
+                "exec_current":    bool(pos.exec_url) and pos.exec_url == exec_cur,
                 "mfe_usd":         max(pos.mfe_usd, pnl),
                 "mae_usd":         min(pos.mae_usd, pnl),
                 "mfe_pct":         pos.mfe_pct,
@@ -2737,7 +4048,12 @@ class TradingBot:
             "total_unrealized":   total_unreal,
             "total_realized_pnl": total_realized_pnl,
             "total_notional":    total_notional,
-            "executor_url":      EXECUTOR_URL or "",
+            "executor_url":      exec_cur or "",
+            "executor":          self.executor_view(),
+            "inverted_mode":     MODE.inverted,
+            "inverted_since":    MODE.changed_at,
+            "mirror_rules":      self.mirror_rules(),
+            "rest_proxy":        REST_ROUTER.view(),
             "positions":         open_positions,
             "winners":           winners_out,
             "closed_trades":     closed,
@@ -2888,6 +4204,7 @@ HTML = r"""<!doctype html>
       --blue: #6a9cff; --blue-d: #3f6fd6;
       --ok: #3dd68c; --warn: #f2b33d; --bad: #f0605d; --off: #4a5468;
       --long: #3dd68c; --short: #f07c5d;
+      --inv: #b48cff;
       --r-lg: 12px; --r-md: 8px; --r-sm: 6px;
       --font: "Barlow", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       --font-c: "Barlow Semi Condensed", "Barlow", system-ui, sans-serif;
@@ -2932,6 +4249,7 @@ HTML = r"""<!doctype html>
     .lamp.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(242,179,61,.16), 0 0 10px rgba(242,179,61,.5); }
     .lamp.bad  { background: var(--bad);  box-shadow: 0 0 0 3px rgba(240,96,93,.18), 0 0 12px rgba(240,96,93,.6); }
     .lamp.off  { background: var(--off); }
+    .lamp.inv  { background: var(--inv); box-shadow: 0 0 0 3px rgba(180,140,255,.18), 0 0 10px rgba(180,140,255,.55); }
     .lamp.blink { animation: blink 1.2s steps(2, start) infinite; }
     @keyframes blink { to { opacity: .35; } }
 
@@ -3025,6 +4343,7 @@ HTML = r"""<!doctype html>
     .tag.sl { color: var(--bad); background: rgba(240,96,93,.1); }
     .tag.manual { color: var(--warn); background: rgba(242,179,61,.1); }
     .tag.global { color: #fff; background: rgba(240,96,93,.55); }
+    .tag.gtp { color: #06301c; background: rgba(61,214,140,.8); }
 
     /* ── Botones y formularios ────────────────────────────────────── */
     .btn { appearance: none; border: 1px solid var(--rule2); background: var(--panel2); color: var(--txt); border-radius: var(--r-md); padding: 9px 14px; min-height: 40px; font-weight: 600; font-size: 14px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
@@ -3036,6 +4355,8 @@ HTML = r"""<!doctype html>
     .btn.danger:hover { background: rgba(240,96,93,.16); }
     .btn.amber { color: #ffd88f; border-color: rgba(242,179,61,.55); background: rgba(242,179,61,.08); }
     .btn.green { color: #9ef0c6; border-color: rgba(61,214,140,.55); background: rgba(61,214,140,.08); }
+    .btn.violet { color: #ddd0ff; border-color: rgba(180,140,255,.6); background: rgba(180,140,255,.1); }
+    .btn.violet:hover { background: rgba(180,140,255,.18); }
     .btn.block { width: 100%; }
 
     .ctl { padding: 16px 18px; display: grid; gap: 12px; }
@@ -3057,13 +4378,36 @@ HTML = r"""<!doctype html>
     .field { display: grid; gap: 5px; }
     .field label { font-size: 13.5px; color: var(--muted); }
     .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    input[type=number], select {
+    input[type=number], input[type=url], select {
       width: 100%; background: var(--ink); border: 1px solid var(--rule2); border-radius: var(--r-md);
       padding: 10px 12px; font-size: 16px; font-family: var(--font-c); font-weight: 600; outline: none; min-height: 42px;
     }
+    input[type=url] { font-family: var(--font); font-weight: 500; min-width: 0; }
     select { font-family: var(--font); font-weight: 500; font-size: 15px; }
-    input[type=number]:focus, select:focus { border-color: var(--blue); }
+    input[type=number]:focus, input[type=url]:focus, select:focus { border-color: var(--blue); }
     input[data-dirty] { border-color: var(--warn); }
+    /* Duración de una pausa: "hasta que la reanude" | "durante N min" */
+    .seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--rule2); border-radius: var(--r-md); background: var(--ink); overflow: hidden; }
+    .seg[hidden] { display: none; }
+    .seg label { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 42px; padding: 5px 8px; cursor: pointer; font-size: 14px; color: var(--muted); font-weight: 500; text-align: center; transition: background .15s, color .15s; }
+    .seg label + label { border-left: 1px solid var(--rule2); }
+    .seg label:hover { color: var(--txt); }
+    .seg label.on { background: rgba(106,156,255,.14); color: var(--txt); box-shadow: inset 0 0 0 1px var(--blue); }
+    .seg input[type=radio] { position: absolute; opacity: 0; width: 1px; height: 1px; }
+    .seg input[type=radio]:focus-visible + span { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 3px; }
+    .seg input[type=radio][data-dirty] + span { text-decoration: underline 2px var(--warn); text-underline-offset: 4px; }
+    .seg input.mins { width: 58px; min-height: 32px; padding: 3px 4px; text-align: center; -moz-appearance: textfield; appearance: textfield; }
+    .seg input.mins::-webkit-inner-spin-button, .seg input.mins::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    .seg.dim { opacity: .45; }
+    .inline { display: flex; gap: 8px; }
+    .inline input { flex: 1; }
+    .ctl-title .host { margin-left: auto; font-family: var(--font-c); font-weight: 600; font-size: 13.5px; color: var(--muted); max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ctl-sub { display: grid; gap: 10px; padding-top: 12px; border-top: 1px dashed var(--rule); }
+    .ctl .field p { font-size: 13px; }
+    .switch[hidden] { display: none; }
+    @media (min-width: 641px) {
+      table.proxytbl th:nth-child(2), table.proxytbl td:nth-child(2) { text-align: left; white-space: normal; min-width: 240px; }
+    }
     .switch { display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 14.5px; position: relative; }
     .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
     .switch .track { width: 40px; height: 22px; border-radius: 11px; background: var(--rule2); position: relative; flex: 0 0 auto; transition: background .2s; }
@@ -3093,6 +4437,17 @@ HTML = r"""<!doctype html>
     .icon-btn:hover { color: var(--bad); border-color: rgba(240,96,93,.5); }
     .ema-tag { margin-left: 6px; font-family: var(--font-c); font-weight: 700; font-size: 11px; color: var(--blue); border: 1px solid rgba(106,156,255,.45); border-radius: 4px; padding: 0 4px; }
     .ema-tag:empty { display: none; }
+    /* Modo invertido */
+    .mode.inv { color: var(--inv); border-color: rgba(180,140,255,.6); background: rgba(180,140,255,.1); }
+    .mode[hidden] { display: none; }
+    .side.inv { box-shadow: inset 0 0 0 1.5px var(--inv); }
+    .inv-tag { font-family: var(--font-c); font-weight: 700; font-size: 11px; color: var(--inv); border: 1px solid rgba(180,140,255,.5); border-radius: 4px; padding: 0 4px; margin-left: 6px; vertical-align: 1px; }
+    .ctl.inv-on { background: linear-gradient(180deg, rgba(180,140,255,.09), rgba(180,140,255,0) 75%); }
+    .inv-map { list-style: none; margin: 0; padding: 0; border: 1px solid var(--rule); border-radius: var(--r-md); font-size: 13.5px; }
+    .inv-map li { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; padding: 7px 12px; border-bottom: 1px solid var(--rule); }
+    .inv-map li:last-child { border-bottom: 0; }
+    .inv-map span { color: var(--muted); }
+    .inv-map b { font-weight: 600; }
     .factory-row { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--rule); font-size: 13px; }
     .factory-row span { flex: 1 1 180px; }
     .dca-next { font-size: 14px; color: var(--muted); line-height: 1.5; }
@@ -3174,12 +4529,17 @@ HTML = r"""<!doctype html>
       table.ladder input.cell { min-width: 50px; padding: 6px 5px; }
       .blk-list li { grid-template-columns: 48px 1fr; }
       .blk-list li .why { grid-column: 1 / -1; }
+      .rt td small { text-align: right; }
       table.rt thead { display: none; }
       table.rt, .rt tbody, .rt tr, .rt td { display: block; width: 100%; }
       .rt tr { border-bottom: 1px solid var(--rule); padding: 8px 14px; }
       .rt td { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; border: 0; white-space: normal; text-align: right; }
       .rt td::before { content: attr(data-label); color: var(--muted); font-size: 13px; text-align: left; }
       .rt td:first-child { text-align: right; }
+    }
+    @media (max-width: 380px) {
+      .seg { grid-template-columns: 1fr; }
+      .seg label + label { border-left: 0; border-top: 1px solid var(--rule2); }
     }
   </style>
 </head>
@@ -3188,9 +4548,11 @@ HTML = r"""<!doctype html>
   <div class="top-row">
     <div class="brand">Bot Short<span>Binance USDT-M, cruce EMA</span></div>
     <span id="modeBadge" class="mode paper">—</span>
+    <span id="invBadge" class="mode inv" hidden title="Las posiciones nuevas se abren al revés de la señal">Invertido</span>
     <div class="grow"></div>
     <div class="conn" aria-label="Estado de conexión">
       <span title="Entradas nuevas"><i id="lampEntries" class="lamp off"></i><span class="lbl" id="lblEntries">Entradas</span></span>
+      <span title="Envío de operaciones al executor"><i id="lampExec" class="lamp off"></i><span class="lbl" id="lblExec">Executor</span></span>
       <span title="WebSocket de precios"><i id="lampWs" class="lamp off"></i><span class="lbl">Precios</span></span>
       <span title="Refresco del panel"><i id="lampPoll" class="lamp off"></i><span class="lbl">Panel</span></span>
     </div>
@@ -3241,7 +4603,7 @@ HTML = r"""<!doctype html>
         <span class="il-sub" data-s></span>
       </button>
       <button class="il" id="ilGstop" data-go="cfg-gstop" data-state="off">
-        <span class="il-head"><i class="lamp off"></i>Stop global</span>
+        <span class="il-head"><i class="lamp off"></i><span id="ilGstopName">Stop global</span></span>
         <span class="il-val" data-v>—</span>
         <span class="il-bar"><i data-b></i></span>
         <span class="il-sub" data-s></span>
@@ -3268,10 +4630,42 @@ HTML = r"""<!doctype html>
     <!-- Control + ajustes -->
     <aside class="panel">
       <div id="sec-ctl" class="anchor">
+        <div class="ctl" id="ctlInv">
+          <div class="ctl-title"><i id="lampInv" class="lamp off"></i>Modo invertido<span class="host" id="invState">—</span></div>
+          <p id="invText">—</p>
+          <ul class="inv-map" id="invMap" aria-label="Reglas de las posiciones invertidas"></ul>
+          <button id="invBtn" class="btn violet block">Activar modo invertido</button>
+        </div>
         <div class="ctl">
           <div class="ctl-title"><i id="lampPause" class="lamp off"></i>Entradas nuevas</div>
           <p id="pauseText">—</p>
+          <div class="seg" id="pauseSeg" role="radiogroup" aria-label="Duración de la pausa de entradas">
+            <label><input type="radio" name="pauseDur" value="manual" checked><span>Hasta que la reanude</span></label>
+            <label><input type="radio" name="pauseDur" value="timed"><span>Durante</span><input class="mins" id="pauseMin" type="number" min="1" max="10080" step="1" inputmode="numeric" value="25" aria-label="Minutos de pausa de las entradas"><span>min</span></label>
+          </div>
           <button id="pauseBtn" class="btn amber block">Pausar entradas</button>
+        </div>
+        <div class="ctl" id="ctlExec">
+          <div class="ctl-title"><i id="lampExecCard" class="lamp off"></i>Executor<span class="host" id="execHost">—</span></div>
+          <p id="execText">—</p>
+          <div class="seg" id="execSeg" role="radiogroup" aria-label="Duración de la pausa del envío al executor">
+            <label><input type="radio" name="execDur" value="manual" checked><span>Hasta que lo reanude</span></label>
+            <label><input type="radio" name="execDur" value="timed"><span>Durante</span><input class="mins" id="execMin" type="number" min="1" max="10080" step="1" inputmode="numeric" value="25" aria-label="Minutos de pausa del envío al executor"><span>min</span></label>
+          </div>
+          <button id="execPauseBtn" class="btn amber block">Pausar envío al executor</button>
+          <div class="ctl-sub">
+            <div class="field">
+              <label for="execUrl">Link del executor</label>
+              <div class="inline">
+                <input id="execUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://mi-executor.onrender.com">
+                <button class="btn" id="execTest" type="button" title="Comprueba que el link responde, sin enviar señales">Probar</button>
+              </div>
+              <p id="execHint" class="muted" style="margin:0"></p>
+            </div>
+            <label class="switch" id="execMoveWrap" hidden><input type="checkbox" id="execMove"><span class="track"></span><span id="execMoveTxt">—</span></label>
+            <div id="execMsg" class="msg"></div>
+            <button class="btn primary block" id="execSave" disabled>Guardar link</button>
+          </div>
         </div>
         <div class="ctl">
           <div class="ctl-title">Cerrar todas las posiciones</div>
@@ -3289,15 +4683,19 @@ HTML = r"""<!doctype html>
         <div class="panel-head" style="border-top:1px solid var(--rule)"><h2>Ajustes</h2><span class="muted" style="font-size:13.5px">se guardan y sobreviven a reinicios</span></div>
 
         <details class="acc" id="cfg-gstop">
-          <summary><span class="acc-name">Stop global por PnL</span><span class="acc-val" id="cvGstop">—</span><span class="chev"></span></summary>
+          <summary><span class="acc-name" id="gsName">Stop global por PnL</span><span class="acc-val" id="cvGstop">—</span><span class="chev"></span></summary>
           <div class="acc-body" data-panel>
-            <p class="hint">Si la suma del PnL no realizado de todas las posiciones llega a este valor, el bot las cierra todas a mercado, una a una.</p>
-            <label class="switch"><input type="checkbox" id="gsEnabled"><span class="track"></span>Stop global activado</label>
+            <p class="hint" id="gsHint">Si la suma del PnL no realizado de las posiciones llega a este valor, el bot las cierra todas a mercado, una a una.</p>
+            <label class="switch"><input type="checkbox" id="gsEnabled"><span class="track"></span><span id="gsEnabledTxt">Stop global activado</span></label>
             <div class="field">
-              <label for="gsUsd">Cerrar todo cuando el PnL no realizado sea igual o menor que (USD)</label>
+              <label for="gsUsd" id="gsUsdLbl">Cerrar todo cuando el PnL no realizado sea igual o menor que (USD)</label>
               <input id="gsUsd" type="number" step="0.5" placeholder="-5">
             </div>
             <label class="switch"><input type="checkbox" id="gsPause"><span class="track"></span>Pausar entradas nuevas tras dispararse</label>
+            <div class="seg" id="gsSeg" role="radiogroup" aria-label="Duración de la pausa tras el stop global">
+              <label><input type="radio" name="gsDur" value="manual" checked><span>Hasta que la reanude</span></label>
+              <label><input type="radio" name="gsDur" value="timed"><span>Durante</span><input class="mins" id="gsPauseMin" type="number" min="1" max="10080" step="1" inputmode="numeric" value="30" aria-label="Minutos de pausa tras el stop global"><span>min</span></label>
+            </div>
             <p class="hint" id="gsLast"></p>
             <button class="btn primary" id="gsSave">Guardar stop global</button>
           </div>
@@ -3364,24 +4762,24 @@ HTML = r"""<!doctype html>
         </details>
 
         <details class="acc" id="cfg-sl">
-          <summary><span class="acc-name">Stop loss por posición</span><span class="acc-val on" id="cvSl">—</span><span class="chev"></span></summary>
+          <summary><span class="acc-name" id="slName">Stop loss por posición</span><span class="acc-val on" id="cvSl">—</span><span class="chev"></span></summary>
           <div class="acc-body" data-panel>
             <p class="hint" id="slHint">—</p>
             <div class="field">
-              <label for="gslInput">Stop loss estándar para 2 o más tramos (USD)</label>
+              <label for="gslInput" id="gslLbl">Stop loss estándar para 2 o más tramos (USD)</label>
               <input id="gslInput" type="number" step="0.5" placeholder="-8">
             </div>
-            <label class="switch"><input type="checkbox" id="gslOverride"><span class="track"></span>Sobrescribir también los SL fijados a mano</label>
+            <label class="switch"><input type="checkbox" id="gslOverride"><span class="track"></span><span id="gslOverrideTxt">Sobrescribir también los SL fijados a mano</span></label>
             <button class="btn primary" id="gslSave">Guardar stop loss</button>
           </div>
         </details>
 
         <details class="acc" id="cfg-tp">
-          <summary><span class="acc-name">Take profit</span><span class="acc-val on" id="cvTp">—</span><span class="chev"></span></summary>
+          <summary><span class="acc-name" id="tpName">Take profit</span><span class="acc-val on" id="cvTp">—</span><span class="chev"></span></summary>
           <div class="acc-body" data-panel>
-            <p class="hint">Objetivo de cada posición = notional × multiplicador. Se aplica al instante a las posiciones abiertas.</p>
+            <p class="hint" id="tpHint">Objetivo de cada posición = notional × multiplicador. Se aplica al instante a las posiciones abiertas.</p>
             <div class="field">
-              <label for="tpInput">Multiplicador (0.07 = 7 % del notional)</label>
+              <label for="tpInput" id="tpLbl">Multiplicador (0.07 = 7 % del notional)</label>
               <input id="tpInput" type="number" step="0.005" min="0.001" max="5" inputmode="decimal" placeholder="0.07">
             </div>
             <div class="chips" id="tpPreview"></div>
@@ -3451,6 +4849,8 @@ HTML = r"""<!doctype html>
         <button data-f="SL" aria-pressed="false">Stop loss</button>
         <button data-f="MANUAL" aria-pressed="false">Manual</button>
         <button data-f="GLOBAL" aria-pressed="false">Stop global</button>
+        <button data-f="GLOBAL_TP" aria-pressed="false">TP global</button>
+        <button data-f="INV" aria-pressed="false">Invertidas</button>
       </div>
       <div class="tablewrap" style="margin-top:12px; max-height:520px; overflow:auto">
         <table class="rt">
@@ -3476,13 +4876,13 @@ HTML = r"""<!doctype html>
           <h3 class="sub-h">Por tipo de cierre (USD, MAE en valor absoluto)</h3>
           <div class="boxed tablewrap">
             <table>
-              <thead><tr><th>Grupo</th><th>N</th><th>MFE med</th><th>MFE p90</th><th>MAE med</th><th>MAE p90</th><th>MFE %</th><th>MAE %</th><th>Duración</th></tr></thead>
-              <tbody id="tbStatGroups"><tr><td colspan="9" class="muted">Sin datos aún</td></tr></tbody>
+              <thead><tr><th>Grupo</th><th>N</th><th>PnL total</th><th>MFE med</th><th>MFE p90</th><th>MAE med</th><th>MAE p90</th><th>MFE %</th><th>MAE %</th><th>Duración</th></tr></thead>
+              <tbody id="tbStatGroups"><tr><td colspan="10" class="muted">Sin datos aún</td></tr></tbody>
             </table>
           </div>
         </div>
         <div>
-          <h3 class="sub-h">Take profits que cada SL habría cortado</h3>
+          <h3 class="sub-h" id="slSimTitle">Take profits que cada SL habría cortado</h3>
           <div class="boxed tablewrap">
             <table>
               <thead><tr><th>SL USD</th><th>TP cortados</th><th>%</th></tr></thead>
@@ -3546,7 +4946,17 @@ HTML = r"""<!doctype html>
         <div><span>Cruces detectados</span><b id="klSignals">—</b></div>
         <div><span>Red de seguridad</span><b id="rbSafety">—</b></div>
         <div><span>Executor</span><b id="executorStatus">—</b></div>
+        <div><span>Proxies de arranque</span><b id="proxyStatus">—</b></div>
         <div><span>Tiempo activo</span><b id="uptime">—</b></div>
+      </div>
+      <div id="proxyBox" hidden>
+        <h3 class="sub-h" id="proxySum">Proxies de arranque</h3>
+        <div class="boxed tablewrap">
+          <table class="rt proxytbl">
+            <thead><tr><th>Salida</th><th>Estado</th><th>OK</th><th>Fallos</th><th>Peso del minuto</th><th>Última respuesta</th></tr></thead>
+            <tbody id="tbProxy"></tbody>
+          </table>
+        </div>
       </div>
       <div>
         <h3 class="sub-h">Eventos del bot</h3>
@@ -3559,9 +4969,9 @@ HTML = r"""<!doctype html>
 <!-- Modal: SL de una posición -->
 <div id="slModalOverlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="slModalTitle">
   <div class="modal">
-    <h3 id="slModalTitle">Stop loss de <span id="slModalSymbol">—</span></h3>
+    <h3 id="slModalTitle"><span id="slModalWhat">Stop loss</span> de <span id="slModalSymbol">—</span></h3>
     <div class="field">
-      <label for="slModalInput">Pérdida máxima en USD. Un SL fijado a mano no lo cambia el bot.</label>
+      <label for="slModalInput" id="slModalLbl">Pérdida máxima en USD. Un SL fijado a mano no lo cambia el bot.</label>
       <input id="slModalInput" type="number" step="0.5">
     </div>
     <p id="slModalError" class="neg" style="display:none;margin:0;font-size:13.5px"></p>
@@ -3617,6 +5027,52 @@ function negVal(id) {
   return isFinite(v) && v !== 0 ? -Math.abs(v) : NaN;
 }
 function numVal(id) { const v = parseFloat(String(q(id).value).replace(',', '.')); return isFinite(v) ? v : NaN; }
+function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* sin almacenamiento */ } }
+function fmtMin(m) {
+  m = Math.round(n(m) * 10) / 10;
+  if (m >= 60 && Number.isInteger(m)) { const h = Math.floor(m / 60), r = m % 60; return `${h} h` + (r ? ` ${r} min` : ''); }
+  return `${m} min`;
+}
+// Pausa con tiempo: "hasta las 10:42 (quedan 23 min 05 s)" o "hasta que la reanudes"
+function untilTxt(untilTs, leftS, manual) {
+  return n(untilTs) ? `hasta las ${hhmm(untilTs)} (quedan ${fmtDur(leftS)})` : manual;
+}
+
+// ── Selector de duración: "hasta que la reanude" | "durante N min" ──────────
+function segSync(segId) {
+  q(segId).querySelectorAll('label').forEach(l => l.classList.toggle('on', l.querySelector('input[type=radio]').checked));
+}
+function segInit(segId, minId, lsKey) {
+  const seg = q(segId), mi = q(minId), timed = seg.querySelector('input[value="timed"]');
+  if (lsKey) { const v = parseFloat(lsGet(lsKey, '')); if (v >= 1 && v <= 10080) mi.value = v; }
+  seg.addEventListener('change', () => segSync(segId));
+  ['focus', 'input'].forEach(ev => mi.addEventListener(ev, () => {
+    if (!timed.checked) { timed.checked = true; timed.dispatchEvent(new Event('change', { bubbles: true })); }
+  }));
+  mi.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
+  segSync(segId);
+}
+function segValue(segId, minId) {
+  if (!q(segId).querySelector('input[value="timed"]').checked) return { minutes: null };
+  const m = numVal(minId);
+  if (!(m >= 1 && m <= 10080)) return { error: 'Escribe los minutos de la pausa, de 1 a 10080 (7 días).' };
+  return { minutes: m };
+}
+function fillSeg(segId, minId, minutes) {
+  const seg = q(segId), mi = q(minId);
+  if (seg.querySelector('[data-dirty]') || isEditing(mi)) return;
+  const timed = n(minutes) > 0;
+  seg.querySelector(`input[value="${timed ? 'timed' : 'manual'}"]`).checked = true;
+  if (timed && String(mi.value) !== String(n(minutes))) mi.value = n(minutes);
+  segSync(segId);
+}
+const hostOf = u => String(u || '').replace(/^https?:\/\//, '');
+function normUrl(v) {
+  v = String(v || '').trim().replace(/\/+$/, '');
+  if (v && !/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) v = 'https://' + v;
+  return v;
+}
 
 // ── Campos editables: no se pisan mientras el usuario los está cambiando ────
 function isEditing(el) { return el && (document.activeElement === el || el.dataset.dirty); }
@@ -3645,18 +5101,29 @@ function tile(id, state, value, sub, bar) {
 function renderGate(g) {
   if (!g) return;
   _gate = g;
+  const inv = !!g.inverted_mode;
+  if (inv !== _inv) renderMode(inv, null, g);
   // 1) Entradas nuevas
-  let st = 'ok', val = 'Permitidas', sub = 'Un cruce EMA puede abrir posición';
-  const globalRun = !!(_closeAll.running && _closeAll.origin === 'GLOBAL');
-  if (g.close_all_active) { st = 'bad'; val = 'Cerrando todo'; sub = globalRun ? 'Stop global disparado' : 'Cierre masivo en curso'; }
-  else if (g.paused) { st = 'warn'; val = 'En pausa'; sub = (g.pause_reason || 'Pausa manual') + (n(g.paused_at) ? `, desde las ${hhmm(g.paused_at)}` : ''); }
+  let st = 'ok', val = 'Permitidas', sub = inv ? 'Un cruce EMA abre la posición contraria' : 'Un cruce EMA puede abrir posición';
+  const globalRun = !!(_closeAll.running && (_closeAll.origin === 'GLOBAL' || _closeAll.origin === 'GLOBAL_TP'));
+  if (g.close_all_active) {
+    st = 'bad'; val = 'Cerrando todo';
+    sub = !globalRun ? 'Cierre masivo en curso' : _closeAll.origin === 'GLOBAL_TP' ? 'TP global alcanzado' : 'Stop global disparado';
+  }
+  else if (g.paused) {
+    st = 'warn'; val = 'En pausa';
+    sub = (g.pause_reason || 'Pausa manual') + (n(g.pause_until) ? `, hasta las ${hhmm(g.pause_until)} (quedan ${fmtDur(g.pause_left_s)})`
+        : n(g.paused_at) ? `, desde las ${hhmm(g.paused_at)}` : '');
+  }
   else if (!g.can_open_long && !g.can_open_short) {
     st = 'bad'; val = 'Bloqueadas';
     sub = g.exposure_blocks ? 'Exposición al límite'
         : (g.btc_change === null || !g.btc_fresh) ? 'Filtro BTC sin dato fresco' : 'El filtro BTC frena todo';
   } else if (!g.can_open_long || !g.can_open_short) {
     st = 'warn'; val = 'Solo ' + (g.can_open_long ? 'LONG' : 'SHORT');
-    sub = `El filtro BTC frena ${g.can_open_long ? 'SHORT' : 'LONG'}`;
+    const realBlocked = g.can_open_long ? 'SHORT' : 'LONG';
+    sub = inv ? `El filtro BTC frena las señales ${realBlocked === 'LONG' ? 'SHORT' : 'LONG'}, que abrirían ${realBlocked}`
+              : `El filtro BTC frena ${realBlocked}`;
   }
   tile('ilEntries', st, val, sub);
   setHTML(q('ilEntries').querySelector('[data-sides]'),
@@ -3667,8 +5134,9 @@ function renderGate(g) {
   // Panel de pausa
   setLamp(q('lampPause'), g.paused ? 'warn' : 'ok');
   setTxt('pauseText', g.paused
-    ? `En pausa: ${g.pause_reason || 'pausa manual'}. Las posiciones abiertas siguen con su TP, SL y DCA.`
+    ? `En pausa ${untilTxt(g.pause_until, g.pause_left_s, 'hasta que la reanudes')}${n(g.pause_until) ? ', luego se reanudan solas' : ''}. Motivo: ${g.pause_reason || 'pausa manual'}. Las posiciones abiertas siguen con su TP, SL y DCA.`
     : 'Sin pausa. Pausar frena solo las posiciones nuevas; las abiertas siguen con su TP, SL y DCA.');
+  q('pauseSeg').hidden = !!g.paused;
   const pb = q('pauseBtn');
   if (!pb.disabled) { setTxt(pb, g.paused ? 'Reanudar entradas' : 'Pausar entradas'); pb.className = 'btn block ' + (g.paused ? 'green' : 'amber'); }
 
@@ -3696,7 +5164,7 @@ function renderGate(g) {
     const who = /sin dato/.test(rs) ? 'Sin dato fresco, se frena'
       : (/alcista/.test(rs) && /bajista/.test(rs)) ? 'Los filtros frenan'
       : /alcista/.test(rs) ? 'El filtro alcista frena' : 'El filtro bajista frena';
-    sub = `${who} ${bL && bS ? 'LONG y SHORT' : bL ? 'LONG' : 'SHORT'}`;
+    sub = `${who} ${inv ? 'las señales ' : ''}${bL && bS ? 'LONG y SHORT' : bL ? 'LONG' : 'SHORT'}`;
   } else {
     sub = g.btc_enabled && g.btc_up_enabled ? `Entre ${sgn(thr, 1)} % y ${sgn(thrUp, 1)} %: pasa los dos filtros`
         : g.btc_enabled ? `Sobre ${sgn(thr, 1)} %: pasa el filtro bajista` : `Bajo ${sgn(thrUp, 1)} %: pasa el filtro alcista`;
@@ -3715,24 +5183,37 @@ function renderGate(g) {
   const edSig = [g.dca_ema_enabled, g.dca_ema_period, g.dca_ema_after].join('|');
   if (edSig !== _edSig) { _edSig = edSig; edExplain(); updateLadderMeta(); }
 
-  // 4) Stop global
-  const un = n(g.unrealized), stop = n(g.gstop_usd);
-  const used = (un < 0 && stop < 0) ? un / stop : 0;
-  st = !g.gstop_enabled ? 'off' : globalRun ? 'bad' : used >= 0.6 ? 'warn' : 'ok';
-  val = `<span class="${cls(un)}">${sgn(un, 2)}</span><small>/ ${fx(stop, 2)} USD</small>`;
+  // 4) Stop global (normales: −X) · TP global (invertidas: +X)
+  const stop = n(g.gstop_usd), tgt = -stop;
+  const unN = n(g.unreal_normal), unI = n(g.unreal_inverted);
   const last = g.gstop_last || {};
-  sub = !g.gstop_enabled ? 'Desactivado'
-      : n(g.gstop_triggers) ? `${g.gstop_triggers} disparo${g.gstop_triggers === 1 ? '' : 's'}, el último a las ${hhmm(last.ts)}`
-      : `Cierra todo al llegar a ${fx(stop, 2)} USD`;
-  tile('ilGstop', st, val, sub, g.gstop_enabled ? used : 0);
-  setTxt('cvGstop', g.gstop_enabled ? `${fx(stop, 2)} USD` : 'Apagado');
+  const trig = n(g.gstop_triggers)
+    ? `${g.gstop_triggers} disparo${g.gstop_triggers === 1 ? '' : 's'}, el último a las ${hhmm(last.ts)}` : '';
+  let bar;
+  if (!inv) {
+    bar = (unN < 0 && stop < 0) ? unN / stop : 0;
+    st = !g.gstop_enabled ? 'off' : globalRun ? 'bad' : bar >= 0.6 ? 'warn' : 'ok';
+    val = `<span class="${cls(unN)}">${sgn(unN, 2)}</span><small>/ ${fx(stop, 2)} USD</small>`;
+    sub = !g.gstop_enabled ? 'Desactivado' : trig || `Cierra todo al llegar a ${fx(stop, 2)} USD`;
+    if (g.gstop_enabled && n(g.open_inverted)) sub += `. Invertidas: ${sgn(unI, 2)} de +${fx(tgt, 2)}`;
+  } else {
+    bar = (unI > 0 && tgt > 0) ? unI / tgt : 0;
+    st = !g.gstop_enabled ? 'off' : globalRun ? 'warn' : 'ok';
+    val = `<span class="${cls(unI)}">${sgn(unI, 2)}</span><small>/ +${fx(tgt, 2)} USD</small>`;
+    sub = !g.gstop_enabled ? 'Desactivado' : trig || `Cierra las invertidas al llegar a +${fx(tgt, 2)} USD`;
+    if (g.gstop_enabled && n(g.open_normal)) sub += `. Normales: ${sgn(unN, 2)} de ${fx(stop, 2)}`;
+  }
+  tile('ilGstop', st, val, sub, g.gstop_enabled ? bar : 0);
+  setTxt('cvGstop', !g.gstop_enabled ? 'Apagado' : inv ? `+${fx(tgt, 2)} USD` : `${fx(stop, 2)} USD`);
   q('cvGstop').classList.toggle('on', !!g.gstop_enabled);
   setTxt('gsLast', n(g.gstop_triggers)
-    ? `Último disparo: ${last.at || hhmm(last.ts)} con PnL ${sgn(last.pnl, 2)} USD sobre ${n(last.positions)} posición(es).`
+    ? `Último disparo${last.kind === 'TP' ? ' (TP global)' : last.kind === 'SL' ? ' (stop global)' : ''}: ${last.at || hhmm(last.ts)} con PnL ${sgn(last.pnl, 2)} USD sobre ${n(last.positions)} posición(es).`
     : 'Aún no se ha disparado desde el arranque.');
 
-  // Formularios de riesgo
-  fillChk('gsEnabled', g.gstop_enabled); fillVal('gsUsd', fx(stop, 2)); fillChk('gsPause', g.gstop_pause);
+  // Formularios de riesgo (en modo invertido el stop global se muestra como TP global: +X)
+  fillChk('gsEnabled', g.gstop_enabled); fillVal('gsUsd', fx(inv ? tgt : stop, 2)); fillChk('gsPause', g.gstop_pause);
+  fillSeg('gsSeg', 'gsPauseMin', g.gstop_pause_min);
+  q('gsSeg').classList.toggle('dim', !q('gsPause').checked);
   fillChk('exEnabled', g.exposure_enabled); fillVal('exMax', +fx(mx, 2)); fillChk('exDca', g.exposure_include_dca);
   fillChk('btcEnabled', g.btc_enabled); fillVal('btcThr', +fx(thr, 2)); fillVal('btcMode', g.btc_mode || 'all');
   fillChk('btcUpEnabled', g.btc_up_enabled); fillVal('btcUpThr', +fx(thrUp, 2)); fillVal('btcUpMode', g.btc_up_mode || 'short');
@@ -3749,15 +5230,16 @@ function rangePos(pnl, sl, tp) {
   return [clamp01((n(pnl) - n(sl)) / span), clamp01((0 - n(sl)) / span)];
 }
 function posItem(p) {
-  const sym = p.symbol, side = p.direction === 'LONG' ? 'LONG' : 'SHORT';
+  const sym = p.symbol, side = p.direction === 'LONG' ? 'LONG' : 'SHORT', inv = !!p.inverted;
   const fills = Array.isArray(p.fills) ? p.fills : [];
   const pnl = n(p.unrealized_pnl);
   const [m, z] = rangePos(pnl, p.stop_loss_usd, p.target);
   const rows = fills.map((f, i) => `<tr><td>${i + 1}</td><td>${fmtN(f.level)} %</td><td>${fx(f.notional, 2)}</td><td>${px(f.entry_price)}</td><td>${f.qty}</td><td>${hhmm(f.opened_at)}</td></tr>`).join('');
+  const slPct = n(p.notional) > 0 ? fx(-n(p.stop_loss_usd) / n(p.notional) * 100, 2) : '0';
   return `<details id="prow_${sym}" data-sym="${sym}"${_openPos.has(sym) ? ' open' : ''}>
     <summary>
-      <span class="side ${side.toLowerCase()}">${side}</span>
-      <span class="pos-id"><b>${sym}</b><small>${fills.length} tramo${fills.length === 1 ? '' : 's'}, ${fx(p.notional, 2)} USDT</small></span>
+      <span class="side ${side.toLowerCase()}${inv ? ' inv' : ''}"${inv ? ` title="Invertida: la señal era ${esc(p.signal_dir)}"` : ''}>${side}</span>
+      <span class="pos-id"><b>${sym}${inv ? '<span class="inv-tag">INV</span>' : ''}</b><small>${fills.length} tramo${fills.length === 1 ? '' : 's'}, ${fx(p.notional, 2)} USDT${inv ? `, señal ${esc(p.signal_dir)}` : ''}${p.exec_url ? '' : ', solo bot'}</small></span>
       <span id="pc_${sym}" class="chg ${cls(p.change)}">${pctS(p.change)}</span>
       <span class="range" title="PnL entre el stop loss (izquierda) y el take profit (derecha)"><i class="zero" style="left:${(z * 100).toFixed(1)}%"></i><i class="mark" id="pm_${sym}" style="left:${(m * 100).toFixed(1)}%"></i></span>
       <span id="ppnl_${sym}" class="pnl ${cls(pnl)}">${sgn(pnl)}</span>
@@ -3768,20 +5250,23 @@ function posItem(p) {
         <div><dt>Entrada media</dt><dd>${px(p.avg_entry)}</dd></div>
         <div><dt>Precio actual</dt><dd id="pp_${sym}">${px(p.mark_price)}</dd></div>
         <div><dt>Cantidad</dt><dd>${p.qty}</dd></div>
-        <div><dt>Take profit</dt><dd class="pos">+${fx(p.target, 3)} USD</dd></div>
-        <div><dt>Stop loss</dt><dd><span id="psl_${sym}">${px(p.stop_loss_price)}</span> <small>${sgn(p.stop_loss_usd, 3)} USD, ${esc(p.sl_mode || '')}</small></dd></div>
+        <div><dt>Take profit</dt><dd><span class="pos">+${fx(p.target, 3)} USD</span> <small>a ${px(p.take_profit_price)}${inv ? ', ' + esc(p.sl_mode || '') : ''}</small></dd></div>
+        <div><dt>Stop loss</dt><dd><span id="psl_${sym}">${px(p.stop_loss_price)}</span> <small>${sgn(p.stop_loss_usd, 3)} USD, ${inv ? `−${slPct} % del notional` : esc(p.sl_mode || '')}</small></dd></div>
         <div><dt>MFE (mejor)</dt><dd id="pmfe_${sym}" class="pos">${sgn(p.mfe_usd)}</dd></div>
         <div><dt>MAE (peor)</dt><dd id="pmae_${sym}" class="neg">${sgn(p.mae_usd)}</dd></div>
         <div><dt>Abierta hace</dt><dd id="pdur_${sym}">${fmtDur(Date.now() / 1000 - n(p.opened_ts))}</dd></div>
         <div><dt>Trade</dt><dd>#${n(p.trade_id)}</dd></div>
+        <div><dt>Executor</dt><dd>${p.exec_url ? esc(p.exec_host) + (p.exec_current ? '' : ' <small>link anterior</small>')
+          : '<small>no se envió (link en pausa o sin link)</small>'}</dd></div>
       </dl>
       <p class="dca-next" id="pdca_${sym}" style="margin:0">${dcaHtml(p)}</p>
       <div class="tablewrap"><table class="fills">
-        <thead><tr><th>#</th><th>En contra</th><th>Notional</th><th>Precio</th><th>Cantidad</th><th>Hora</th></tr></thead>
+        <thead><tr><th>#</th><th>${inv ? 'A favor' : 'En contra'}</th><th>Notional</th><th>Precio</th><th>Cantidad</th><th>Hora</th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>
       <div class="actions">
-        <button class="btn" data-act="sl" data-sym="${sym}" data-sl="${n(p.stop_loss_usd)}">Editar stop loss</button>
+        ${inv ? `<button class="btn" data-act="tp" data-sym="${sym}" data-tp="${n(p.target)}">Editar take profit</button>`
+              : `<button class="btn" data-act="sl" data-sym="${sym}" data-sl="${n(p.stop_loss_usd)}">Editar stop loss</button>`}
         <a class="btn" href="https://www.binance.com/en/futures/${sym}" target="_blank" rel="noopener">Abrir en Binance</a>
         <button class="btn danger" data-act="close" data-sym="${sym}">Cerrar posición</button>
       </div>
@@ -3792,9 +5277,11 @@ function posItem(p) {
 function dcaHtml(p) {
   const d = p.dca_next || {};
   if (d.level === null || d.level === undefined) return 'Escalera completa: no quedan tramos DCA para esta posición.';
-  let s = `Próximo DCA: tramo ${n(d.idx) + 1}, <b>${fx(d.notional, 2)} USDT</b> al <b>${fmtN(d.level)} %</b> en contra (ahora ${sgn(d.adverse, 2)} %).`;
+  const inv = !!p.inverted;
+  let s = `Próximo DCA: tramo ${n(d.idx) + 1}, <b>${fx(d.notional, 2)} USDT</b> al <b>${fmtN(d.level)} %</b> ${inv ? 'a favor' : 'en contra'} (ahora ${sgn(d.adverse, 2)} %)`
+    + (inv ? ', donde añadiría el bot normal.' : '.');
   if (d.ema_applies) {
-    const where = p.direction === 'LONG' ? 'por encima' : 'por debajo';
+    const where = (d.ema_dir || p.direction) === 'LONG' ? 'por encima' : 'por debajo';
     s += (d.ema === null || d.ema === undefined)
       ? ` Exige el precio ${where} de la EMA ${n(d.ema_period)}, que aún no tiene velas suficientes: <b class="neg">frenado</b>.`
       : ` Exige el precio ${where} de la EMA ${n(d.ema_period)} (${px(d.ema)}): <b class="${d.ema_ok ? 'pos' : 'neg'}">${d.ema_ok ? 'se cumple' : 'no se cumple'}</b>.`;
@@ -3807,7 +5294,7 @@ function renderPositions(positions) {
   _posMeta = {};
   positions.forEach(p => { _posMeta[p.symbol] = { opened: n(p.opened_ts) }; });
   const sig = JSON.stringify(positions.map(p => [p.symbol, p.direction, p.avg_entry, p.qty, p.notional, p.target,
-    p.stop_loss_usd, p.sl_mode, (p.fills || []).length]));
+    p.stop_loss_usd, p.sl_mode, (p.fills || []).length, p.exec_url, p.exec_current, p.inverted]));
   if (sig !== _posSig) {
     _posSig = sig;
     const live = new Set(positions.map(p => p.symbol));
@@ -3829,15 +5316,16 @@ function patchPosition(sym, p) {
 }
 
 // ── Historial ───────────────────────────────────────────────────────────────
-const REASONS = { TP: ['tp', 'Take profit'], SL: ['sl', 'Stop loss'], MANUAL: ['manual', 'Manual'], GLOBAL: ['global', 'Stop global'] };
+const REASONS = { TP: ['tp', 'Take profit'], SL: ['sl', 'Stop loss'], MANUAL: ['manual', 'Manual'],
+                  GLOBAL: ['global', 'Stop global'], GLOBAL_TP: ['gtp', 'TP global'] };
 function renderHistory() {
   const closed = (_d && Array.isArray(_d.closed_trades)) ? _d.closed_trades : [];
-  const rows = closed.filter(t => _histFilter === 'ALL' || t.reason === _histFilter);
+  const rows = closed.filter(t => _histFilter === 'ALL' || (_histFilter === 'INV' ? !!t.inverted : t.reason === _histFilter));
   const html = rows.length ? rows.map(t => {
     const r = REASONS[t.reason] || ['', t.reason || '—'];
     return `<tr>
       <td data-label="Símbolo" class="sym">${esc(t.symbol)}</td>
-      <td data-label="Lado">${esc(t.direction || '—')}</td>
+      <td data-label="Lado"><span>${esc(t.direction || '—')}${t.inverted ? '<span class="inv-tag" title="Posición invertida">INV</span>' : ''}</span></td>
       <td data-label="Motivo"><span class="tag ${r[0]}">${esc(r[1])}</span></td>
       <td data-label="PnL" class="num ${cls(t.pnl)}">${sgn(t.pnl)}</td>
       <td data-label="MFE" class="pos">${t.mfe_usd === undefined ? '—' : sgn(t.mfe_usd)}</td>
@@ -3848,7 +5336,7 @@ function renderHistory() {
       <td data-label="Cooldown hasta" class="muted">${esc(t.unblock_at || '—')}</td>
       <td data-label="Cerrada" class="muted">${esc(t.closed_at || '')}</td>
     </tr>`;
-  }).join('') : `<tr><td colspan="11" class="muted">${closed.length ? 'Ningún cierre con ese motivo.' : 'Todavía no hay cierres.'}</td></tr>`;
+  }).join('') : `<tr><td colspan="11" class="muted">${!closed.length ? 'Todavía no hay cierres.' : _histFilter === 'INV' ? 'Ninguna posición invertida cerrada.' : 'Ningún cierre con ese motivo.'}</td></tr>`;
   setHTML(q('tbClosed'), html);
   const rp = n(_d && _d.total_realized_pnl);
   setHTML(q('histSum'), closed.length ? `${closed.length} cierres, realizado <b class="${cls(rp)}">${sgn(rp)} USDT</b>` : 'Sin cierres');
@@ -3865,7 +5353,7 @@ function renderCloseAll(ca, openN) {
   cancel.disabled = !!ca.cancel;
   wrap.style.display = (running || n(ca.started) > 0) ? 'block' : 'none';
   q('caBar').style.width = (running ? (total ? done / total * 100 : 0) : 100) + '%';
-  const origin = ca.origin === 'GLOBAL' ? 'Stop global: ' : '';
+  const origin = ca.origin === 'GLOBAL' ? 'Stop global: ' : ca.origin === 'GLOBAL_TP' ? 'TP global: ' : '';
   if (running) {
     msg.className = 'msg warn-t';
     setTxt(msg, origin + (ca.cancel ? 'deteniendo tras la operación en curso. ' : '') + (ca.current ? `Cerrando ${ca.current}. ` : 'Preparando. ')
@@ -3901,16 +5389,24 @@ function render(d) {
   renderPositions(positions);
   renderHistory();
 
-  // Ajustes: SL, TP, EMA, DCA
+  // Modo invertido (tarjeta, insignia y rótulos de los ajustes en espejo)
+  renderMode(!!d.inverted_mode, d.mirror_rules, d.gate || {});
+  const inv = !!d.inverted_mode;
+
+  // Ajustes: SL, TP, EMA, DCA (en modo invertido se muestran en espejo: mismo valor, otro signo)
   const frac = n(d.first_tranche_sl_fraction || 0.251), defSl = n(d.default_stop_loss_usd ?? -8);
-  setTxt('cvSl', `${fx(defSl, 2)} USD`);
-  setTxt('slHint', `Con 1 tramo el SL es el notional del tramo × ${frac} (por ejemplo, 5 USDT → ${fx(-5 * frac, 3)} USD). Desde el 2.º tramo se usa este SL estándar. Se aplica al instante a las posiciones abiertas.`);
-  fillVal('gslInput', fx(defSl, 2));
+  setTxt('cvSl', inv ? `+${fx(-defSl, 2)} USD` : `${fx(defSl, 2)} USD`);
+  setTxt('slHint', inv
+    ? `Con 1 tramo el TP es el notional del tramo × ${frac} (por ejemplo, 5 USDT → +${fx(5 * frac, 3)} USD). Desde el 2.º tramo se usa este TP estándar. Es el stop loss del modo normal con el signo cambiado: el mismo valor sigue siendo el SL de las posiciones normales.`
+    : `Con 1 tramo el SL es el notional del tramo × ${frac} (por ejemplo, 5 USDT → ${fx(-5 * frac, 3)} USD). Desde el 2.º tramo se usa este SL estándar. Se aplica al instante a las posiciones abiertas.`);
+  fillVal('gslInput', fx(inv ? -defSl : defSl, 2));
 
   const tpf = n(d.take_profit_fraction || 0.07);
-  setTxt('cvTp', `${+(tpf * 100).toFixed(2)} % del notional`);
-  fillVal('tpInput', +tpf.toFixed(4));
-  setHTML(q('tpPreview'), [5, 10, 20, 50, 100].map(v => `<span class="chip">${v} USDT gana <b>+${+(v * tpf).toFixed(3)}</b></span>`).join(''));
+  setTxt('cvTp', inv ? `−${+(tpf * 100).toFixed(2)} % del notional` : `${+(tpf * 100).toFixed(2)} % del notional`);
+  fillVal('tpInput', inv ? -(+tpf.toFixed(4)) : +tpf.toFixed(4));
+  setHTML(q('tpPreview'), [5, 10, 20, 50, 100].map(v => inv
+    ? `<span class="chip">${v} USDT pierde <b>−${+(v * tpf).toFixed(3)}</b></span>`
+    : `<span class="chip">${v} USDT gana <b>+${+(v * tpf).toFixed(3)}</b></span>`).join(''));
 
   const kw = d.kline_ws || {};
   if (d.ema_fast !== undefined) {
@@ -3961,7 +5457,9 @@ function render(d) {
   setTxt('klPairs', `${n(kw.pairs_with_data)} de ${n(kw.tracked)}`);
   setTxt('klSignals', `${n(kw.signals)}` + (n(kw.stale_signals) ? ` (${n(kw.stale_signals)} viejos)` : ''));
   setTxt('rbSafety', n(d.safety_tick_secs) > 0 ? `cada ${n(d.safety_tick_secs)} s` : 'apagada');
-  setTxt('executorStatus', d.executor_url ? d.executor_url.replace(/^https?:\/\//, '').split('/')[0] : 'No configurado');
+  setTxt('executorStatus', d.executor_url ? hostOf(d.executor_url).split('/')[0] + ((d.executor || {}).paused ? ' (en pausa)' : '') : 'No configurado');
+  renderExecutor(d.executor);
+  renderProxy(d.rest_proxy);
   setTxt('uptime', fmtDur(d.uptime_seconds));
   setTxt('diagSum', `${d.ws_connected ? 'WebSocket conectado' : 'WebSocket desconectado'}, ${fx(d.eval_rate, 0)} evaluaciones/s`);
 
@@ -3972,7 +5470,8 @@ function render(d) {
     const stamp = (i > 0 && !isNaN(dt)) ? dt.toLocaleTimeString('es-CO', { hour12: false }) : '';
     const text = i > 0 ? line.slice(i + 3) : line;
     const k = /STOP GLOBAL|STOP LOSS|Error|error|falló|⛔|🛑/.test(text) ? 'bad'
-      : /CIERRE TP|REANUDADAS/.test(text) ? 'good' : /PAUSA|frenada|⚠️|CIERRE MASIVO/.test(text) ? 'warn' : '';
+      : /CIERRE TP|REANUDAD|vuelve a responder|TP GLOBAL/.test(text) ? 'good'
+      : /PAUSA|frenada|⚠️|CIERRE MASIVO|LINK CAMBIADO|MODO INVERTIDO|MODO NORMAL|bloquead|limitad|fuera (durante|hasta)|\(407:/.test(text) ? 'warn' : '';
     return `<li class="${k}"><time>${esc(stamp)}</time><span>${esc(text)}</span></li>`;
   }).join(''));
 
@@ -3999,6 +5498,7 @@ function applyLive(l) {
   setTxt('pnl', sgn(pu)); q('pnl').className = 'big ' + cls(pu);
   renderCloseAll(l.close_all, keys.length);
   renderGate(l.gate);
+  if (l.executor) renderExecutor(l.executor, true);
   setTxt('scanCount', String(n(l.scan_count)));
   setTxt('evalRate', fx(l.eval_rate, 0));
   setTxt('latency', `${fx(l.latency_avg_ms, 1)} ms media, ${fx(l.latency_max_ms, 1)} máx`);
@@ -4015,15 +5515,19 @@ function renderStats(s) {
   setTxt('stMfe', all && all.n ? '+' + fx(all.mfe_usd.median, 3) : '—');
   setTxt('stMae', all && all.n ? '−' + fx(all.mae_usd.median, 3) : '—');
   setTxt('statsSum', s.count ? `${n(s.count)} operaciones, acierto ${fx(s.win_rate, 1)} %, PnL total ${sgn(s.total_pnl)}` : 'Mejor y peor PnL alcanzado por cada operación');
-  const names = { ALL: 'Todas', TP: 'Take profit', SL: 'Stop loss', MANUAL: 'Manual', GLOBAL: 'Stop global' };
-  const rows = ['ALL', 'TP', 'SL', 'MANUAL', 'GLOBAL'].filter(k => (s.groups || {})[k] && s.groups[k].n).map(k => {
-    const g = s.groups[k];
-    return `<tr><td>${names[k]}</td><td>${g.n}</td>
+  const names = { ALL: 'Todas', TP: 'Take profit', SL: 'Stop loss', MANUAL: 'Manual', GLOBAL: 'Stop global',
+                  GLOBAL_TP: 'TP global', NORMAL: 'Normales', INVERTED: 'Invertidas' };
+  const G = s.groups || {}, hasInv = !!(G.INVERTED && G.INVERTED.n);
+  const keys = ['ALL', 'TP', 'SL', 'MANUAL', 'GLOBAL', 'GLOBAL_TP'].concat(hasInv ? ['NORMAL', 'INVERTED'] : []);
+  setTxt('slSimTitle', 'Take profits que cada SL habría cortado' + (hasInv ? ' (solo posiciones normales)' : ''));
+  const rows = keys.filter(k => G[k] && G[k].n).map(k => {
+    const g = G[k], tot = n(g.pnl && g.pnl.mean) * n(g.n);
+    return `<tr><td>${names[k]}</td><td>${g.n}</td><td class="num ${cls(tot)}">${sgn(tot, 2)}</td>
       <td class="pos">${fx(g.mfe_usd.median, 3)}</td><td class="pos">${fx(g.mfe_usd.p90, 3)}</td>
       <td class="neg">${fx(g.mae_usd.median, 3)}</td><td class="neg">${fx(g.mae_usd.p90, 3)}</td>
       <td>${fx(g.mfe_pct.median, 1)} %</td><td>${fx(g.mae_pct.median, 1)} %</td><td>${fmtDur(g.duration_s.median)}</td></tr>`;
   });
-  setHTML(q('tbStatGroups'), rows.length ? rows.join('') : '<tr><td colspan="9" class="muted">Sin datos aún</td></tr>');
+  setHTML(q('tbStatGroups'), rows.length ? rows.join('') : '<tr><td colspan="10" class="muted">Sin datos aún</td></tr>');
   const sim = Array.isArray(s.sl_sim) ? s.sl_sim : [];
   setHTML(q('tbSlSim'), sim.length && sim[0].tp_total
     ? sim.map(r => `<tr><td>${fx(r.sl, 1)}</td><td>${r.tp_stopped} de ${r.tp_total}</td>
@@ -4040,14 +5544,165 @@ async function loadStats() {
 // ── Acciones ────────────────────────────────────────────────────────────────
 async function togglePause() {
   const btn = q('pauseBtn'), resume = !!(_gate && _gate.paused);
-  if (!resume && !confirm('¿Pausar la apertura de posiciones nuevas?\n\nLas posiciones abiertas siguen con su TP, SL y DCA.')) return;
+  const body = { paused: !resume, reason: 'Pausa manual' };
+  let okMsg = 'Entradas reanudadas';
+  if (!resume) {
+    const dv = segValue('pauseSeg', 'pauseMin');
+    if (dv.error) { toast(dv.error, 'bad'); q('pauseMin').focus(); return; }
+    const how = dv.minutes ? `durante ${fmtMin(dv.minutes)} (luego se reanudan solas)` : 'hasta que las reanudes';
+    if (!confirm(`¿Pausar la apertura de posiciones nuevas ${how}?\n\nLas posiciones abiertas siguen con su TP, SL y DCA.`)) return;
+    body.minutes = dv.minutes;
+    if (dv.minutes) lsSet('pauseMin', String(dv.minutes));
+    okMsg = dv.minutes ? `Entradas en pausa durante ${fmtMin(dv.minutes)}` : 'Entradas en pausa hasta que las reanudes';
+  }
   busy(btn, true);
   try {
-    await postJSON('/api/pause', { paused: !resume, reason: 'Pausa manual' });
-    toast(resume ? 'Entradas reanudadas' : 'Entradas en pausa', 'ok');
+    const data = await postJSON('/api/pause', body);
+    if (_gate) Object.assign(_gate, { paused: data.paused, pause_until: data.pause_until });
+    toast(okMsg, 'ok');
     requestFull(true);
   } catch (e) { toast('No se pudo cambiar la pausa: ' + e.message, 'bad'); }
   finally { busy(btn, false, resume ? 'Pausar entradas' : 'Reanudar entradas'); }
+}
+
+// ── Executor: estado, link en caliente y pausa del envío ────────────────────
+let _ex = null;
+function renderExecutor(ex, partial) {
+  if (!ex) return;
+  _ex = partial ? { ...(_ex || {}), ...ex } : ex;
+  const e = _ex, url = e.url || '';
+  const errRecent = n(e.sent_err) > 0 && n(e.last_err_ts) > n(e.last_ok_ts);
+  const st = !url ? 'off' : e.paused ? 'warn' : errRecent ? 'bad' : 'ok';
+  setLamp(q('lampExec'), st);
+  setLamp(q('lampExecCard'), st);
+  setTxt('lblExec', 'Executor: ' + (!url ? 'sin link' : e.paused ? 'en pausa' : errRecent ? 'con errores' : 'enviando'));
+  setTxt('execHost', url ? hostOf(url) : 'sin link');
+  q('execHost').title = url;
+  let txt;
+  if (!url) txt = 'Sin link: el bot opera pero no envía señales a ningún executor.';
+  else if (e.paused) txt = `En pausa ${untilTxt(e.pause_until, e.pause_left_s, 'hasta que lo reanudes')}: las posiciones nuevas no se envían al executor. Las que ya están en él siguen recibiendo su DCA y su cierre.`;
+  else txt = 'Enviando las posiciones nuevas al executor.';
+  if (url && e.sent_ok !== undefined) {
+    const ok = n(e.sent_ok), bad = n(e.sent_err);
+    txt += ` ${ok} señal${ok === 1 ? '' : 'es'} enviada${ok === 1 ? '' : 's'} desde el arranque`
+      + (bad ? `, ${bad} con error` + (errRecent ? ` (la última a las ${hhmm(e.last_err_ts)}: ${e.last_err})` : '') : '') + '.';
+  }
+  const k = n(e.open_on_other);
+  if (k) txt += k === 1 ? ' 1 posición abierta sigue en el link anterior hasta cerrarse.'
+                        : ` ${k} posiciones abiertas siguen en el link anterior hasta cerrarse.`;
+  setTxt('execText', txt);
+  q('execSeg').hidden = !!e.paused || !url;
+  const pb = q('execPauseBtn');
+  if (!pb.dataset.busy) {
+    setTxt(pb, e.paused ? 'Reanudar envío al executor' : 'Pausar envío al executor');
+    pb.className = 'btn block ' + (e.paused ? 'green' : 'amber');
+    pb.disabled = !url && !e.paused;
+  }
+  if (e.env_url !== undefined) {
+    setTxt('execHint', e.env_url && e.env_url !== url ? `El de arranque (EXECUTOR_URL) es ${hostOf(e.env_url)}.` : '');
+  }
+  fillVal('execUrl', url);
+  execDirty();
+}
+function execDirty() {
+  const inp = q('execUrl'), cur = (_ex && _ex.url) || '', val = normUrl(inp.value);
+  const changed = val !== cur;
+  if (changed) inp.dataset.dirty = '1'; else delete inp.dataset.dirty;
+  const btn = q('execSave');
+  if (!btn.dataset.busy) btn.disabled = !changed;
+  const nOpen = n(_ex && _ex.open_on_current);
+  const showMove = changed && !!cur && !!val && nOpen > 0;
+  q('execMoveWrap').hidden = !showMove;
+  if (showMove) setTxt('execMoveTxt', `Mandar también el DCA y el cierre de ${nOpen === 1 ? 'la posición abierta' : `las ${nOpen} posiciones abiertas`} al link nuevo (solo si es el mismo executor con otra dirección)`);
+}
+async function saveExecUrl() {
+  const inp = q('execUrl'), btn = q('execSave'), val = normUrl(inp.value), cur = (_ex && _ex.url) || '';
+  if (val === cur) return;
+  const move = !q('execMoveWrap').hidden && q('execMove').checked;
+  const nOpen = n(_ex && _ex.open_on_current);
+  let msg = val ? `¿Cambiar el link del executor a\n${val}?\n\nLas posiciones nuevas se enviarán ahí.`
+                : '¿Quitar el link del executor?\n\nEl bot seguirá operando pero no enviará señales.';
+  if (cur && val && nOpen) msg += move ? `\nLas ${nOpen} posiciones abiertas también pasan al link nuevo (su DCA y su cierre irán ahí).`
+                                       : `\nLas ${nOpen} posiciones abiertas seguirán recibiendo su DCA y su cierre en el link anterior.`;
+  if (!confirm(msg)) return;
+  btn.dataset.busy = '1';
+  busy(btn, true);
+  try {
+    const data = await postJSON('/api/executor/url', { url: val, move_open: move });
+    delete inp.dataset.dirty;
+    q('execMove').checked = false;
+    setTxt('execMsg', '');
+    renderExecutor(data.executor);
+    toast(!data.changed ? 'El link no cambió' : val ? `Link del executor: ${hostOf(val)}` : 'Link del executor quitado', 'ok');
+    requestFull(true);
+  } catch (e) { toast('No se guardó el link: ' + e.message, 'bad'); }
+  finally { delete btn.dataset.busy; busy(btn, false, 'Guardar link'); execDirty(); }
+}
+async function testExecUrl() {
+  const btn = q('execTest'), val = normUrl(q('execUrl').value) || ((_ex && _ex.url) || ''), m = q('execMsg');
+  if (!val) { toast('Escribe un link para probarlo.', 'bad'); return; }
+  btn.disabled = true; setTxt(btn, 'Probando…');
+  m.className = 'msg muted'; setTxt(m, `Probando ${hostOf(val)}…`);
+  try {
+    const d = await postJSON('/api/executor/test', { url: val });
+    if (d.reachable) { m.className = 'msg pos'; setTxt(m, `${hostOf(val)} responde (HTTP ${d.status}, ${n(d.ms)} ms).`); }
+    else {
+      m.className = 'msg neg';
+      setTxt(m, `${hostOf(val)} no responde: ${d.detail || 'sin respuesta'}.`
+        + (/timed out|timeout/i.test(d.detail || '') ? ' Si estaba dormido, vuelve a probar en un minuto.' : ''));
+    }
+  } catch (e) { m.className = 'msg neg'; setTxt(m, e.message); }
+  finally { btn.disabled = false; setTxt(btn, 'Probar'); }
+}
+async function toggleExecPause() {
+  const btn = q('execPauseBtn'), resume = !!(_ex && _ex.paused);
+  const body = { paused: !resume, reason: 'Pausa manual' };
+  let okMsg = 'Envío al executor reanudado';
+  if (!resume) {
+    const dv = segValue('execSeg', 'execMin');
+    if (dv.error) { toast(dv.error, 'bad'); q('execMin').focus(); return; }
+    const how = dv.minutes ? `durante ${fmtMin(dv.minutes)} (luego se reanuda solo)` : 'hasta que lo reanudes';
+    if (!confirm(`¿Pausar el envío de posiciones nuevas al executor ${how}?\n\nEl bot sigue operando. Las posiciones que ya están en el executor siguen recibiendo su DCA y su cierre.`)) return;
+    body.minutes = dv.minutes;
+    if (dv.minutes) lsSet('execMin', String(dv.minutes));
+    okMsg = dv.minutes ? `Envío al executor en pausa durante ${fmtMin(dv.minutes)}` : 'Envío al executor en pausa hasta que lo reanudes';
+  }
+  btn.dataset.busy = '1';
+  busy(btn, true);
+  try {
+    const data = await postJSON('/api/executor/pause', body);
+    delete btn.dataset.busy;
+    busy(btn, false);
+    renderExecutor(data.executor);
+    toast(okMsg, 'ok');
+    requestFull(true);
+  } catch (e) { toast('No se pudo cambiar la pausa del executor: ' + e.message, 'bad'); }
+  finally { if (btn.dataset.busy) { delete btn.dataset.busy; busy(btn, false); renderExecutor(_ex); } }
+}
+
+// ── Proxies de arranque (diagnóstico) ───────────────────────────────────────
+function renderProxy(rp) {
+  if (!rp) return;
+  const box = q('proxyBox'), el = q('proxyStatus');
+  if (!rp.configured) { setTxt(el, 'Sin proxies'); el.className = 'muted'; box.hidden = true; return; }
+  box.hidden = false;
+  setTxt(el, rp.active ? `Activos, quedan ${fmtDur(rp.window_left_s)}` : 'Terminados, REST directo');
+  el.className = rp.active ? 'pos' : 'muted';
+  setTxt('proxySum', `Proxies de arranque: ${n(rp.n_proxies)} proxies, ${rp.mode === 'always' ? 'siempre por proxy' : 'modo automático'}, `
+    + (rp.active ? `quedan ${fmtDur(rp.window_left_s)} de ${n(rp.hours)} h` : `ventana de ${n(rp.hours)} h terminada`)
+    + `. ${n(rp.via_proxy)} descargas por proxy y ${n(rp.direct)} directas (${n(rp.klines)} de velas).`);
+  const ST = { ok: ['pos', 'Disponible'], cooling: ['warn-t', 'En pausa'], off: ['neg', 'Fuera'], limit: ['warn-t', 'Al tope de peso'] };
+  setHTML(q('tbProxy'), (rp.routes || []).map(r => {
+    const s = ST[r.state] || ['', r.state];
+    return `<tr>
+      <td data-label="Salida"><span><b>${esc(r.name)}</b> <span class="muted">${esc(r.label)}</span></span></td>
+      <td data-label="Estado"><span><span class="${s[0]}">${s[1]}${r.state === 'cooling' ? ' ' + fmtDur(r.cool_left_s) : ''}</span>${r.reason ? ` <small class="muted">${esc(r.reason)}</small>` : ''}</span></td>
+      <td data-label="OK">${n(r.ok)}</td>
+      <td data-label="Fallos">${n(r.fail)}</td>
+      <td data-label="Peso del minuto">${n(r.weight)} / ${n(rp.weight_limit)}</td>
+      <td data-label="Última respuesta">${n(r.last_status) ? `HTTP ${n(r.last_status)}, ${hhmm(r.last_ts)}` : '—'}</td>
+    </tr>`;
+  }).join(''));
 }
 
 async function saveRisk(btnId, body, okMsg) {
@@ -4063,13 +5718,28 @@ async function saveRisk(btnId, body, okMsg) {
   finally { busy(btn, false); }
 }
 function saveGlobalStop() {
-  const usd = negVal('gsUsd'), enabled = q('gsEnabled').checked;
-  if (isNaN(usd)) { toast('Escribe la pérdida a la que se cierra todo, por ejemplo 5 o -5.', 'bad'); return; }
-  const un = _gate ? n(_gate.unrealized) : 0, open = _gate ? n(_gate.open_positions) : 0;
-  if (enabled && open > 0 && un <= usd &&
-      !confirm(`El PnL no realizado ya es ${sgn(un, 2)} USD, así que el stop global cerrará todas las posiciones de inmediato.\n\n¿Guardar igualmente?`)) return;
-  saveRisk('gsSave', { global_stop_enabled: enabled, global_stop_usd: usd, global_stop_pause: q('gsPause').checked },
-    enabled ? `Stop global guardado en ${fx(usd, 2)} USD` : 'Stop global desactivado');
+  // Se guarda siempre como pérdida (−X). En modo invertido el campo muestra +X (TP global):
+  // negVal acepta 5, +5 o −5 y devuelve −5 en los dos casos.
+  const inv = !!_inv, usd = negVal('gsUsd'), enabled = q('gsEnabled').checked;
+  if (isNaN(usd)) {
+    toast(inv ? 'Escribe la ganancia a la que se cierran las invertidas, por ejemplo 5.'
+              : 'Escribe la pérdida a la que se cierra todo, por ejemplo 5 o -5.', 'bad');
+    return;
+  }
+  const pause = q('gsPause').checked, dv = segValue('gsSeg', 'gsPauseMin');
+  if (pause && dv.error) { toast(dv.error, 'bad'); q('gsPauseMin').focus(); return; }
+  const g = _gate || {};
+  const unN = n(g.unreal_normal), nN = n(g.open_normal), unI = n(g.unreal_inverted), nI = n(g.open_inverted);
+  if (enabled && nN > 0 && unN <= usd &&
+      !confirm(`El PnL de las posiciones normales ya es ${sgn(unN, 2)} USD, así que el stop global las cerrará de inmediato.\n\n¿Guardar igualmente?`)) return;
+  if (enabled && nI > 0 && unI >= -usd &&
+      !confirm(`El PnL de las posiciones invertidas ya es ${sgn(unI, 2)} USD, así que el TP global las cerrará de inmediato.\n\n¿Guardar igualmente?`)) return;
+  const body = { global_stop_enabled: enabled, global_stop_usd: usd, global_stop_pause: pause };
+  if (!dv.error) body.global_stop_pause_min = dv.minutes || 0;
+  const what = inv ? 'TP global' : 'Stop global';
+  saveRisk('gsSave', body, !enabled ? `${what} desactivado`
+    : `${what} guardado en ${inv ? '+' + fx(-usd, 2) : fx(usd, 2)} USD` + (!pause ? ', sin pausa'
+      : dv.minutes ? `, pausa de ${fmtMin(dv.minutes)}` : ', pausa hasta reanudar'));
 }
 function saveExposure() {
   const mx = numVal('exMax');
@@ -4242,25 +5912,30 @@ async function ladderReset() {
 }
 
 async function saveGlobalSl() {
-  const v = negVal('gslInput'), btn = q('gslSave');
-  if (isNaN(v)) { toast('Escribe el stop loss en USD, por ejemplo 8 o -8.', 'bad'); return; }
+  // Mismo valor para los dos modos: SL estándar de las normales (−X) = TP estándar de las invertidas (+X)
+  const inv = !!_inv, v = negVal('gslInput'), btn = q('gslSave');
+  if (isNaN(v)) { toast(inv ? 'Escribe el take profit en USD, por ejemplo 8.' : 'Escribe el stop loss en USD, por ejemplo 8 o -8.', 'bad'); return; }
   busy(btn, true);
   try {
     const data = await postJSON('/api/set-default-sl', { sl_usd: v, override_manual: q('gslOverride').checked });
     clearDirty(btn.closest('[data-panel]'));
-    toast(`Stop loss estándar en ${fx(v, 2)} USD, ${(data.updated || []).length} posición(es) actualizada(s)`, 'ok');
+    toast(`${inv ? 'Take profit estándar en +' + fx(-v, 2) : 'Stop loss estándar en ' + fx(v, 2)} USD, ${(data.updated || []).length} posición(es) actualizada(s)`, 'ok');
     requestFull(true);
   } catch (e) { toast('No se guardó: ' + e.message, 'bad'); }
   finally { busy(btn, false); }
 }
 async function saveTp() {
-  const v = numVal('tpInput'), btn = q('tpSave');
-  if (isNaN(v) || v < 0.001 || v > 5) { toast('El multiplicador va de 0.001 a 5, por ejemplo 0.07.', 'bad'); return; }
+  // Mismo multiplicador: TP de las normales (+notional×f) = SL de las invertidas (−notional×f)
+  const inv = !!_inv, v = Math.abs(numVal('tpInput')), btn = q('tpSave');
+  if (isNaN(v) || v < 0.001 || v > 5) {
+    toast(inv ? 'El multiplicador va de 0.001 a 5, por ejemplo -0.1.' : 'El multiplicador va de 0.001 a 5, por ejemplo 0.07.', 'bad');
+    return;
+  }
   busy(btn, true);
   try {
     await postJSON('/api/set-take-profit', { fraction: v });
     clearDirty(btn.closest('[data-panel]'));
-    toast(`Take profit en ${+(v * 100).toFixed(2)} % del notional`, 'ok');
+    toast(inv ? `Stop loss en −${+(v * 100).toFixed(2)} % del notional` : `Take profit en ${+(v * 100).toFixed(2)} % del notional`, 'ok');
     requestFull(true);
   } catch (e) { toast('No se guardó: ' + e.message, 'bad'); }
   finally { busy(btn, false); }
@@ -4301,22 +5976,122 @@ async function closePosition(sym, btn) {
 }
 
 // Modal SL por posición
-let _slSym = null;
-function editStopLoss(sym, cur) {
-  _slSym = sym; setTxt('slModalSymbol', sym);
-  q('slModalInput').value = cur; q('slModalError').style.display = 'none';
+let _slSym = null, _slKind = 'sl';
+// kind 'sl': SL manual de una posición normal · 'tp': TP manual de una invertida (su espejo)
+function editStopLoss(sym, cur, kind = 'sl') {
+  _slSym = sym; _slKind = kind; setTxt('slModalSymbol', sym);
+  setTxt('slModalWhat', kind === 'tp' ? 'Take profit' : 'Stop loss');
+  setTxt('slModalLbl', kind === 'tp' ? 'Ganancia objetivo en USD. Un TP fijado a mano no lo cambia el bot.'
+                                     : 'Pérdida máxima en USD. Un SL fijado a mano no lo cambia el bot.');
+  setTxt('slModalSave', kind === 'tp' ? 'Guardar take profit' : 'Guardar stop loss');
+  q('slModalInput').value = kind === 'tp' ? +n(cur).toFixed(4) : cur; q('slModalError').style.display = 'none';
   q('slModalOverlay').style.display = 'flex';
   setTimeout(() => q('slModalInput').focus(), 50);
 }
 function closeSlModal() { q('slModalOverlay').style.display = 'none'; _slSym = null; }
 async function saveSlModal() {
   if (!_slSym) return;
-  const v = negVal('slModalInput'), btn = q('slModalSave');
-  if (isNaN(v)) { setTxt('slModalError', 'Escribe la pérdida máxima, por ejemplo 5 o -5.'); q('slModalError').style.display = 'block'; return; }
+  const btn = q('slModalSave'), err = q('slModalError'), sym = _slSym;
+  if (_slKind === 'tp') {
+    const raw = numVal('slModalInput'), v = Math.abs(raw);
+    if (!(v > 0)) { setTxt(err, 'Escribe la ganancia objetivo, por ejemplo 8.'); err.style.display = 'block'; return; }
+    busy(btn, true);
+    try { await postJSON(`/api/set-tp/${sym}`, { tp_usd: v }); toast(`Take profit de ${sym} en +${fx(v, 2)} USD`, 'ok'); closeSlModal(); requestFull(true); }
+    catch (e) { setTxt(err, e.message); err.style.display = 'block'; }
+    finally { busy(btn, false); }
+    return;
+  }
+  const v = negVal('slModalInput');
+  if (isNaN(v)) { setTxt(err, 'Escribe la pérdida máxima, por ejemplo 5 o -5.'); err.style.display = 'block'; return; }
   busy(btn, true);
-  try { await postJSON(`/api/set-sl/${_slSym}`, { sl_usd: v }); toast(`Stop loss de ${_slSym} en ${fx(v, 2)} USD`, 'ok'); closeSlModal(); requestFull(true); }
-  catch (e) { setTxt('slModalError', e.message); q('slModalError').style.display = 'block'; }
+  try { await postJSON(`/api/set-sl/${sym}`, { sl_usd: v }); toast(`Stop loss de ${sym} en ${fx(v, 2)} USD`, 'ok'); closeSlModal(); requestFull(true); }
+  catch (e) { setTxt(err, e.message); err.style.display = 'block'; }
   finally { busy(btn, false); }
+}
+
+// ── Modo invertido: un solo botón ───────────────────────────────────────────
+let _inv = null, _rules = null;
+function setBtnLabel(id, txt) {
+  const b = q(id); if (!b) return;
+  if (b.disabled && b.dataset.label) b.dataset.label = txt; else setTxt(b, txt);
+}
+// Rótulos de los ajustes: en modo invertido se ven en espejo (TP ↔ SL, stop global → TP global)
+function applyModeLabels(inv) {
+  setTxt('gsName', inv ? 'Take profit global por PnL' : 'Stop global por PnL');
+  setTxt('gsEnabledTxt', inv ? 'TP global activado' : 'Stop global activado');
+  setTxt('gsHint', inv
+    ? 'Si la suma del PnL no realizado de las posiciones invertidas llega a este valor, el bot las cierra todas a mercado, una a una. Es el stop global del modo normal con el signo cambiado.'
+    : 'Si la suma del PnL no realizado de las posiciones normales llega a este valor, el bot las cierra todas a mercado, una a una.');
+  setTxt('gsUsdLbl', inv ? 'Cerrar las invertidas cuando su PnL no realizado sea igual o mayor que (USD)'
+                         : 'Cerrar todo cuando el PnL no realizado sea igual o menor que (USD)');
+  q('gsUsd').placeholder = inv ? '5' : '-5';
+  setBtnLabel('gsSave', inv ? 'Guardar TP global' : 'Guardar stop global');
+  setTxt('slName', inv ? 'Take profit por posición' : 'Stop loss por posición');
+  setTxt('gslLbl', inv ? 'Take profit estándar para 2 o más tramos (USD)' : 'Stop loss estándar para 2 o más tramos (USD)');
+  setTxt('gslOverrideTxt', inv ? 'Sobrescribir también los TP fijados a mano' : 'Sobrescribir también los SL fijados a mano');
+  q('gslInput').placeholder = inv ? '8' : '-8';
+  setBtnLabel('gslSave', inv ? 'Guardar take profit' : 'Guardar stop loss');
+  setTxt('tpName', inv ? 'Stop loss' : 'Take profit');
+  setTxt('tpHint', inv
+    ? 'Stop loss de cada posición = −(notional × multiplicador). Es el take profit del modo normal con el signo cambiado; se aplica al instante a las posiciones abiertas.'
+    : 'Objetivo de cada posición = notional × multiplicador. Se aplica al instante a las posiciones abiertas.');
+  setTxt('tpLbl', inv ? 'Multiplicador (−0.1 = −10 % del notional)' : 'Multiplicador (0.07 = 7 % del notional)');
+  q('tpInput').placeholder = inv ? '-0.1' : '0.07';
+  setBtnLabel('tpSave', inv ? 'Guardar stop loss' : 'Guardar take profit');
+  setTxt('ilGstopName', inv ? 'TP global' : 'Stop global');
+  // El signo de esos campos cambia: se descarta lo que estuviera a medio editar
+  ['gsUsd', 'gslInput', 'tpInput'].forEach(id => { const el = q(id); delete el.dataset.dirty; if (document.activeElement === el) el.blur(); });
+}
+function renderMode(inv, rules, g) {
+  if (rules) _rules = rules;
+  if (inv !== _inv) { _inv = inv; applyModeLabels(inv); }
+  const r = _rules || {};
+  g = g || _gate || {};
+  setLamp(q('lampInv'), inv ? 'inv' : 'off');
+  setTxt('invState', inv ? 'Activo' : 'Apagado');
+  q('ctlInv').classList.toggle('inv-on', inv);
+  q('invBadge').hidden = !inv;
+  const others = inv ? n(g.open_normal) : n(g.open_inverted);
+  const kind = inv ? 'normal' : 'invertida';
+  setTxt('invText', (inv
+    ? 'Activo: cada posición nueva hace lo contrario del bot normal, en los mismos precios.'
+    : 'Apagado. Al activarlo, cada posición nueva hará lo contrario del bot normal, en los mismos precios:')
+    + (others ? ` ${others} posición${others === 1 ? '' : 'es'} ${kind}${others === 1 ? '' : 'es'} abierta${others === 1 ? '' : 's'} sigue${others === 1 ? '' : 'n'} con sus reglas hasta cerrarse.` : ''));
+  if (r.tp_std !== undefined) {
+    const items = [
+      ['Señal', 'UP → SHORT · DOWN → LONG'],
+      ['Take profit', `+${fx(r.tp_first, 3)} USD con 1 tramo, +${fx(r.tp_std, 2)} USD desde el 2.º`],
+      ['Stop loss', `−${+(n(r.sl_fraction) * 100).toFixed(2)} % del notional (−${+n(r.sl_fraction).toFixed(4)})`],
+      ['TP global', r.global_on ? `+${fx(r.global_tp, 2)} USD` : 'apagado (el stop global está desactivado)'],
+      ['DCA', 'en los mismos precios que el normal: cuando el precio va a favor'],
+    ];
+    setHTML(q('invMap'), items.map(([k, v]) => `<li><span>${k}</span><b>${esc(v)}</b></li>`).join(''));
+  }
+  const b = q('invBtn');
+  if (!b.disabled) { setTxt(b, inv ? 'Volver al modo normal' : 'Activar modo invertido'); b.className = 'btn block ' + (inv ? 'green' : 'violet'); }
+}
+async function toggleInvert() {
+  const btn = q('invBtn'), on = !_inv, r = _rules || {};
+  const msg = on
+    ? '¿Activar el modo invertido?\n\nLas posiciones NUEVAS harán lo contrario del bot normal, en los mismos precios:\n'
+      + '• Señal UP → SHORT, DOWN → LONG\n'
+      + `• Take profit +${fx(r.tp_first, 3)} USD con 1 tramo, +${fx(r.tp_std, 2)} USD desde el 2.º\n`
+      + `• Stop loss −${+(n(r.sl_fraction) * 100).toFixed(2)} % del notional\n`
+      + `• TP global ${r.global_on ? '+' + fx(r.global_tp, 2) + ' USD' : 'apagado'}\n`
+      + '• DCA en los mismos precios que el normal (cuando el precio va a favor)\n\n'
+      + 'Las posiciones abiertas no cambian.'
+    : '¿Volver al modo normal?\n\nLas posiciones nuevas se abrirán en la dirección de la señal. Las invertidas abiertas siguen con sus reglas hasta cerrarse.';
+  if (!confirm(msg)) return;
+  busy(btn, true);
+  try {
+    const data = await postJSON('/api/invert', { inverted: on });
+    if (_gate) _gate.inverted_mode = !!data.inverted_mode;
+    btn.disabled = false;
+    renderMode(!!data.inverted_mode, data.rules, _gate);
+    toast(on ? 'Modo invertido activado: las posiciones nuevas se abren al revés' : 'Modo normal: las posiciones nuevas siguen la señal', 'ok');
+    requestFull(true);
+  } catch (e) { toast('No se pudo cambiar el modo: ' + e.message, 'bad'); }
+  finally { busy(btn, false, _inv ? 'Volver al modo normal' : 'Activar modo invertido'); }
 }
 
 // ── Eventos de la interfaz ──────────────────────────────────────────────────
@@ -4360,8 +6135,24 @@ document.addEventListener('DOMContentLoaded', () => {
   q('tpSave').addEventListener('click', saveTp);
   q('emaSave').addEventListener('click', saveEma);
   q('pauseBtn').addEventListener('click', togglePause);
+  q('invBtn').addEventListener('click', toggleInvert);
   q('caStart').addEventListener('click', closeAll);
   q('caCancel').addEventListener('click', cancelCloseAll);
+
+  // Pausas con duración y executor
+  segInit('pauseSeg', 'pauseMin', 'pauseMin');
+  segInit('execSeg', 'execMin', 'execMin');
+  segInit('gsSeg', 'gsPauseMin', '');
+  q('gsPause').addEventListener('change', () => q('gsSeg').classList.toggle('dim', !q('gsPause').checked));
+  q('execPauseBtn').addEventListener('click', toggleExecPause);
+  q('execSave').addEventListener('click', saveExecUrl);
+  q('execTest').addEventListener('click', testExecUrl);
+  const eu = q('execUrl');
+  eu.addEventListener('input', () => { setTxt('execMsg', ''); execDirty(); });
+  eu.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); if (!q('execSave').disabled) saveExecUrl(); }
+    if (e.key === 'Escape') { eu.value = (_ex && _ex.url) || ''; execDirty(); eu.blur(); }
+  });
 
   // Interlocks: llevan a su ajuste
   document.querySelectorAll('.il').forEach(el => el.addEventListener('click', () => {
@@ -4381,6 +6172,7 @@ document.addEventListener('DOMContentLoaded', () => {
   pl.addEventListener('click', e => {
     const b = e.target.closest('button[data-act]'); if (!b) return;
     if (b.dataset.act === 'sl') editStopLoss(b.dataset.sym, n(b.dataset.sl));
+    if (b.dataset.act === 'tp') editStopLoss(b.dataset.sym, n(b.dataset.tp), 'tp');
     if (b.dataset.act === 'close') closePosition(b.dataset.sym, b);
   });
   q('expandAll').addEventListener('click', () => pl.querySelectorAll('details').forEach(d => d.open = true));
@@ -4521,10 +6313,46 @@ def api_set_sl(symbol: str):
         return jsonify({"ok": False, "error": "sl_usd inválido"}), 400
     if sl_usd >= 0:
         return jsonify({"ok": False, "error": "sl_usd debe ser un valor negativo (pérdida)"}), 400
-    ok = bot.set_stop_loss(symbol, sl_usd)
+    try:
+        ok = bot.set_stop_loss(symbol, sl_usd)
+    except ValueError as exc:
+        return jsonify({"ok": False, "symbol": symbol, "error": str(exc)}), 400
     if ok:
         return jsonify({"ok": True, "symbol": symbol, "sl_usd": sl_usd})
     return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o cerrada"}), 404
+
+
+@app.post("/api/set-tp/<symbol>")
+def api_set_tp(symbol: str):
+    """Take profit MANUAL (USD, positivo) de una posición INVERTIDA abierta:
+    {"tp_usd": 8}. Es el espejo del SL manual de una posición normal."""
+    symbol = symbol.upper().strip()
+    data = request.get_json(silent=True) or {}
+    try:
+        tp_usd = float(str(data.get("tp_usd")).replace(",", "."))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "tp_usd inválido"}), 400
+    if not (0 < tp_usd <= 100000):
+        return jsonify({"ok": False, "error": "tp_usd debe ser un valor positivo (ganancia)"}), 400
+    try:
+        ok = bot.set_take_profit_manual(symbol, tp_usd)
+    except ValueError as exc:
+        return jsonify({"ok": False, "symbol": symbol, "error": str(exc)}), 400
+    if ok:
+        return jsonify({"ok": True, "symbol": symbol, "tp_usd": tp_usd})
+    return jsonify({"ok": False, "symbol": symbol, "error": "Posición no encontrada o cerrada"}), 404
+
+
+@app.post("/api/invert")
+def api_invert():
+    """Modo invertido: {"inverted": true} lo activa y {"inverted": false} lo apaga.
+    Solo cambia las posiciones NUEVAS."""
+    data = request.get_json(silent=True) or {}
+    try:
+        enabled = _v_bool(data.get("inverted"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **bot.set_inverted(enabled)})
 
 
 @app.post("/api/force-close/<symbol>")
@@ -4585,7 +6413,7 @@ def api_trades():
 def api_trades_csv():
     """Descarga CSV de todo el histórico (para analizarlo en Excel / pandas)."""
     cols = [
-        "trade_id", "symbol", "direction", "reason", "opened_at_ts", "closed_at_ts",
+        "trade_id", "symbol", "direction", "inverted", "signal_dir", "reason", "opened_at_ts", "closed_at_ts",
         "duration_s", "avg_entry", "close_price", "qty", "notional", "fills_n", "levels",
         "sl_usd", "target", "pnl", "pnl_pct", "mfe_usd", "mae_usd", "mfe_pct", "mae_pct",
         "time_to_mfe_s", "time_to_mae_s", "low_price", "high_price",
@@ -4695,14 +6523,80 @@ def api_set_risk():
 
 @app.post("/api/pause")
 def api_pause():
-    """Pausa ({"paused": true}) o reanuda ({"paused": false}) las entradas nuevas."""
+    """Pausa ({"paused": true}) o reanuda ({"paused": false}) las entradas nuevas.
+    {"paused": true, "minutes": 25} → se reanudan solas a los 25 min;
+    sin "minutes" (o 0/null) → hasta reanudarlas a mano."""
     data = request.get_json(silent=True) or {}
     try:
         paused = _v_bool(data.get("paused", True))
+        minutes = _v_pause_minutes(data.get("minutes")) if paused else None
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     reason = str(data.get("reason", "") or "").strip()[:120]
-    return jsonify({"ok": True, **bot.set_pause(paused, reason or "Pausa manual")})
+    return jsonify({"ok": True, **bot.set_pause(paused, reason or "Pausa manual", minutes=minutes)})
+
+
+@app.get("/api/executor")
+def api_executor():
+    """Link del executor, estado de la pausa del envío y contadores de señales."""
+    resp = jsonify(bot.executor_view())
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.post("/api/executor/url")
+def api_executor_url():
+    """Cambia el link del executor en caliente: {"url": "https://…", "move_open": false}.
+    move_open=true → el DCA y el cierre de las posiciones abiertas también van al
+    link nuevo (solo si es el mismo executor con otra dirección)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        move_open = _v_bool(data.get("move_open", False))
+        result = bot.set_executor_url(data.get("url", ""), move_open=move_open)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/executor/pause")
+def api_executor_pause():
+    """Pausa ({"paused": true, "minutes": 25 | null}) o reanuda ({"paused": false}) el
+    envío de posiciones NUEVAS al executor."""
+    data = request.get_json(silent=True) or {}
+    try:
+        paused = _v_bool(data.get("paused", True))
+        minutes = _v_pause_minutes(data.get("minutes")) if paused else None
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if paused and not bot.executor.config.executor_url:
+        return jsonify({"ok": False, "error": "No hay link de executor que pausar"}), 400
+    reason = str(data.get("reason", "") or "").strip()[:120]
+    return jsonify({"ok": True, **bot.set_executor_pause(paused, minutes=minutes,
+                                                         reason=reason or "Pausa manual")})
+
+
+@app.post("/api/executor/test")
+def api_executor_test():
+    """Comprueba si un link (o el actual) responde, sin enviar señales: {"url": "…"}."""
+    data = request.get_json(silent=True) or {}
+    raw = data.get("url")
+    try:
+        url = _v_exec_url(raw) if raw not in (None, "") else None
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    res = bot.executor.probe(url)
+    target = url or bot.executor.config.executor_url
+    return jsonify({"ok": True, "reachable": bool(res.get("ok")), "url": target,
+                    "status": res.get("status"), "ms": res.get("ms"),
+                    "detail": res.get("error", "")})
+
+
+@app.get("/api/rest-proxy")
+def api_rest_proxy():
+    """Estado de los proxies de arranque del REST de Binance."""
+    resp = jsonify(REST_ROUTER.view())
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 @app.get("/api/ladder")
