@@ -57,6 +57,9 @@ PROXY_BOOTSTRAP_HOURS = max(0.0, float(os.getenv("PROXY_BOOTSTRAP_HOURS", "4") o
 PROXY_MODE            = (os.getenv("PROXY_MODE", "auto") or "auto").strip().lower()
 PROXY_WEIGHT_LIMIT    = int(os.getenv("PROXY_WEIGHT_LIMIT", "2000"))   # Binance Futures: 2400 de peso/min por IP
 PROXY_TIMEOUT_S       = float(os.getenv("PROXY_TIMEOUT_S", "30"))
+# Pasadas las PROXY_BOOTSTRAP_HOURS: true = el REST sale directo, pero si Binance
+# bloquea la IP del servidor (418/429) se usan los proxies hasta que se libere.
+PROXY_FALLBACK        = (os.getenv("PROXY_FALLBACK", "true") or "true").strip().lower() in ("1", "true", "yes", "on", "si", "sí")
 _BINANCE_REST_HOST_RE = re.compile(r"^(fapi|dapi|api)\d*\.binance\.com$", re.I)
 
 
@@ -84,7 +87,8 @@ def _mask_proxy(url: str) -> str:
 def _parse_proxy_urls(raw: str) -> List[str]:
     """Lista de proxies de PROXY_URLS (comas, espacios o ';'; acepta comillas)."""
     out: List[str] = []
-    for part in re.split(r"[\s,;]+", (raw or "").strip()):
+    raw = re.sub(r"^\s*(export\s+)?PROXY_URLS\s*=\s*", "", raw or "")   # si se pegó "PROXY_URLS=..."
+    for part in re.split(r"[\s,;]+", raw.strip()):
         p = part.strip().strip("'\"")
         if not p:
             continue
@@ -211,7 +215,7 @@ class BinanceRestRouter:
     los proxies durante la ventana de arranque (ver comentario de arriba)."""
 
     def __init__(self, proxy_urls: List[str], hours: float, mode: str,
-                 weight_limit: int, base_url: str, timeout_s: float) -> None:
+                 weight_limit: int, base_url: str, timeout_s: float, fallback: bool = True) -> None:
         self.direct = _Route(0, None)
         self.proxies = [_Route(i + 1, u) for i, u in enumerate(proxy_urls)]
         for r in self.proxies:
@@ -225,7 +229,9 @@ class BinanceRestRouter:
         self.timeout_s = float(timeout_s)
         self.started = time.time()
         self.window_end = self.started + self.hours * 3600.0
-        self.configured = bool(self.proxies) and self.hours > 0
+        self.fallback = bool(fallback)
+        self.configured = bool(self.proxies) and (self.hours > 0 or self.fallback)
+        self._starved_log = 0.0                      # último aviso de "sin salida disponible"
         self.lock = threading.Lock()
         self.logger = None                           # se conecta a bot.log al arrancar
         self._rr = 0                                 # siguiente proxy de la rotación
@@ -240,8 +246,13 @@ class BinanceRestRouter:
 
     # ── Estado ────────────────────────────────────────────────────────────────
 
-    def active(self) -> bool:
+    def in_window(self) -> bool:
         return self.configured and time.time() < self.window_end
+
+    def active(self) -> bool:
+        """El enrutador decide la salida: dentro de la ventana, o después si hay
+        respaldo (directo primero, proxies solo si Binance bloquea la IP)."""
+        return self.configured and (time.time() < self.window_end or self.fallback)
 
     def _emit(self, msgs: List[str]) -> None:
         for m in msgs:
@@ -257,8 +268,10 @@ class BinanceRestRouter:
             return "[proxy] PROXY_URLS vacío: el REST de Binance sale siempre directo"
         how = ("directo y, si Binance limita la IP del servidor, por los proxies"
                if self.mode == "auto" else "siempre por los proxies")
-        return (f"[proxy] {len(self.proxies)} proxies para el REST de Binance durante las primeras "
-                f"{self.hours:g} h (modo {self.mode}: {how}): "
+        after = ("después, directo con los proxies de respaldo si Binance bloquea la IP"
+                 if self.fallback else "después, siempre directo")
+        return (f"[proxy] {len(self.proxies)} proxies para el REST de Binance: primeras "
+                f"{self.hours:g} h modo {self.mode} ({how}); {after}: "
                 + ", ".join(r.label for r in self.proxies))
 
     def should_route(self, url: str, method: Optional[str], params: Any = None) -> bool:
@@ -288,7 +301,8 @@ class BinanceRestRouter:
         with self.lock:
             n = len(self.proxies)
             rot = [self.proxies[(self._rr + i) % n] for i in range(n)]
-            order = rot + [self.direct] if self.mode == "always" else [self.direct] + rot
+            always = self.mode == "always" and now < self.window_end
+            order = rot + [self.direct] if always else [self.direct] + rot
             soonest: Optional[float] = None
             for r in order:
                 if r in tried:
@@ -312,9 +326,29 @@ class BinanceRestRouter:
                 else:
                     self._rr = (self.proxies.index(r) + 1) % n
                 return r, 0.0
-        if soonest is not None and soonest - now <= 65.0:
+        if soonest is not None:
             return None, max(0.2, soonest - now)
         return None, 0.0
+
+    def _starved(self) -> None:
+        """Aviso (máx. 1 cada 5 min) de que ninguna salida está disponible."""
+        now = time.time()
+        with self.lock:
+            if now - self._starved_log < 300:
+                return
+            self._starved_log = now
+            parts = []
+            for r in [self.direct] + self.proxies:
+                if r.cool_until > now:
+                    parts.append(f"{r.name}: {r.cool_reason or 'en pausa'} ({_fmt_secs(r.cool_until - now)})")
+                else:
+                    parts.append(f"{r.name}: al tope de peso del minuto")
+        self._emit(["[proxy] ⚠️ Ninguna salida a Binance disponible ahora; la descarga de velas espera "
+                    "a la primera que se libere (sin insistir sobre la IP bloqueada). " + " · ".join(parts)])
+
+    def _direct_banned(self) -> bool:
+        d = self.direct
+        return d.cool_until > time.time() and d.cool_kind in ("http418", "http429", "http403", "http451")
 
     def _done(self, route: _Route) -> None:
         if route is self.direct:
@@ -358,7 +392,7 @@ class BinanceRestRouter:
     def _cool(self, route: _Route, secs: Optional[float], reason: str, kind: str) -> None:
         """Aparta una ruta `secs` segundos (None = hasta el final de la ventana)."""
         now = time.time()
-        until = self.window_end if secs is None else now + float(secs)
+        until = max(self.window_end, now + 6 * 3600.0) if secs is None else now + float(secs)
         msgs: List[str] = []
         with self.lock:
             route.fail += 1
@@ -373,7 +407,7 @@ class BinanceRestRouter:
                     tail = " → el REST sale por los proxies" if self.proxies else ""
                     msgs.append(f"[proxy] IP del servidor {reason} durante {_fmt_secs(left)}{tail}")
                 else:
-                    dur = ("hasta el final de la ventana" if route.cool_until >= self.window_end - 1
+                    dur = ("hasta nuevo aviso" if kind in ("http407", "http403", "http451")
                            else f"durante {_fmt_secs(left)}")
                     msgs.append(f"[proxy] {route.name} ({route.label}) fuera {dur}: {reason}")
         self._emit(msgs)
@@ -480,6 +514,9 @@ class BinanceRestRouter:
             return resp
         if last_exc is not None:
             raise last_exc
+        if self._direct_banned():
+            self._starved()
+            raise urllib.error.URLError("Binance bloquea la IP del servidor y no hay proxy disponible")
         return orig_open(caller_opener, req, None, timeout)  # nada disponible: comportamiento original
 
     # ── requests ──────────────────────────────────────────────────────────────
@@ -528,6 +565,9 @@ class BinanceRestRouter:
             return last_resp
         if last_exc is not None:
             raise last_exc
+        if self._direct_banned():
+            self._starved()
+            raise _rq.exceptions.ConnectionError("Binance bloquea la IP del servidor y no hay proxy disponible")
         return orig_send(adapter, request, **kwargs)
 
     # ── aiohttp ───────────────────────────────────────────────────────────────
@@ -540,13 +580,19 @@ class BinanceRestRouter:
         tried: set = set()
         last_exc: Optional[BaseException] = None
         last_resp = None
-        waited = 0
         while True:
             route, wait = self._pick(weight, tried)
             if route is None:
-                if wait > 0 and waited < 2:
-                    waited += 1
-                    await asyncio.sleep(min(wait, 65.0))
+                if wait > 0:
+                    # Todas las salidas en pausa: NO se devuelve el 418/429 (la caché de
+                    # velas se pararía horas con su Retry-After) ni se insiste sobre la IP
+                    # bloqueada. Se espera a la primera salida que se libere y se reintenta.
+                    if last_resp is not None:
+                        last_resp.release()
+                        last_resp = None
+                    self._starved()
+                    await asyncio.sleep(min(wait, 60.0))
+                    tried = set()
                     continue
                 break
             tried.add(route)
@@ -585,6 +631,8 @@ class BinanceRestRouter:
             return last_resp
         if last_exc is not None:
             raise last_exc
+        if self._direct_banned():
+            raise _aio.ClientConnectionError("Binance bloquea la IP del servidor y no hay proxy disponible")
         return await orig_request(session, method, str_or_url, **kwargs)
 
     # ── Mantenimiento y vista para la web ─────────────────────────────────────
@@ -600,7 +648,9 @@ class BinanceRestRouter:
                 per = ", ".join(f"{r.name} {r.ok}" for r in self.proxies)
                 msgs.append(f"[proxy] Terminaron las {self.hours:g} h de proxies de arranque "
                             f"({self.stats['via_proxy']} descargas por proxy: {per}). "
-                            f"Desde ahora el REST de Binance sale directo.")
+                            + ("Desde ahora el REST sale directo y los proxies solo se usan si Binance "
+                               "bloquea la IP del servidor." if self.fallback
+                               else "Desde ahora el REST de Binance sale directo."))
             if (not self._klines_warned and self.stats["klines"] == 0
                     and now - self.started > 300 and now < self.window_end):
                 self._klines_warned = True
@@ -617,7 +667,7 @@ class BinanceRestRouter:
             for r in [self.direct] + self.proxies:
                 cooling = r.cool_until > now
                 used = r.min_weight if r.min_key == mk else 0
-                if cooling and r is not self.direct and r.cool_until >= self.window_end - 1:
+                if cooling and r is not self.direct and r.cool_kind in ("http407", "http403", "http451"):
                     state = "off"
                 elif cooling:
                     state = "cooling"
@@ -638,6 +688,7 @@ class BinanceRestRouter:
         return {
             "configured": self.configured, "mode": self.mode, "hours": self.hours,
             "active": self.configured and now < self.window_end,
+            "fallback": self.fallback,
             "window_left_s": max(0.0, self.window_end - now) if self.configured else 0.0,
             "weight_limit": self.weight_limit, "n_proxies": len(self.proxies),
             "routes": routes, **stats,
@@ -711,6 +762,7 @@ def _install_rest_router(router: BinanceRestRouter) -> None:
 REST_ROUTER = BinanceRestRouter(
     _parse_proxy_urls(_PROXY_URLS_RAW), PROXY_BOOTSTRAP_HOURS, PROXY_MODE,
     PROXY_WEIGHT_LIMIT, os.getenv("BASE_URL", "https://fapi.binance.com"), PROXY_TIMEOUT_S,
+    PROXY_FALLBACK,
 )
 _install_rest_router(REST_ROUTER)       # antes de importar los módulos que descargan velas
 print(REST_ROUTER.startup_message(), flush=True)
@@ -5686,10 +5738,12 @@ function renderProxy(rp) {
   const box = q('proxyBox'), el = q('proxyStatus');
   if (!rp.configured) { setTxt(el, 'Sin proxies'); el.className = 'muted'; box.hidden = true; return; }
   box.hidden = false;
-  setTxt(el, rp.active ? `Activos, quedan ${fmtDur(rp.window_left_s)}` : 'Terminados, REST directo');
+  setTxt(el, rp.active ? `Activos, quedan ${fmtDur(rp.window_left_s)}`
+    : rp.fallback ? 'De respaldo (si Binance bloquea la IP)' : 'Terminados, REST directo');
   el.className = rp.active ? 'pos' : 'muted';
   setTxt('proxySum', `Proxies de arranque: ${n(rp.n_proxies)} proxies, ${rp.mode === 'always' ? 'siempre por proxy' : 'modo automático'}, `
-    + (rp.active ? `quedan ${fmtDur(rp.window_left_s)} de ${n(rp.hours)} h` : `ventana de ${n(rp.hours)} h terminada`)
+    + (rp.active ? `quedan ${fmtDur(rp.window_left_s)} de ${n(rp.hours)} h`
+       : `ventana de ${n(rp.hours)} h terminada` + (rp.fallback ? ', ahora de respaldo si Binance bloquea la IP' : ''))
     + `. ${n(rp.via_proxy)} descargas por proxy y ${n(rp.direct)} directas (${n(rp.klines)} de velas).`);
   const ST = { ok: ['pos', 'Disponible'], cooling: ['warn-t', 'En pausa'], off: ['neg', 'Fuera'], limit: ['warn-t', 'Al tope de peso'] };
   setHTML(q('tbProxy'), (rp.routes || []).map(r => {
