@@ -17,7 +17,7 @@ import threading
 import time
 import zlib
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from math import floor
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,11 +26,102 @@ import urllib.error
 import urllib.request
 import urllib.response
 
-from flask import Flask, jsonify, make_response, render_template_string, request
+from flask import Flask, Response, jsonify, make_response, render_template_string, request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MEMORIA (Render free: 512 MB de RAM y 0.1 CPU)
+# ─────────────────────────────────────────────────────────────────────────────
+# Si el proceso pasa de 512 MB, Render lo mata y lo reinicia, y con el reinicio
+# se pierden las posiciones (viven en memoria) y los ajustes hechos desde la web
+# (el disco de Render free se borra en cada reinicio).
+# glibc (el malloc de Linux) puede reservar hasta 8 "arenas" por núcleo, y en un
+# contenedor con la CPU recortada (0.1 en Render) sigue contando los núcleos de la
+# máquina. Con varios hilos (WS de precios, velas, bot, servidor web) creando y
+# soltando JSON grandes cada segundo (!ticker@arr ~200 KB, /api/status ~60 KB,
+# 200 descargas de 1500 velas…), la memoria liberada puede quedarse repartida en
+# arenas sin volver al sistema y el RSS crecer sin que Python tenga ninguna fuga.
+# Se previene al arrancar, antes de crear hilos:
+#   • MALLOC_ARENAS  (2):   máximo de arenas.
+#   • MALLOC_MMAP_KB (128): los bloques ≥ 128 KB van siempre a mmap y vuelven al
+#     sistema al liberarse (si no, glibc sube ese umbral solo y se quedan).
+#   • MEM_TRIM_SECS  (60):  malloc_trim(0) devuelve al sistema la memoria libre.
+# El bot vigila su RSS: lo muestra en el panel y en /health, lo apunta en el log
+# cada MEM_LOG_MIN minutos y avisa si pasa de MEM_WARN_MB.
+MEM_LIMIT_MB  = float(os.getenv("MEM_LIMIT_MB", "512"))
+MEM_WARN_MB   = float(os.getenv("MEM_WARN_MB", "400"))
+MEM_TRIM_SECS = float(os.getenv("MEM_TRIM_SECS", "60"))
+MEM_LOG_MIN   = float(os.getenv("MEM_LOG_MIN", "10"))
+
+
+def _load_libc():
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        try:
+            return ctypes.CDLL("libc.so.6")
+        except OSError:
+            import ctypes.util
+            name = ctypes.util.find_library("c")
+            return ctypes.CDLL(name) if name else None
+    except Exception:
+        return None
+
+
+_LIBC = _load_libc()
+
+
+def _tune_malloc() -> str:
+    """Limita las arenas de glibc y fija el umbral de mmap (ver arriba)."""
+    if _LIBC is None or not hasattr(_LIBC, "mallopt"):
+        return "malloc sin ajustar (no es glibc)"
+    done: List[str] = []
+    try:
+        arenas = int(os.getenv("MALLOC_ARENAS", "2"))
+        if arenas > 0 and _LIBC.mallopt(-8, arenas) == 1:            # M_ARENA_MAX
+            done.append(f"máx. {arenas} arenas")
+        mmap_kb = int(os.getenv("MALLOC_MMAP_KB", "128"))
+        if mmap_kb > 0 and _LIBC.mallopt(-3, mmap_kb * 1024) == 1:    # M_MMAP_THRESHOLD
+            done.append(f"bloques ≥ {mmap_kb} KB por mmap")
+    except Exception as exc:
+        return f"ajuste de malloc falló: {exc}"
+    return "malloc: " + (", ".join(done) if done else "sin cambios")
+
+
+_MALLOC_NOTE = _tune_malloc()
+try:
+    _PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
+except Exception:
+    _PAGE_SIZE = 4096
+
+
+def _malloc_trim() -> bool:
+    """Devuelve al sistema la memoria libre que glibc tenga guardada."""
+    if _LIBC is None:
+        return False
+    try:
+        return bool(_LIBC.malloc_trim(0))
+    except Exception:
+        return False
+
+
+def _rss_mb() -> float:
+    """Memoria real (RSS) del proceso en MB."""
+    try:
+        with open("/proc/self/statm", "rb") as fh:
+            return int(fh.read().split()[1]) * _PAGE_SIZE / 1048576.0
+    except Exception:
+        pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0   # pico (Linux: KB)
+    except Exception:
+        return 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1020,8 +1111,8 @@ PRICE_MAX_AGE_S        = float(os.getenv("PRICE_MAX_AGE_S",        "5"))    # un
 USE_LIVE_CHANGE        = os.getenv("USE_LIVE_CHANGE", "true").lower() == "true"
 # ── Señal de entrada: cruce EMA rápida/lenta sobre las N cripto más activas ──
 EMA_INTERVAL           = os.getenv("EMA_INTERVAL", "1m")
-EMA_FAST               = int(os.getenv("EMA_FAST", "100"))
-EMA_SLOW               = int(os.getenv("EMA_SLOW", "200"))
+EMA_FAST               = int(os.getenv("EMA_FAST", "250"))
+EMA_SLOW               = int(os.getenv("EMA_SLOW", "500"))
 EMA_TOP_N              = int(os.getenv("EMA_TOP_N", "200"))
 # Velas (cierres) guardadas por símbolo: máximo 1500 (límite de Binance por petición).
 # Con 1500 velas el periodo máximo admitido para la EMA lenta es 500 (≈ 3× de historia).
@@ -1196,6 +1287,9 @@ def _fmt_minutes(m: float) -> str:
 # a un disco persistente (STATS_FILE=/data/trade_stats.jsonl) o se perderán al redeploy.
 STATS_FILE    = os.getenv("STATS_FILE",    os.path.join(_HERE, "trade_stats.jsonl"))
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
+# Operaciones cerradas que se guardan EN MEMORIA para las estadísticas (las más
+# recientes). El archivo STATS_FILE conserva todas y el CSV se lee de él.
+STATS_MAX_IN_MEMORY = max(100, int(os.getenv("STATS_MAX_IN_MEMORY", "3000")))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1363,14 +1457,34 @@ def _apply_risk_dict(data: dict, strict: bool) -> Dict[str, Any]:
     return parsed
 
 
+_SETTINGS_SOURCE = "none"     # "file" si al arrancar había ajustes guardados desde la web
+
+
 def _load_settings() -> None:
     """Restaura los ajustes guardados desde la web (SL global, multiplicador del TP,
-    EMA rápida/lenta y gestión de riesgo). Sobrescriben los valores de entorno."""
-    global DEFAULT_STOP_LOSS_USD, TAKE_PROFIT_FRACTION, EMA_FAST, EMA_SLOW, ENTRY_LADDER
+    EMA rápida/lenta y gestión de riesgo). Sobrescriben los valores de entorno.
+    Si hay memoria en Upstash, lo de Upstash se aplica después y manda."""
+    global _SETTINGS_SOURCE
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
+    except FileNotFoundError:
+        return
     except Exception:
+        _SETTINGS_SOURCE = "error"
+        return
+    if not isinstance(data, dict):
+        _SETTINGS_SOURCE = "error"
+        return
+    _SETTINGS_SOURCE = "file"
+    _apply_settings_dict(data)
+
+
+def _apply_settings_dict(data: dict) -> None:
+    """Aplica un diccionario de ajustes (el que escribe _save_settings), venga del
+    disco o de Upstash. Las claves que falten o no sean válidas no se tocan."""
+    global DEFAULT_STOP_LOSS_USD, TAKE_PROFIT_FRACTION, EMA_FAST, EMA_SLOW, ENTRY_LADDER
+    if not isinstance(data, dict):
         return
     lad = data.get("ladder")
     if isinstance(lad, dict):
@@ -1432,31 +1546,47 @@ def _load_settings() -> None:
 
 
 _SETTINGS_LOCK = threading.Lock()
+# Lo llama _save_settings tras cada cambio: el bot lo conecta a la memoria externa
+# (Upstash) para que el cambio se guarde también allí.
+_SETTINGS_SAVED_HOOK: Optional[Any] = None
 
 
-def _save_settings() -> Optional[str]:
-    """Guarda TODOS los ajustes editables en disco (atómico). Devuelve error o None."""
+def _settings_dict() -> dict:
+    """TODOS los ajustes editables desde la web (lo que se guarda y se restaura)."""
+    return {
+        "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
+        "take_profit_fraction":  TAKE_PROFIT_FRACTION,
+        "ema_fast":              EMA_FAST,
+        "ema_slow":              EMA_SLOW,
+        "ladder": {
+            "levels":    [lv for lv, _ in ENTRY_LADDER],
+            "notionals": [nt for _, nt in ENTRY_LADDER],
+        },
+        "risk":                  asdict(RISK),
+        "executor":              asdict(EXEC),
+        "mode":                  asdict(MODE),
+    }
+
+
+def _save_settings(notify: bool = True) -> Optional[str]:
+    """Guarda TODOS los ajustes editables en disco (atómico) y avisa a la memoria
+    externa. Devuelve error o None."""
     tmp = f"{SETTINGS_FILE}.tmp"
+    err: Optional[str] = None
     try:
         with _SETTINGS_LOCK:
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({
-                    "default_stop_loss_usd": DEFAULT_STOP_LOSS_USD,
-                    "take_profit_fraction":  TAKE_PROFIT_FRACTION,
-                    "ema_fast":              EMA_FAST,
-                    "ema_slow":              EMA_SLOW,
-                    "ladder": {
-                        "levels":    [lv for lv, _ in ENTRY_LADDER],
-                        "notionals": [nt for _, nt in ENTRY_LADDER],
-                    },
-                    "risk":                  asdict(RISK),
-                    "executor":              asdict(EXEC),
-                    "mode":                  asdict(MODE),
-                }, fh)
+                json.dump(_settings_dict(), fh)
             os.replace(tmp, SETTINGS_FILE)
-        return None
     except Exception as exc:
-        return str(exc)
+        err = str(exc)
+    hook = _SETTINGS_SAVED_HOOK
+    if notify and hook is not None:
+        try:
+            hook()
+        except Exception:
+            pass
+    return err
 
 
 _load_settings()
@@ -1640,6 +1770,717 @@ class BotPosition:
         return "1er tramo" if len(self.fills) == 1 else "estándar"
 
 
+_POS_FIELDS = {f.name for f in fields(BotPosition)}
+_FILL_FIELDS = {f.name for f in fields(Fill)}
+# Datos de una posición que cambian con cada tick (no obligan a guardar al instante)
+_POS_VOLATILE = ("mfe_usd", "mae_usd", "mfe_pct", "mae_pct", "mfe_ts", "mae_ts", "low_price", "high_price")
+
+
+def _position_from_dict(d: Any) -> Optional[BotPosition]:
+    """Reconstruye una posición abierta guardada (None si no es válida)."""
+    if not isinstance(d, dict) or not d.get("symbol") or not isinstance(d.get("fills"), list):
+        return None                         # (los archivos de versiones viejas solo traían un resumen)
+    fills: List[Fill] = []
+    for f in d["fills"]:
+        if not isinstance(f, dict):
+            continue
+        try:
+            fills.append(Fill(**{k: float(v) for k, v in f.items() if k in _FILL_FIELDS}))
+        except (TypeError, ValueError):
+            continue
+    if not fills:
+        return None
+    kw = {k: v for k, v in d.items() if k in _POS_FIELDS and k not in ("fills", "symbol")}
+    try:
+        pos = BotPosition(symbol=str(d["symbol"]).upper(), fills=fills, **kw)
+        pos.status = "OPEN"
+        pos.trade_id = int(pos.trade_id or 0)
+        for k in ("sl_usd", "realized_pnl", "opened_ts") + _POS_VOLATILE:
+            setattr(pos, k, float(getattr(pos, k) or 0.0))
+        pos.sl_manual, pos.inverted = bool(pos.sl_manual), bool(pos.inverted)
+        if pos.direction not in ("LONG", "SHORT"):
+            return None
+        return pos
+    except (TypeError, ValueError):
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MEMORIA EXTERNA: Upstash Redis (estado) + QStash (que Render no lo duerma)
+# ─────────────────────────────────────────────────────────────────────────────
+# En Render free el disco se borra en cada reinicio, así que con
+# UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN el bot guarda en Upstash
+# Redis (gratis) todo lo necesario para seguir donde estaba:
+#   {STORE_PREFIX}:config  ajustes de la web: EMAs, SL, TP, escalera DCA, riesgo,
+#                          pausas, link del executor y modo invertido
+#   {STORE_PREFIX}:state   posiciones abiertas con TODOS sus datos (tramos, SL o TP
+#                          manual, trade_id, executor, MFE/MAE…), cooldowns,
+#                          contador de trade_id, PnL realizado y stop global
+#   {STORE_PREFIX}:closed  últimas 500 operaciones cerradas (historial del panel)
+#   {STORE_PREFIX}:stats   últimas STATS_MAX_IN_MEMORY operaciones con MFE/MAE
+#   {STORE_PREFIX}:lock    qué instancia manda: en un deploy Render arranca la
+#                          nueva antes de parar la vieja; la nueva espera a que
+#                          la vieja guarde y suelte, así nunca operan dos a la vez.
+# Cada cambio (apertura, DCA, cierre, SL/TP, ajuste, cooldown) se guarda en ~1 s;
+# el MFE/MAE de las abiertas, cada minuto. Gasto: ~4.000 comandos al día (la capa
+# gratis de Upstash da 500.000 al mes).
+# QStash NO guarda datos (es una cola de mensajes HTTP). Con QSTASH_TOKEN el bot
+# crea en QStash un horario que visita /health cada 10 min: así Render free no lo
+# duerme por falta de visitas (dormido no vigila precios ni gestiona posiciones).
+
+UPSTASH_URL   = (os.getenv("UPSTASH_REDIS_REST_URL","https://merry-camel-217854.upstash.io") or os.getenv("KV_REST_API_URL") or "").strip().rstrip("/")
+UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN", "gQAAAAAAA1L-AAIgcDEyYWRiYmMwZDczMDc0YTYzOTYwMjllNjM0ZmMwNzgzMA") or os.getenv("KV_REST_API_TOKEN") or "").strip()
+STORE_PREFIX  = re.sub(r"[^A-Za-z0-9_.:-]", "", os.getenv("STORE_PREFIX", "botema") or "") or "botema"
+STORE_LOCK_TTL_S  = max(30.0, float(os.getenv("STORE_LOCK_TTL_S", "75")))
+STORE_RENEW_S     = max(5.0, min(STORE_LOCK_TTL_S / 3.0, float(os.getenv("STORE_RENEW_S", "25"))))
+STORE_HEARTBEAT_S = max(10.0, float(os.getenv("STORE_HEARTBEAT_S", "60")))   # MFE/MAE de las abiertas
+STORE_MIN_GAP_S   = 1.0                                                       # agrupa ráfagas de cambios
+STORE_BOOT_WAIT_S = max(5.0, float(os.getenv("STORE_BOOT_WAIT_S", "20")))
+STORE_CLOSED_MAX  = 500
+# Sin conexión con Upstash el bot no sabe qué posiciones tenía: por defecto NO abre
+# posiciones nuevas hasta conectar (sí gestiona TP/SL/DCA de las que tenga en memoria).
+STORE_OFFLINE_BLOCKS_ENTRIES = _env_bool("STORE_OFFLINE_BLOCKS_ENTRIES", True)
+
+QSTASH_TOKEN   = (os.getenv("QSTASH_TOKEN") or "").strip()
+QSTASH_URL     = (os.getenv("QSTASH_URL") or "https://qstash.upstash.io").strip().rstrip("/")
+KEEPALIVE_URL  = (os.getenv("KEEPALIVE_URL") or "").strip()
+if not KEEPALIVE_URL and os.getenv("RENDER_EXTERNAL_URL"):
+    KEEPALIVE_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/") + "/health"
+KEEPALIVE_CRON = (os.getenv("KEEPALIVE_CRON") or "*/10 * * * *").strip()
+
+# Guardado atómico con cerrojo: solo escribe quien tiene el lock (si nadie lo tiene,
+# lo recupera). ARGV: 1 id · 2 ttl · 3 config · 4 state · 5 reemplazar listas ·
+# 6 máx. cerrados · 7 máx. estadísticas · 8 nº cerrados + cerrados · nº stats + stats
+_LUA_SAVE = """
+local cur = redis.call('GET', KEYS[1])
+if cur and cur ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+if ARGV[3] ~= '' then redis.call('SET', KEYS[2], ARGV[3]) end
+if ARGV[4] ~= '' then redis.call('SET', KEYS[3], ARGV[4]) end
+if ARGV[5] == '1' then redis.call('DEL', KEYS[4], KEYS[5]) end
+local i = 8
+local n = tonumber(ARGV[i])
+i = i + 1
+for j = 1, n do
+  redis.call('LPUSH', KEYS[4], ARGV[i])
+  i = i + 1
+end
+if n > 0 then redis.call('LTRIM', KEYS[4], 0, tonumber(ARGV[6]) - 1) end
+n = tonumber(ARGV[i])
+i = i + 1
+for j = 1, n do
+  redis.call('RPUSH', KEYS[5], ARGV[i])
+  i = i + 1
+end
+if n > 0 then redis.call('LTRIM', KEYS[5], -tonumber(ARGV[7]), -1) end
+return 1
+"""
+_LUA_RELEASE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+"""
+
+
+class UpstashError(Exception):
+    def __init__(self, msg: str, status: int = 0, fatal: bool = False) -> None:
+        super().__init__(msg)
+        self.status = status
+        self.fatal = fatal          # credenciales o URL mal puestas: reintentar no sirve
+
+
+class UpstashRedis:
+    """Cliente mínimo de la API REST de Upstash Redis (solo librería estándar)."""
+
+    def __init__(self, url: str, token: str, timeout: float = 6.0) -> None:
+        self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
+        self.calls = 0
+        self.bytes_out = 0
+        self.bytes_in = 0
+
+    def _post(self, path: str, payload: Any) -> Any:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(self.url + path, data=body, method="POST", headers={
+            "Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
+        self.calls += 1
+        self.bytes_out += len(body)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read() or b"{}").get("error", "")
+            except Exception:
+                detail = ""
+            msg = f"HTTP {exc.code}" + (f": {detail}" if detail else "")
+            if exc.code in (401, 403):
+                msg += " (revisa UPSTASH_REDIS_REST_TOKEN)"
+            elif exc.code == 404:
+                msg += " (revisa UPSTASH_REDIS_REST_URL)"
+            raise UpstashError(msg, exc.code, fatal=exc.code in (401, 403, 404))
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+            reason = getattr(exc, "reason", None) or exc
+            raise UpstashError(f"sin conexión con Upstash: {reason}", 0)
+        self.bytes_in += len(raw)
+        try:
+            return json.loads(raw)
+        except Exception:
+            raise UpstashError("respuesta no válida de Upstash", 0)
+
+    def cmd(self, *args: Any) -> Any:
+        data = self._post("", [a if isinstance(a, (str, int, float)) else str(a) for a in args])
+        if isinstance(data, dict) and data.get("error"):
+            raise UpstashError(str(data["error"]), 400)
+        return data.get("result") if isinstance(data, dict) else None
+
+    def pipeline(self, cmds: List[List[Any]]) -> List[Any]:
+        data = self._post("/pipeline", cmds)
+        if isinstance(data, dict) and data.get("error"):
+            raise UpstashError(str(data["error"]), 400)
+        out = []
+        for item in data if isinstance(data, list) else []:
+            if isinstance(item, dict) and item.get("error"):
+                raise UpstashError(str(item["error"]), 400)
+            out.append(item.get("result") if isinstance(item, dict) else None)
+        return out
+
+
+def _json_loads_safe(raw: Any) -> Any:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _num(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        return v if v == v else default
+    except (TypeError, ValueError):
+        return default
+
+
+class StateStore:
+    """Memoria del bot en Upstash Redis. Un hilo propio guarda los cambios y
+    renueva el cerrojo; el bot solo avisa (mark_dirty / mark_config / push_closed)."""
+
+    STATUS_TEXT = {
+        "off":        "Desactivada",
+        "connecting": "Conectando",
+        "active":     "Activa",
+        "waiting":    "En espera",
+        "standby":    "En espera",
+        "degraded":   "Sin conexión",
+        "error":      "Error de configuración",
+    }
+
+    def __init__(self, url: str, token: str, prefix: str) -> None:
+        bad_url = bool(url) and not url.lower().startswith(("https://", "http://"))
+        self.enabled = bool(url and token) and not bad_url
+        self.client = UpstashRedis(url, token) if self.enabled else None
+        self.prefix = prefix
+        self.k_lock, self.k_config, self.k_state, self.k_closed, self.k_stats = (
+            f"{prefix}:{n}" for n in ("lock", "config", "state", "closed", "stats"))
+        self.host = (os.getenv("RENDER_INSTANCE_ID") or socket.gethostname() or "local").replace("|", "_")
+        self.instance_id = f"{self.host}|{os.getpid()}|{int(time.time())}|{os.urandom(3).hex()}"
+        self.status = "connecting" if self.enabled else ("error" if bad_url else "off")
+        self.detail = ("UPSTASH_REDIS_REST_URL debe ser la URL REST (https://…upstash.io), no la redis://"
+                       if bad_url else
+                       "" if self.enabled else
+                       "sin UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN: lo guardado se pierde al reiniciar")
+        self.holder = ""
+        self.bot: Any = None
+        self.stopping = False
+        self.loaded_info = ""
+        self.last_save_ts = 0.0
+        self.last_ok_ts = 0.0
+        self.fail_since = 0.0
+        self.saves = 0
+        self.errors = 0
+        self.last_error = ""
+        self.keepalive: Dict[str, Any] = {"status": "off", "detail": "", "url": KEEPALIVE_URL,
+                                          "cron": KEEPALIVE_CRON, "schedule_id": ""}
+        self._lock = threading.Lock()           # colas y marcas
+        self._io = threading.Lock()             # una petición a Upstash a la vez
+        self._wake = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._pending_closed: deque = deque()
+        self._pending_stats: deque = deque()
+        self._config_gen = 0
+        self._config_saved_gen = 0
+        self._replace_lists = False
+        self._last_struct: Optional[str] = None
+        self._last_full: Optional[str] = None
+        self._last_state_ts = 0.0
+        self._last_renew = 0.0
+        self._wait_since = 0.0
+        self._fails = 0
+        self._shut = False
+        self._takeover_lock = threading.Lock()
+        self._flush_lock = threading.Lock()
+        self._recheck = False
+        self._last_hb_check = 0.0
+
+    # ── Estado para el bot y la web ───────────────────────────────────────
+    @property
+    def manage_ok(self) -> bool:
+        """¿Puede esta instancia gestionar posiciones (TP/SL/DCA, cierres, ajustes)?"""
+        if not self.enabled:
+            return True
+        if self.stopping:
+            return False
+        return self.status in ("active", "degraded", "error")
+
+    @property
+    def entries_ok(self) -> bool:
+        """¿Puede abrir posiciones nuevas?"""
+        if not self.enabled:
+            return True
+        if self.stopping:
+            return False
+        if self.status == "degraded":
+            return not STORE_OFFLINE_BLOCKS_ENTRIES
+        return self.status in ("active", "error")
+
+    def block_text(self) -> str:
+        if self.stopping:
+            return "el bot se está deteniendo (reinicio de Render)"
+        if self.status in ("waiting", "standby"):
+            who = self.holder.split("|")[0] if self.holder else "otra instancia"
+            return (f"otra instancia del bot ({who}) tiene el control de la memoria; "
+                    "esta espera para no operar dos veces")
+        if self.status == "degraded":
+            return "sin conexión con la memoria Upstash: no se abren posiciones nuevas hasta conectar"
+        if self.status == "connecting":
+            return "recuperando el estado guardado en Upstash"
+        return ""
+
+    def view(self) -> dict:
+        now = time.time()
+        c = self.client
+        return {
+            "enabled":      self.enabled,
+            "status":       self.status,
+            "text":         self.STATUS_TEXT.get(self.status, self.status),
+            "detail":       self.detail,
+            "block":        self.block_text() if not self.manage_ok or not self.entries_ok else "",
+            "holder":       self.holder.split("|")[0] if self.holder else "",
+            "instance":     self.host,
+            "prefix":       self.prefix,
+            "loaded":       self.loaded_info,
+            "last_save_ts": self.last_save_ts,
+            "last_save_ago": (now - self.last_save_ts) if self.last_save_ts else None,
+            "fail_s":       (now - self.fail_since) if self.fail_since else 0.0,
+            "saves":        self.saves,
+            "errors":       self.errors,
+            "last_error":   self.last_error,
+            "calls":        c.calls if c else 0,
+            "kb_out":       round(c.bytes_out / 1024.0, 1) if c else 0.0,
+            "keepalive":    dict(self.keepalive),
+        }
+
+    # ── Avisos del bot (no bloquean) ──────────────────────────────────────
+    def mark_dirty(self) -> None:
+        if self.enabled:
+            self._wake.set()
+
+    def mark_config(self) -> None:
+        if self.enabled:
+            with self._lock:
+                self._config_gen += 1
+            self._wake.set()
+
+    def push_closed(self, closed_rec: Optional[dict], stat_rec: Optional[dict]) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if closed_rec is not None:
+                self._pending_closed.append(json.dumps(closed_rec, ensure_ascii=False,
+                                                       separators=(",", ":"), default=str))
+            if stat_rec is not None:
+                self._pending_stats.append(json.dumps(stat_rec, ensure_ascii=False,
+                                                      separators=(",", ":"), default=str))
+            for q_ in (self._pending_closed, self._pending_stats):
+                while len(q_) > 5000:           # sin conexión mucho tiempo: se descartan los más viejos
+                    q_.popleft()
+        self._wake.set()
+
+    def request_full_resync(self) -> None:
+        """Tras unir memoria local y Upstash: reescribe las listas enteras."""
+        with self._lock:
+            self._replace_lists = True
+            self._config_gen += 1
+        self._last_struct = None
+        self._wake.set()
+
+    # ── Arranque (lo llama el bot ANTES de operar) ────────────────────────
+    def boot(self) -> dict:
+        """Toma el cerrojo y lee todo lo guardado. Reintenta los errores de red
+        hasta STORE_BOOT_WAIT_S. Nunca lanza excepciones."""
+        deadline = time.time() + STORE_BOOT_WAIT_S
+        attempt = 0
+        while True:
+            try:
+                with self._io:
+                    acquired, holder = self._acquire(force=False)
+                    data = self._load_all()
+                self._ok()
+                self.holder = "" if acquired else (holder or "")
+                return {"ok": True, "acquired": acquired, "holder": holder, "data": data}
+            except UpstashError as exc:
+                self._fail(exc)
+                if exc.fatal:
+                    return {"ok": False, "fatal": True, "error": str(exc)}
+                attempt += 1
+                if time.time() >= deadline:
+                    return {"ok": False, "fatal": False, "error": str(exc)}
+                time.sleep(min(5.0, 1.0 + attempt))
+            except Exception as exc:                     # nunca tumbar el arranque
+                self._fail(exc)
+                return {"ok": False, "fatal": False, "error": repr(exc)}
+
+    def _acquire(self, force: bool) -> Tuple[bool, str]:
+        """(cerrojo tomado, quién lo tiene). Con force lo toma aunque sea de otro.
+        Requiere self._io."""
+        c = self.client
+        ttl = int(STORE_LOCK_TTL_S)
+        if force:
+            c.cmd("SET", self.k_lock, self.instance_id, "EX", ttl)
+            return True, self.instance_id
+        for _ in range(3):
+            if c.cmd("SET", self.k_lock, self.instance_id, "NX", "EX", ttl) == "OK":
+                return True, self.instance_id
+            holder = c.cmd("GET", self.k_lock)
+            if holder is None:
+                continue                                 # expiró justo ahora: reintenta
+            if holder == self.instance_id:
+                return True, holder
+            parts = str(holder).split("|")
+            # Proceso anterior de ESTE mismo contenedor que ya no existe (se cayó): se toma ya
+            if len(parts) >= 2 and parts[0] == self.host and parts[1].isdigit() \
+                    and int(parts[1]) != os.getpid() and not _pid_alive(int(parts[1])):
+                c.cmd("SET", self.k_lock, self.instance_id, "EX", ttl)
+                return True, self.instance_id
+            return False, str(holder)
+        return False, ""
+
+    def _load_all(self) -> dict:
+        """Lee config, estado, cerrados y estadísticas. Requiere self._io."""
+        c = self.client
+        cfg_raw, st_raw, closed_raw, n_stats = c.pipeline([
+            ["GET", self.k_config], ["GET", self.k_state],
+            ["LRANGE", self.k_closed, 0, STORE_CLOSED_MAX - 1], ["LLEN", self.k_stats]])
+        stats_raw: List[Any] = []
+        n_stats = int(n_stats or 0)
+        if n_stats:
+            chunks = [["LRANGE", self.k_stats, i, i + 999] for i in range(0, n_stats, 1000)]
+            for part in c.pipeline(chunks):
+                stats_raw.extend(part or [])
+        closed = [x for x in (_json_loads_safe(r) for r in closed_raw or []) if isinstance(x, dict)]
+        stats = [x for x in (_json_loads_safe(r) for r in stats_raw) if isinstance(x, dict)]
+        cfg = _json_loads_safe(cfg_raw)
+        st = _json_loads_safe(st_raw)
+        return {"config": cfg if isinstance(cfg, dict) else None,
+                "state": st if isinstance(st, dict) else None,
+                "closed": closed, "stats": stats}
+
+    def start(self, status: str) -> None:
+        """Arranca el hilo de guardado con el estado decidido en el arranque."""
+        if not self.enabled or self._thread is not None:
+            return
+        self.status = status
+        if status in ("waiting", "standby"):
+            self._wait_since = time.time()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="StateStore")
+        self._thread.start()
+
+    # ── Hilo de guardado ──────────────────────────────────────────────────
+    def _run(self) -> None:
+        while not self.stopping:
+            st = self.status
+            if st == "active":
+                timeout = 1.0
+            elif st in ("waiting", "standby"):
+                timeout = 3.0 if time.time() - self._wait_since < 300 else 20.0
+            elif st == "degraded":
+                timeout = min(60.0, 5.0 * (2 ** min(self._fails, 4)))
+            else:
+                timeout = 30.0
+            woke = self._wake.wait(timeout)
+            self._wake.clear()
+            if self.stopping:
+                break
+            try:
+                if st == "active":
+                    self.flush(woke=woke)
+                elif st in ("waiting", "standby"):
+                    self.takeover(force=False)
+                elif st == "degraded":
+                    self._reconnect()
+            except UpstashError as exc:
+                self._fail(exc)
+                if exc.fatal:
+                    self._set_error(str(exc))
+            except Exception as exc:                      # el hilo no debe morir nunca
+                self._fail(exc)
+
+    def flush(self, final: bool = False, woke: bool = True) -> bool:
+        """Guarda lo que haya cambiado y renueva el cerrojo. True si quedó guardado."""
+        with self._flush_lock:                            # hilo y SIGTERM nunca a la vez
+            return self._flush_locked(final, woke)
+
+    def _flush_locked(self, final: bool, woke: bool) -> bool:
+        bot = self.bot
+        if bot is None or self.status != "active":
+            return False
+        now = time.time()
+        with self._lock:
+            pending = bool(self._pending_closed or self._pending_stats or self._replace_lists
+                           or self._config_gen != self._config_saved_gen)
+        hb_due = now - self._last_hb_check >= STORE_HEARTBEAT_S
+        need_renew = now - self._last_renew >= STORE_RENEW_S
+        if not (final or woke or pending or hb_due or need_renew or self._recheck):
+            return True                                  # nada nuevo: ni siquiera se calcula
+        if hb_due:
+            self._last_hb_check = now
+        state = bot._collect_state()
+        struct_sig, full_sig, state_json = bot._state_signature(state)
+        with self._lock:
+            cfg_gen = self._config_gen
+            cfg_dirty = cfg_gen != self._config_saved_gen
+            closed = list(self._pending_closed)
+            stats = list(self._pending_stats)
+            replace = self._replace_lists
+        struct_changed = struct_sig != self._last_struct
+        need_state = (final or replace or bool(closed) or struct_changed
+                      or (full_sig != self._last_full and now - self._last_state_ts >= STORE_HEARTBEAT_S))
+        if not (need_state or cfg_dirty or stats or need_renew):
+            self._recheck = False
+            return True
+        # Ráfagas de cambios (p. ej. varios tramos DCA seguidos): se agrupan ~1 s
+        if (struct_changed and not (final or closed or replace or need_renew)
+                and now - self._last_state_ts < STORE_MIN_GAP_S):
+            self._recheck = True                         # el hilo vuelve en 1 s y lo guarda
+            return True
+        self._recheck = False
+        cfg_json = (json.dumps(_settings_dict(), ensure_ascii=False, separators=(",", ":"), default=str)
+                    if (cfg_dirty or replace) else "")
+        if replace:
+            closed, stats = bot._history_for_resync()
+        argv: List[Any] = [self.instance_id, int(STORE_LOCK_TTL_S), cfg_json,
+                           state_json if (need_state or replace) else "",
+                           "1" if replace else "0", STORE_CLOSED_MAX, STATS_MAX_IN_MEMORY,
+                           len(closed), *closed, len(stats), *stats]
+        with self._io:
+            if self.status != "active":
+                return False
+            res = self.client.cmd("EVAL", _LUA_SAVE, 5, self.k_lock, self.k_config, self.k_state,
+                                  self.k_closed, self.k_stats, *argv)
+        if res in (0, "0", None):
+            self._lost()
+            return False
+        self._ok()
+        self._last_renew = now
+        if need_state or replace:
+            self._last_struct, self._last_full, self._last_state_ts = struct_sig, full_sig, now
+            self.last_save_ts = now
+            self.saves += 1
+        with self._lock:
+            if cfg_json:
+                self._config_saved_gen = cfg_gen
+            if replace:
+                self._replace_lists = False
+                self._pending_closed.clear()
+                self._pending_stats.clear()
+            else:
+                for _ in range(len(closed)):
+                    if self._pending_closed:
+                        self._pending_closed.popleft()
+                for _ in range(len(stats)):
+                    if self._pending_stats:
+                        self._pending_stats.popleft()
+        return True
+
+    def takeover(self, force: bool) -> bool:
+        """Toma el control (si el cerrojo está libre, o a la fuerza), recarga TODO
+        de Upstash y lo aplica en el bot. True si esta instancia pasa a mandar."""
+        bot = self.bot
+        if bot is None:
+            return False
+        # Un solo intento a la vez (hilo de la memoria y botón de la web)
+        if not self._takeover_lock.acquire(timeout=30.0 if force else 0.0):
+            return False
+        try:
+            return self._takeover_locked(force)
+        finally:
+            self._takeover_lock.release()
+
+    def _takeover_locked(self, force: bool) -> bool:
+        bot = self.bot
+        if self.status == "active":
+            return True
+        with self._io:
+            acquired, holder = self._acquire(force=force)
+            if not acquired:
+                self.holder = holder or self.holder
+                self._ok()
+                return False
+            data = self._load_all()
+        self._ok()
+        self.holder = ""
+        ok = bot._store_apply_threadsafe(data, "takeover")
+        if not ok:
+            with self._io:
+                self.client.cmd("EVAL", _LUA_RELEASE, 1, self.k_lock, self.instance_id)
+            return False
+        self._last_struct = None
+        self._last_renew = time.time()
+        self.status = "active"
+        self.detail = ""
+        bot.log("🔐 Memoria Upstash: esta instancia toma el control y continúa con lo guardado")
+        self._wake.set()
+        return True
+
+    def _reconnect(self) -> None:
+        """Arrancó sin conexión: al volver Upstash une lo de allí con lo de aquí."""
+        bot = self.bot
+        with self._io:
+            acquired, holder = self._acquire(force=False)
+            if not acquired:
+                self._ok()
+                self.holder = holder
+                self.status, self._wait_since = "standby", time.time()
+                bot.log(f"⚠️ Memoria Upstash: otra instancia ({holder.split('|')[0]}) tiene el control; "
+                        "esta queda en espera")
+                return
+            data = self._load_all()
+        self._ok()
+        if not bot._store_apply_threadsafe(data, "merge"):
+            with self._io:
+                self.client.cmd("EVAL", _LUA_RELEASE, 1, self.k_lock, self.instance_id)
+            return
+        self.status, self.detail = "active", ""
+        self.request_full_resync()
+        bot.log("🔐 Memoria Upstash conectada: lo guardado y lo de esta sesión quedan unidos")
+
+    def _lost(self) -> None:
+        holder = ""
+        try:
+            with self._io:
+                holder = self.client.cmd("GET", self.k_lock) or ""
+        except Exception:
+            pass
+        self.holder = str(holder)
+        self.status, self._wait_since = "standby", time.time()
+        if self.bot is not None:
+            self.bot.log(f"⚠️ Memoria Upstash: otra instancia ({self.holder.split('|')[0] or '?'}) tomó el "
+                         "control. Este bot deja de operar para no duplicar órdenes (en espera)")
+
+    def _set_error(self, msg: str) -> None:
+        self.status, self.detail = "error", msg
+        if self.bot is not None:
+            self.bot.log(f"❌ Memoria Upstash desactivada: {msg}. El bot sigue operando SIN memoria")
+
+    def _ok(self) -> None:
+        self.last_ok_ts = time.time()
+        self.fail_since = 0.0
+        self._fails = 0
+
+    def _fail(self, exc: BaseException) -> None:
+        self.errors += 1
+        self._fails += 1
+        self.last_error = str(exc)[:300]
+        if not self.fail_since:
+            self.fail_since = time.time()
+        if self.bot is not None:
+            self.bot._log_throttled("store_err", f"Memoria Upstash: {self.last_error}", 120.0)
+
+    # ── Parada (SIGTERM de Render) ─────────────────────────────────────────
+    def shutdown(self, reason: str) -> None:
+        """Deja de operar, guarda lo último y suelta el cerrojo para la siguiente
+        instancia. Se llama una sola vez (señal o salida)."""
+        if not self.enabled or self._shut:
+            return
+        self._shut = True
+        was_active = self.status == "active"
+        self.stopping = True
+        self._wake.set()
+        bot = self.bot
+        if not was_active or bot is None:
+            return
+        t_end = time.time() + 3.0
+        while time.time() < t_end and bot._orders_in_flight():
+            time.sleep(0.05)
+        try:
+            self.status = "active"                       # flush exige estado activo
+            ok = self.flush(final=True)
+            bot.log(f"💾 {reason}: estado guardado en Upstash" if ok else
+                    f"⚠️ {reason}: no pude guardar el estado final en Upstash")
+        except Exception as exc:
+            bot.log(f"⚠️ {reason}: no pude guardar el estado final en Upstash: {exc}")
+        try:
+            with self._io:
+                self.client.cmd("EVAL", _LUA_RELEASE, 1, self.k_lock, self.instance_id)
+        except Exception:
+            pass
+        self.status = "standby"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _qstash_keepalive(store: "StateStore", log) -> None:
+    """Crea (o actualiza) en QStash el horario que visita /health cada 10 min.
+    Usa siempre el mismo id de horario: no se duplica en cada arranque."""
+    ka = store.keepalive
+    if not QSTASH_TOKEN:
+        ka.update(status="off", detail="sin QSTASH_TOKEN")
+        return
+    if not KEEPALIVE_URL:
+        ka.update(status="error", detail="falta KEEPALIVE_URL (Render la deduce de RENDER_EXTERNAL_URL)")
+        log("⚠️ QStash: no sé la URL pública del bot; pon KEEPALIVE_URL=https://tu-bot.onrender.com/health")
+        return
+    sched_id = f"{STORE_PREFIX}-keepalive"
+    req = urllib.request.Request(
+        f"{QSTASH_URL}/v2/schedules/{KEEPALIVE_URL}", data=b"", method="POST",
+        headers={"Authorization": "Bearer " + QSTASH_TOKEN, "Upstash-Cron": KEEPALIVE_CRON,
+                 "Upstash-Method": "GET", "Upstash-Schedule-Id": sched_id,
+                 "Upstash-Retries": "1", "Content-Type": "text/plain"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read() or b"{}")
+            ka.update(status="active", schedule_id=body.get("scheduleId", sched_id),
+                      detail=f"visita {KEEPALIVE_URL} ({KEEPALIVE_CRON})")
+            every = "cada 10 min" if KEEPALIVE_CRON == "*/10 * * * *" else f"con el horario {KEEPALIVE_CRON}"
+            log(f"⏰ QStash: keep-alive activo → {KEEPALIVE_URL} {every} "
+                f"(horario {ka['schedule_id']}); Render free no dormirá el bot")
+            return
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = json.loads(exc.read() or b"{}").get("error", "")
+            except Exception:
+                pass
+            ka.update(status="error", detail=f"HTTP {exc.code} {detail}".strip())
+            if exc.code in (400, 401, 403):
+                log(f"❌ QStash: no pude crear el keep-alive (HTTP {exc.code} {detail}). Revisa QSTASH_TOKEN"
+                    + (" y QSTASH_URL (la región de tu QStash)" if exc.code != 400 else ""))
+                return
+        except Exception as exc:
+            ka.update(status="error", detail=str(exc)[:200])
+        time.sleep(5 * (attempt + 1))
+    log(f"⚠️ QStash: no pude crear el keep-alive ({ka.get('detail')})")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLIENTE BINANCE FUTURES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1817,6 +2658,13 @@ class TradingBot:
         # ── Persistencia asíncrona ────────────────────────────────────────
         self._persist_event: Optional[asyncio.Event] = None
         self._persist_debounce_secs: float = 0.35
+        self._persist_sig: Optional[tuple] = None      # lo último escrito (no se reescribe igual)
+
+        # ── Memoria (RSS) ─────────────────────────────────────────────────
+        self.mem_rss_mb:  float = 0.0
+        self.mem_peak_mb: float = 0.0
+        self.mem_trims:   int   = 0
+        self._mem_last_log: float = 0.0
 
         # ── Guardia anti doble cierre ─────────────────────────────────────
         self._closing_symbols: set[str] = set()
@@ -1847,11 +2695,22 @@ class TradingBot:
         self._ema_cache: Dict[str, Tuple[tuple, Optional[float]]] = {}   # EMA de tendencia del DCA
         self._block_seen: Dict[str, float] = {}              # anti-spam por (símbolo, tipo)
 
+        # ── Memoria externa (Upstash Redis): config, posiciones, cierres… ──
+        self.store = StateStore(UPSTASH_URL, UPSTASH_TOKEN, STORE_PREFIX)
+        self.store.bot = self
+        self._pnl_at_boot = 0.0
+        self._config_changed_here = False      # ajustes cambiados en esta sesión (para unir memorias)
+        global _SETTINGS_SAVED_HOOK
+        _SETTINGS_SAVED_HOOK = self._on_settings_saved
+
         # ── Estadísticas MFE/MAE por operación cerrada (se cargan del disco) ──
-        self.trade_stats: List[dict] = []
+        # Acotadas a las STATS_MAX_IN_MEMORY más recientes: antes la lista crecía
+        # sin límite (≈3 KB por operación) y se cargaba entera del disco.
+        self.trade_stats: deque = deque(maxlen=STATS_MAX_IN_MEMORY)
         self._stats_lock = threading.Lock()
         self._load_trade_stats()
         self._restore_history()
+        self._pnl_at_boot = self.total_realized_pnl
 
     # ── Logging ───────────────────────────────────────────────────────────────
 
@@ -1944,6 +2803,26 @@ class TradingBot:
         self.log("Bot iniciado — modo " + (
             "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL"
         ))
+        self.log(f"[mem] {_MALLOC_NOTE} · RSS al arrancar {self._note_rss():.0f} MB · "
+                 f"límite de la instancia {MEM_LIMIT_MB:.0f} MB · aviso a partir de {MEM_WARN_MB:.0f} MB")
+        if _SETTINGS_SOURCE == "file":
+            self.log(f"Ajustes restaurados de {SETTINGS_FILE} (los guardados desde la web) · "
+                     f"EMA {EMA_FAST}/{EMA_SLOW}")
+        elif not self.store.enabled:
+            self.log(f"⚠️ Sin ajustes guardados en {SETTINGS_FILE}"
+                     + (" (archivo ilegible)" if _SETTINGS_SOURCE == "error" else "")
+                     + f": se usan las variables de entorno (EMA {EMA_FAST}/{EMA_SLOW}). En Render free "
+                       "el disco se borra en cada reinicio: activa la memoria Upstash "
+                       "(UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN) para que todo sobreviva.")
+
+        # Memoria externa: ajustes, posiciones abiertas, cierres, estadísticas y
+        # cooldowns ANTES de conectar con Binance y de evaluar nada.
+        await self._store_boot()
+        if QSTASH_TOKEN:
+            threading.Thread(target=_qstash_keepalive, args=(self.store, self.log),
+                             daemon=True, name="QStashKeepAlive").start()
+        else:
+            self.store.keepalive.update(status="off", detail="sin QSTASH_TOKEN")
         try:
             await self.client.start()
             self.exchange_symbols = len(self.client.exchange_filters)
@@ -2063,6 +2942,11 @@ class TradingBot:
         inverted = MODE.inverted
         side = _opp(signal_side) if inverted else signal_side
         now = time.time()
+        if not self.store.entries_ok:
+            if self.store.manage_ok:           # sin conexión con Upstash: se registra el freno
+                self._record_block(symbol, side, "memoria", self.store.block_text(), is_dca=False,
+                                   extra=f"cruce {direction}")
+            return
         if symbol in self._entry_inflight or symbol in self._closing_symbols:
             return
         if now < self._entry_backoff.get(symbol, 0.0):
@@ -2621,6 +3505,8 @@ class TradingBot:
         pc = self.price_cache
         if pc is None:
             return
+        if not self.store.manage_ok:          # otra instancia tiene el control (o se está deteniendo)
+            return
 
         with self.lock:
             pos = self.positions.get(symbol)
@@ -2968,7 +3854,9 @@ class TradingBot:
                 return False
 
             unblock_str = ""
+            unblock_ts  = 0.0
             leftover = 0
+            closed_rec: Optional[dict] = None
             with self.lock:
                 pos = self.positions.get(symbol)
                 if pos:
@@ -2989,8 +3877,9 @@ class TradingBot:
                         unblock_str = datetime.fromtimestamp(
                             unblock_ts, timezone.utc
                         ).strftime("%Y-%m-%d %H:%M UTC")
-                    self.closed_trades.insert(0, {
+                    closed_rec = {
                         "symbol":      symbol,
+                        "trade_id":    trade_id,
                         "direction":   direction,
                         "inverted":    inverted,
                         "fills_n":     fills_n,
@@ -3001,13 +3890,17 @@ class TradingBot:
                         "close_price": price,
                         "notional":    notional,
                         "closed_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "closed_ts":   now_ts,
                         "unblock_at":  unblock_str,
+                        "unblock_ts":  unblock_ts,
                         "reason":      reason,
                         **exc,
-                    })
+                    }
+                    self.closed_trades.insert(0, closed_rec)
                     self.closed_trades = self.closed_trades[:500]
 
             self._record_trade_stat(stat_rec)
+            self.store.push_closed(closed_rec, stat_rec)       # a la memoria externa (Upstash)
             if exec_url:
                 self.executor.notify_close(
                     trade_id=trade_id,
@@ -3056,42 +3949,382 @@ class TradingBot:
     # ── Estadísticas MFE / MAE ────────────────────────────────────────────────
 
     def _load_trade_stats(self) -> None:
-        """Carga el histórico de operaciones (una línea JSON por cierre)."""
+        """Carga el histórico de operaciones (una línea JSON por cierre). En memoria
+        quedan solo las STATS_MAX_IN_MEMORY más recientes; el trade_id se sigue
+        calculando sobre TODO el archivo."""
         try:
             if not os.path.exists(STATS_FILE):
                 return
-            rows: List[dict] = []
+            max_id = 0
             with open(STATS_FILE, "r", encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        rows.append(json.loads(line))
+                        rec = json.loads(line)
                     except Exception:
                         continue
-            self.trade_stats = rows
-            max_id = max((int(r.get("trade_id", 0) or 0) for r in rows), default=0)
+                    if not isinstance(rec, dict):
+                        continue
+                    try:
+                        max_id = max(max_id, int(rec.get("trade_id", 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+                    self.trade_stats.append(rec)   # deque(maxlen): se descartan las más viejas
             if max_id > self._trade_id_seq:
                 self._trade_id_seq = max_id        # evita repetir trade_id tras reinicios
         except Exception as exc:
             print(f"No pude leer {STATS_FILE}: {exc}", flush=True)
 
     def _restore_history(self) -> None:
-        """Tras un reinicio recupera SOLO el historial (cierres y PnL realizado) del
-        último estado guardado. Las posiciones no se restauran: vivían en memoria,
-        así que mostrarlas como abiertas sería engañoso."""
+        """Tras un reinicio recupera del estado guardado en disco el historial, el PnL
+        realizado y (si el archivo es de esta versión) las posiciones abiertas, los
+        cooldowns y el contador de trade_id. En Render free el disco se borra al
+        reiniciar: allí lo que vale es la memoria de Upstash, que se aplica después."""
         try:
             if not os.path.exists(STATE_FILE):
                 return
             with open(STATE_FILE, "r", encoding="utf-8") as fh:
                 persisted = json.load(fh)
-            closed = persisted.get("closed_trades")
-            if isinstance(closed, list) and closed:
-                self.closed_trades = [c for c in closed if isinstance(c, dict)][:500]
-            self.total_realized_pnl = float(persisted.get("total_realized_pnl", 0.0) or 0.0)
         except Exception as exc:
             print(f"No pude restaurar historial de {STATE_FILE}: {exc}", flush=True)
+            return
+        if not isinstance(persisted, dict):
+            return
+        # Los archivos de versiones anteriores no traen "v": de ellos solo el PnL y el historial
+        state = persisted if persisted.get("v") else {
+            "total_realized_pnl": persisted.get("total_realized_pnl", 0.0)}
+        try:
+            info = self._apply_restore({"config": None, "state": state,
+                                        "closed": persisted.get("closed_trades") or [], "stats": []},
+                                       "boot")
+            if info:
+                self.log(f"♻️ Recuperado del disco ({STATE_FILE}): {info}")
+        except Exception as exc:
+            print(f"No pude restaurar el estado de {STATE_FILE}: {exc}", flush=True)
+
+    # ── Memoria externa: qué se guarda y cómo se recupera ────────────────────
+
+    def _on_settings_saved(self) -> None:
+        """Cada _save_settings(): el cambio de ajustes va también a Upstash."""
+        self._config_changed_here = True
+        self.store.mark_config()
+
+    def _collect_state(self) -> dict:
+        """Estado vivo que se guarda (Upstash y disco) para continuar tras un reinicio."""
+        now = time.time()
+        with self.lock:
+            positions = [asdict(p) for _, p in sorted(self.positions.items())
+                         if p.status == "OPEN" and p.fills]
+            cooldowns = {s: ts for s, ts in self.symbol_cooldown.items() if ts > now}
+            total = self.total_realized_pnl
+        with self._trade_id_lock:
+            seq = self._trade_id_seq
+        return {
+            "v":                  1,
+            "positions":          positions,
+            "cooldowns":          cooldowns,
+            "trade_id_seq":       seq,
+            "total_realized_pnl": total,
+            "global_stop":        {"triggers": self.global_stop_triggers,
+                                   "last": dict(self.global_stop_last),
+                                   "rearm_at": self._gstop_rearm_at},
+        }
+
+    def _state_signature(self, state: dict) -> Tuple[str, str, str]:
+        """(firma sin MFE/MAE, firma completa, JSON a guardar). Un cambio en la
+        primera (apertura, DCA, cierre, SL, cooldown…) se guarda al momento; si solo
+        cambia la segunda, como mucho cada STORE_HEARTBEAT_S."""
+        full = json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+        struct = dict(state)
+        struct["positions"] = [{k: v for k, v in p.items() if k not in _POS_VOLATILE}
+                               for p in state.get("positions") or []]
+        s_json = json.dumps(struct, sort_keys=True, separators=(",", ":"), default=str)
+        payload = json.dumps(dict(state, saved_at=time.time(), by=self.store.host),
+                             ensure_ascii=False, separators=(",", ":"), default=str)
+        return (hashlib.sha1(s_json.encode("utf-8")).hexdigest(),
+                hashlib.sha1(full.encode("utf-8")).hexdigest(), payload)
+
+    def _history_for_resync(self) -> Tuple[List[str], List[str]]:
+        """Cierres (del más viejo al más nuevo) y estadísticas, ya en JSON."""
+        with self.lock:
+            closed = list(self.closed_trades[:STORE_CLOSED_MAX])
+        with self._stats_lock:
+            stats = list(self.trade_stats)
+        dump = lambda r: json.dumps(r, ensure_ascii=False, separators=(",", ":"), default=str)  # noqa: E731
+        return [dump(r) for r in reversed(closed)], [dump(r) for r in stats]
+
+    def _orders_in_flight(self) -> bool:
+        with self.lock:
+            return bool(self._entry_inflight or self._closing_symbols or self._entry_reserved)
+
+    @staticmethod
+    def _closed_key(c: dict) -> tuple:
+        if c.get("trade_id") and c.get("closed_ts"):
+            return ("id", c.get("trade_id"), round(_num(c.get("closed_ts")), 3))
+        return ("txt", c.get("symbol"), c.get("closed_at"), round(_num(c.get("pnl")), 6))
+
+    @staticmethod
+    def _stat_key(s: dict) -> tuple:
+        return (s.get("trade_id"), round(_num(s.get("closed_at_ts")), 3), s.get("symbol"))
+
+    def _apply_restore(self, data: dict, mode: str) -> str:
+        """Aplica lo guardado y devuelve un resumen ("" si no había nada).
+        mode "boot": al arrancar · "takeover": otra instancia soltó el control y se
+        sustituye todo · "merge": se une con lo de esta sesión (arrancó sin conexión)."""
+        cfg = data.get("config")
+        state = data.get("state")
+        closed_in = [c for c in (data.get("closed") or []) if isinstance(c, dict)]
+        stats_in = [s for s in (data.get("stats") or []) if isinstance(s, dict)]
+        if cfg is None and not isinstance(state, dict) and not closed_in and not stats_in:
+            return ""
+        state = state if isinstance(state, dict) else {}
+        merge = mode == "merge"
+        parts: List[str] = []
+
+        # 1) Ajustes de la web
+        if isinstance(cfg, dict) and not (merge and self._config_changed_here):
+            _apply_settings_dict(cfg)
+            self.executor.set_url(EXEC.url)
+            _save_settings(notify=False)                 # deja también la copia local al día
+            pause = ""
+            if self._entries_paused_now():
+                pause = " · entradas EN PAUSA " + self._pause_left_txt(RISK.pause_until)
+            parts.append(f"ajustes (EMA {EMA_FAST}/{EMA_SLOW} · SL {DEFAULT_STOP_LOSS_USD:g} USD · "
+                         f"TP {TAKE_PROFIT_FRACTION * 100:g}% · DCA {len(ENTRY_LADDER)} tramos · modo "
+                         f"{'invertido' if MODE.inverted else 'normal'}{pause})")
+
+        # 2) Posiciones abiertas, cooldowns, PnL realizado y contadores
+        now = time.time()
+        restored: Dict[str, BotPosition] = {}
+        pos_in = state.get("positions")
+        for d in pos_in if isinstance(pos_in, list) else []:
+            pos = _position_from_dict(d)
+            if pos is not None:
+                restored[pos.symbol] = pos
+        cds: Dict[str, float] = {}
+        cd_in = state.get("cooldowns")
+        for s, ts in (cd_in.items() if isinstance(cd_in, dict) else []):
+            try:
+                ts = float(ts)
+            except (TypeError, ValueError):
+                continue
+            if ts > now:
+                cds[str(s).upper()] = ts
+        has_state = bool(state)
+        with self.lock:
+            if merge:
+                kept = [s for s in restored if s in self.positions]
+                for s, p in restored.items():
+                    self.positions.setdefault(s, p)
+                for s, ts in cds.items():
+                    self.symbol_cooldown[s] = max(ts, self.symbol_cooldown.get(s, 0.0))
+                if "total_realized_pnl" in state:
+                    self.total_realized_pnl = (float(state.get("total_realized_pnl") or 0.0)
+                                               + (self.total_realized_pnl - self._pnl_at_boot))
+                if kept:
+                    parts.append(f"{', '.join(kept)} ya estaba(n) abierta(s) aquí: se conserva lo de esta sesión")
+            elif has_state:
+                self.positions = restored
+                self.symbol_cooldown = cds
+                if "total_realized_pnl" in state:
+                    self.total_realized_pnl = float(state.get("total_realized_pnl") or 0.0)
+            self._pnl_at_boot = self.total_realized_pnl
+            merged = {self._closed_key(c): c for c in self.closed_trades}
+            for c in closed_in:
+                merged.setdefault(self._closed_key(c), c)
+            self.closed_trades = sorted(
+                merged.values(),
+                key=lambda c: (_num(c.get("closed_ts")), str(c.get("closed_at") or "")),
+                reverse=True)[:500]
+            n_open = sum(1 for p in self.positions.values() if p.status == "OPEN" and p.fills)
+            pos_txt = ", ".join(f"{p.symbol} {p.direction}{' inv.' if p.inverted else ''} "
+                                f"{len(p.fills)} tramo{'s' if len(p.fills) != 1 else ''}"
+                                for p in list(self.positions.values())[:6])
+            n_closed = len(self.closed_trades)
+            n_cd = sum(1 for ts in self.symbol_cooldown.values() if ts > now)
+        gs = state.get("global_stop") if isinstance(state.get("global_stop"), dict) else {}
+        if gs:
+            self.global_stop_triggers = max(self.global_stop_triggers if merge else 0,
+                                            int(_num(gs.get("triggers"))))
+            if isinstance(gs.get("last"), dict) and gs.get("last"):
+                self.global_stop_last = dict(gs["last"])
+            self._gstop_rearm_at = max(self._gstop_rearm_at, _num(gs.get("rearm_at")))
+
+        # 3) Estadísticas MFE/MAE (se unen sin duplicar)
+        with self._stats_lock:
+            st_map = {self._stat_key(s): s for s in self.trade_stats}
+            for s in stats_in:
+                st_map.setdefault(self._stat_key(s), s)
+            ordered = sorted(st_map.values(), key=lambda s: _num(s.get("closed_at_ts")))
+            self.trade_stats.clear()
+            self.trade_stats.extend(ordered)          # deque(maxlen): quedan las más recientes
+            n_stats = len(self.trade_stats)
+            max_stat_id = int(max((_num(s.get("trade_id")) for s in self.trade_stats), default=0))
+        self._sync_stats_file()
+
+        # 4) Contador de trade_id: nunca repetir uno ya usado
+        with self.lock:
+            max_pos_id = max((p.trade_id for p in self.positions.values()), default=0)
+        saved_seq = int(_num(state.get("trade_id_seq")))
+        with self._trade_id_lock:
+            self._trade_id_seq = max(self._trade_id_seq, saved_seq, max_pos_id, max_stat_id)
+
+        if has_state or merge:
+            parts.append(f"{n_open} posición(es) abierta(s)" + (f": {pos_txt}" if pos_txt else "")
+                         + ("…" if n_open > 6 else ""))
+            parts.append(f"{n_cd} en cooldown")
+        parts.append(f"{n_closed} cierres · {n_stats} estadísticas · PnL realizado "
+                     f"{self.total_realized_pnl:+.2f} USD")
+        return " · ".join(parts)
+
+    def _sync_stats_file(self) -> None:
+        """Si el archivo local de estadísticas tiene menos operaciones que la memoria
+        (Render borró el disco), se reescribe para que el CSV las incluya todas."""
+        try:
+            n_file = 0
+            if os.path.exists(STATS_FILE):
+                with open(STATS_FILE, "rb") as fh:
+                    n_file = sum(1 for line in fh if line.strip())
+            with self._stats_lock:
+                rows = list(self.trade_stats)
+            if n_file >= len(rows):
+                return
+            tmp = f"{STATS_FILE}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for r in rows:
+                    fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            os.replace(tmp, STATS_FILE)
+        except Exception as exc:
+            print(f"No pude reescribir {STATS_FILE}: {exc}", flush=True)
+
+    def _store_apply_threadsafe(self, data: dict, mode: str) -> bool:
+        """Desde el hilo de la memoria: aplica lo guardado dentro del loop del bot."""
+        loop = self.loop
+        if loop is None or not loop.is_running():
+            return False
+        fut = asyncio.run_coroutine_threadsafe(self._apply_restore_async(data, mode), loop)
+        try:
+            fut.result(timeout=60)
+            return True
+        except Exception as exc:
+            self.log(f"⚠️ Memoria Upstash: no pude aplicar lo guardado ({exc!r})")
+            return False
+
+    async def _apply_restore_async(self, data: dict, mode: str) -> None:
+        info = self._apply_restore(data, mode)
+        if info:
+            self.log(f"♻️ Recuperado de Upstash{self._saved_ago_txt(data)}: {info}")
+        kc = self.kline_cache
+        if kc is not None and (kc.fast_period, kc.slow_period) != (EMA_FAST, EMA_SLOW):
+            try:
+                await asyncio.to_thread(kc.set_periods, EMA_FAST, EMA_SLOW)
+            except Exception as exc:
+                self.log(f"⚠️ No pude aplicar EMA {EMA_FAST}/{EMA_SLOW} al detector: {exc}")
+        for sym in self._open_position_symbols():
+            self._watch_add(sym)
+            self._enqueue(sym)                       # TP/SL con el precio de ahora mismo
+        self.persist_state()
+
+    @staticmethod
+    def _saved_ago_txt(data: dict) -> str:
+        st = data.get("state") if isinstance(data, dict) else None
+        try:
+            ts = float((st or {}).get("saved_at") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if not ts:
+            return ""
+        who = (st or {}).get("by") or ""
+        return f" (guardado hace {_fmt_secs(max(0.0, time.time() - ts))}" + (f" por {who}" if who else "") + ")"
+
+    async def _store_boot(self) -> None:
+        """Antes de operar: recupera de Upstash ajustes, posiciones, cierres,
+        estadísticas y cooldowns, y toma el control (solo opera una instancia)."""
+        st = self.store
+        if not st.enabled:
+            if st.status == "error":
+                self.log(f"❌ Memoria Upstash mal configurada: {st.detail}")
+            else:
+                self.log("ℹ️ Memoria Upstash desactivada (faltan UPSTASH_REDIS_REST_URL y "
+                         "UPSTASH_REDIS_REST_TOKEN): en Render free lo que no esté en Environment "
+                         "se pierde al reiniciar")
+            return
+        self.log(f"🔐 Memoria Upstash: conectando (prefijo {st.prefix})…")
+        res = await asyncio.to_thread(st.boot)
+        if res.get("ok"):
+            data = res["data"]
+            info = self._apply_restore(data, "boot")
+            if info:
+                st.loaded_info = info
+                self.log(f"♻️ Recuperado de Upstash{self._saved_ago_txt(data)}: {info}")
+            else:
+                st.loaded_info = "Upstash estaba vacío (primer arranque con memoria)"
+                self.log("🔐 Memoria Upstash vacía: primer arranque con memoria; se guarda lo actual")
+                st.request_full_resync()
+            if res.get("acquired"):
+                st.start("active")
+                self.log("🔐 Memoria Upstash activa: cada cambio se guarda en ~1 s")
+            else:
+                st.holder = res.get("holder") or ""
+                st.start("waiting")
+                self.log(f"⏳ Memoria Upstash: otra instancia ({st.holder.split('|')[0] or '?'}) tiene el "
+                         "control (¿deploy en curso?). Esta espera sin operar y sigue sola en cuanto la "
+                         "otra guarde y suelte el control")
+        elif res.get("fatal"):
+            st._set_error(res.get("error", "error"))
+        else:
+            st.detail = f"sin conexión al arrancar: {res.get('error')}"
+            st.start("degraded")
+            self.log(f"⚠️ Memoria Upstash sin conexión ({res.get('error')}). Reintento en segundo plano"
+                     + ("; mientras tanto NO se abren posiciones nuevas" if STORE_OFFLINE_BLOCKS_ENTRIES else ""))
+
+    def store_takeover(self) -> dict:
+        """Botón de la web: esta instancia toma el control aunque otra lo tenga."""
+        st = self.store
+        if not st.enabled:
+            return {"ok": False, "error": "La memoria Upstash no está configurada", "code": 404}
+        if st.status == "active":
+            return {"ok": True, "msg": "Esta instancia ya tiene el control"}
+        if st.status not in ("waiting", "standby"):
+            return {"ok": False, "error": f"No aplica en el estado actual ({st.STATUS_TEXT.get(st.status)})",
+                    "code": 409}
+        try:
+            ok = st.takeover(force=True)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "code": 502}
+        if not ok:
+            return {"ok": False, "error": "No pude tomar el control", "code": 502}
+        self.log("🔐 Control tomado a mano desde la web: la otra instancia dejará de operar "
+                 "en su próximo guardado (≤ 25 s)")
+        return {"ok": True, "msg": "Control tomado"}
+
+    # ── Cooldowns: liberar a mano desde la web ───────────────────────────────
+
+    def release_cooldowns(self, symbols: Optional[List[str]] = None) -> List[str]:
+        """Saca símbolos del cooldown (None = todos). Devuelve los liberados."""
+        now = time.time()
+        with self.lock:
+            active = {s: ts for s, ts in self.symbol_cooldown.items() if ts > now}
+            if symbols is None:
+                targets = sorted(active)
+            else:
+                targets = sorted({s.upper().strip() for s in symbols} & set(active))
+            for s in targets:
+                self.symbol_cooldown.pop(s, None)
+        if not targets:
+            return []
+        if len(targets) == 1:
+            s = targets[0]
+            self.log(f"🔓 COOLDOWN LIBERADO a mano: {s} (quedaban {self._fmt_cooldown(active[s] - now)}). "
+                     f"Puede volver a abrir con el próximo cruce EMA")
+        else:
+            self.log(f"🔓 COOLDOWN LIBERADO a mano: {len(targets)} símbolos "
+                     f"({', '.join(targets[:10])}{'…' if len(targets) > 10 else ''}). "
+                     f"Pueden volver a abrir con el próximo cruce EMA")
+        self.persist_state()
+        return targets
 
     def _record_trade_stat(self, rec: dict) -> None:
         with self._stats_lock:
@@ -3380,6 +4613,8 @@ class TradingBot:
 
     def _check_pause_timers(self) -> None:
         """Reanuda las pausas con tiempo que ya vencieron (lo llama el mantenimiento)."""
+        if not self.store.manage_ok:          # lo hace la instancia que tiene el control
+            return
         now = time.time()
         with self._pause_lock:
             entries_due = RISK.entries_paused and RISK.pause_until and now >= RISK.pause_until
@@ -3584,7 +4819,7 @@ class TradingBot:
           • Invertidas: PnL no realizado ≥ −global_stop_usd (+5) → TP GLOBAL:   las cierra.
         Tras dispararse, si así está configurado, pausa las entradas nuevas.
         Corre en el loop del bot."""
-        if not RISK.global_stop_enabled or self._close_all_active:
+        if not RISK.global_stop_enabled or self._close_all_active or not self.store.manage_ok:
             return
         now = time.time()
         if now - self._gstop_last_check < 0.2 or now < self._gstop_rearm_at:
@@ -3643,8 +4878,10 @@ class TradingBot:
                           and exposure + first_nt > RISK.max_exposure_usd + 1e-9)
         now = time.time()
         paused = self._entries_paused_now(now)
-        common = paused or exp_blocks or self._close_all_active
+        store_block = "" if self.store.entries_ok else self.store.block_text()
+        common = paused or exp_blocks or self._close_all_active or bool(store_block)
         view: Dict[str, Any] = {
+            "store_block":       store_block,
             "paused":            paused,
             "pause_reason":      RISK.pause_reason if paused else "",
             "paused_at":         RISK.paused_at if paused else 0.0,
@@ -3716,6 +4953,8 @@ class TradingBot:
         book: None = todas · False = solo normales · True = solo invertidas."""
         if not self.loop or not self.loop.is_running():
             return {"ok": False, "error": "Bot loop no está activo", "code": 503}
+        if not self.store.manage_ok:
+            return {"ok": False, "error": "No se puede: " + self.store.block_text(), "code": 409}
         with self.lock:
             if self.close_all_state.get("running"):
                 return {"ok": False, "error": "Ya hay un cierre masivo en curso", "code": 409}
@@ -3820,7 +5059,8 @@ class TradingBot:
         Las entradas y los TP/SL los dispara cada tick del WS, no este bucle."""
         step = SAFETY_TICK_SECS if SAFETY_TICK_SECS > 0 else 1.0
         step = max(0.2, min(step, 1.0))
-        last_rate = last_prune = last_persist = time.time()
+        last_rate = last_prune = last_persist = last_mem = time.time()
+        mem_every = MEM_TRIM_SECS if MEM_TRIM_SECS > 0 else 60.0
         last_count = self.scan_count
         while self.running:
             await asyncio.sleep(step)
@@ -3857,11 +5097,56 @@ class TradingBot:
                 if now - last_persist >= STATE_PERSIST_SECS:
                     last_persist = now
                     self.persist_state()
+
+                if now - last_mem >= mem_every:
+                    last_mem = now
+                    await self._memory_housekeeping()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.last_error = str(exc)
                 self._log_throttled("maint_err", f"Error en mantenimiento: {exc!r}")
+
+    # ── Memoria ───────────────────────────────────────────────────────────────
+
+    def _note_rss(self) -> float:
+        rss = _rss_mb()
+        if rss > 0:
+            self.mem_rss_mb = rss
+            if rss > self.mem_peak_mb:
+                self.mem_peak_mb = rss
+        return rss
+
+    def _mem_summary(self) -> str:
+        ks: dict = {}
+        try:
+            ks = self.kline_cache.get_stats() if self.kline_cache else {}
+        except Exception:
+            pass
+        with self.lock:
+            n_open = sum(1 for p in self.positions.values() if p.status == "OPEN" and p.fills)
+            n_closed = len(self.closed_trades)
+        return (f"{ks.get('tracked_symbols', 0)} símbolos EMA con {ks.get('stored_candles', 0)} velas · "
+                f"{n_open} posiciones · {n_closed} cierres en memoria · {threading.active_count()} hilos")
+
+    async def _memory_housekeeping(self) -> None:
+        """Devuelve al sistema la memoria libre (malloc_trim), mide el RSS, lo apunta
+        en el log cada MEM_LOG_MIN minutos y avisa si se acerca al límite de la
+        instancia (en Render free, al pasar de 512 MB Render reinicia el bot)."""
+        before = self._note_rss()
+        if MEM_TRIM_SECS > 0 and await asyncio.to_thread(_malloc_trim):
+            self.mem_trims += 1
+        rss = self._note_rss()
+        now = time.time()
+        if MEM_WARN_MB > 0 and rss >= MEM_WARN_MB:
+            self._log_throttled("mem_warn", f"⚠️ MEMORIA ALTA: {rss:.0f} MB de {MEM_LIMIT_MB:.0f} MB "
+                                            f"(pico {self.mem_peak_mb:.0f} MB) · {self._mem_summary()}", 300.0)
+        if MEM_LOG_MIN > 0 and now - self._mem_last_log >= MEM_LOG_MIN * 60.0:
+            self._mem_last_log = now
+            freed = before - rss
+            self.log(f"[mem] RSS {rss:.0f} MB de {MEM_LIMIT_MB:.0f} MB (pico {self.mem_peak_mb:.0f} MB"
+                     + (f", malloc_trim devolvió {freed:.0f} MB" if freed >= 1 else "") + ") · "
+                     + self._mem_summary())
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
@@ -4040,6 +5325,7 @@ class TradingBot:
             sym: {
                 "remaining_s":   round(ts - now, 0),
                 "remaining_str": self._fmt_cooldown(ts - now),
+                "unblock_ts":    round(ts, 1),
                 "unblock_utc":   datetime.fromtimestamp(ts, timezone.utc).strftime(
                     "%Y-%m-%d %H:%M UTC"
                 ),
@@ -4131,21 +5417,48 @@ class TradingBot:
                 "signals":         kl_stats.get("signals", 0),
                 "stale_signals":   kl_stats.get("stale_signals", 0),
                 "warming":         kl_stats.get("warming", 0),
+                "reconnects":      kl_stats.get("reconnects", 0),
+                "gap_fills":       kl_stats.get("gap_fills", 0),
+                "full_warmups":    kl_stats.get("full_warmups", 0),
             },
+            "memory": {
+                "rss_mb":   round(self._note_rss(), 1),
+                "peak_mb":  round(self.mem_peak_mb, 1),
+                "limit_mb": MEM_LIMIT_MB,
+                "warn_mb":  MEM_WARN_MB,
+                "trims":    self.mem_trims,
+                "malloc":   _MALLOC_NOTE,
+            },
+            "store": self.store.view(),
             "ts": now,
         }
 
 
-    def _write_state_file(self, snap: dict) -> None:
-        '''Escribe el estado en disco de forma atómica.'''
-        if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
-            return
+    def _state_payload(self) -> Tuple[Optional[tuple], Optional[dict]]:
+        """(firma, contenido) de STATE_FILE: el mismo estado que se guarda en Upstash
+        (posiciones completas, cooldowns, contadores, PnL) más los últimos 130
+        cierres. Sirve de memoria cuando el disco no se borra (VPS, PC local)."""
+        state = self._collect_state()
+        _, full_sig, _ = self._state_signature(state)
+        with self.lock:
+            closed = list(self.closed_trades[:130])
+        if not (closed or state["positions"] or state["cooldowns"] or state["total_realized_pnl"]):
+            return None, None
+        sig = (full_sig, len(closed), closed[0].get("closed_at") if closed else None)
+        return sig, dict(state, saved_at=time.time(), closed_trades=closed)
 
+    def _write_state_file(self, state: Tuple[Optional[tuple], Optional[dict]]) -> None:
+        '''Escribe el estado en disco de forma atómica (solo si cambió).'''
+        sig, payload = state
+        if payload is None or sig == self._persist_sig:
+            return
         tmp = f"{STATE_FILE}.tmp"
         try:
+            data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(snap, fh, ensure_ascii=False, default=str)
+                fh.write(data)
             os.replace(tmp, STATE_FILE)
+            self._persist_sig = sig
         except Exception as exc:
             self.log(f"No pude persistir estado: {exc}")
 
@@ -4179,11 +5492,11 @@ class TradingBot:
                 if not self.running:
                     break
 
-                snap = self._build_snapshot()
-                if not snap["positions"] and not snap["closed_trades"] and snap["scan_count"] <= 0:
-                    continue
+                state = self._state_payload()
+                if state[1] is None or state[0] == self._persist_sig:
+                    continue                    # nada que guardar o sin cambios desde la última vez
 
-                await asyncio.to_thread(self._write_state_file, snap)
+                await asyncio.to_thread(self._write_state_file, state)
 
             except asyncio.CancelledError:
                 if not self.running:
@@ -4201,10 +5514,11 @@ class TradingBot:
     # ── Persistencia ──────────────────────────────────────────────────────────
 
     def persist_state(self) -> None:
-        """Solicita persistencia asíncrona del estado sin bloquear el loop."""
+        """Solicita persistencia asíncrona del estado sin bloquear el loop
+        (disco y memoria externa de Upstash)."""
+        self.store.mark_dirty()
         if self._persist_event is None:
-            snap = self._build_snapshot()
-            self._write_state_file(snap)
+            self._write_state_file(self._state_payload())
             return
 
         try:
@@ -4213,8 +5527,7 @@ class TradingBot:
             else:
                 self._persist_event.set()
         except Exception:
-            snap = self._build_snapshot()
-            self._write_state_file(snap)
+            self._write_state_file(self._state_payload())
 
     def snapshot(self) -> dict:
         # Siempre el estado VIVO: el historial ya se restauró al arrancar
@@ -4232,7 +5545,54 @@ class TradingBot:
 bot = TradingBot()
 bot.start()
 
+
+def _install_shutdown_handlers() -> None:
+    """Render para el servicio con SIGTERM (deploy, reinicio o al dormirlo): el bot
+    deja de operar, guarda lo último en Upstash y suelta el control para la
+    instancia nueva. También al salir normalmente (atexit)."""
+    import atexit
+    import signal as _signal
+
+    def _final(reason: str) -> None:
+        # En un hilo aparte y con tiempo máximo: la señal puede llegar mientras este
+        # mismo hilo tiene tomado el lock del bot (p. ej. gunicorn sync en una petición)
+        t = threading.Thread(target=bot.store.shutdown, args=(reason,), daemon=True,
+                             name="StoreShutdown")
+        t.start()
+        t.join(12.0)
+
+    atexit.register(_final, "Salida del proceso")
+    try:
+        prev = _signal.getsignal(_signal.SIGTERM)
+
+        def _on_term(signum, frame):
+            _final("SIGTERM (Render detiene esta instancia)")
+            if callable(prev) and prev not in (_signal.SIG_IGN, _signal.SIG_DFL):
+                return prev(signum, frame)          # p. ej. el cierre ordenado de gunicorn
+            if prev == _signal.SIG_IGN:
+                return None
+            raise SystemExit(0)
+
+        _signal.signal(_signal.SIGTERM, _on_term)
+    except (ValueError, OSError, AttributeError):
+        pass                                       # no es el hilo principal: queda solo atexit
+
+
+_install_shutdown_handlers()
+
 app = Flask(__name__)
+
+
+@app.before_request
+def _store_gate():
+    """Mientras otra instancia tiene el control de la memoria (deploy en curso o
+    una copia del bot abierta en otro sitio) esta no acepta cambios: se perderían
+    al tomar el control y podrían duplicar órdenes."""
+    if request.method != "POST" or bot.store.manage_ok:
+        return None
+    if request.path.startswith("/api/store/"):
+        return None
+    return jsonify({"ok": False, "error": "No se puede ahora: " + bot.store.block_text()}), 409
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4339,6 +5699,9 @@ HTML = r"""<!doctype html>
 
     .alert { border: 1px solid rgba(240,96,93,.5); background: rgba(240,96,93,.07); border-radius: var(--r-md); padding: 10px 14px; font-size: 14px; display: none; gap: 10px; align-items: flex-start; }
     .alert pre { margin: 0; white-space: pre-wrap; font: 13px/1.5 var(--font); color: #f6b4b2; }
+    .alert.warn { border-color: rgba(242,179,61,.55); background: rgba(242,179,61,.07); }
+    .alert .alert-body { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; flex: 1; min-width: 0; }
+    .alert .alert-body p { margin: 0; flex: 1 1 260px; line-height: 1.5; }
 
     .cols { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 20px; align-items: start; }
     .panel { border: 1px solid var(--rule); border-radius: var(--r-lg); background: var(--panel); }
@@ -4410,6 +5773,11 @@ HTML = r"""<!doctype html>
     .btn.violet { color: #ddd0ff; border-color: rgba(180,140,255,.6); background: rgba(180,140,255,.1); }
     .btn.violet:hover { background: rgba(180,140,255,.18); }
     .btn.block { width: 100%; }
+    .btn.sm { min-height: 32px; padding: 5px 11px; font-size: 13px; }
+    .btn[hidden] { display: none; }
+    .cd-link { background: none; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer;
+               text-decoration: underline dotted var(--dim); text-underline-offset: 5px; }
+    .cd-link:hover { color: var(--blue); }
 
     .ctl { padding: 16px 18px; display: grid; gap: 12px; }
     .ctl + .ctl { border-top: 1px solid var(--rule); }
@@ -4525,6 +5893,10 @@ HTML = r"""<!doctype html>
     .statgrid b { font-family: var(--font-c); font-size: 24px; font-weight: 700; }
     .twocol { display: grid; grid-template-columns: 1.7fr 1fr; gap: 16px; }
     .sub-h { font-size: 14px; color: var(--muted); margin: 0 0 8px; font-weight: 500; }
+    .sub-h-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 8px; min-height: 32px; }
+    .sub-h-row .sub-h { margin: 0; }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    td.act { width: 1%; padding-top: 5px; padding-bottom: 5px; }
     .boxed { border: 1px solid var(--rule); border-radius: var(--r-md); overflow: hidden; }
     .diag { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); border: 1px solid var(--rule); border-radius: var(--r-md); overflow: hidden; }
     .diag > div { padding: 10px 14px; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); margin: 0 -1px -1px 0; }
@@ -4632,7 +6004,7 @@ HTML = r"""<!doctype html>
       <dl>
         <div><dt>PnL realizado</dt><dd id="realizedPnl">—</dd></div>
         <div><dt>Posiciones abiertas</dt><dd id="openCount">—</dd></div>
-        <div><dt>En cooldown</dt><dd id="cdCount">—</dd></div>
+        <div><dt>En cooldown</dt><dd><button type="button" class="cd-link" id="cdCount" title="Ver y liberar los símbolos en cooldown">—</button></dd></div>
         <div><dt>Señales frenadas</dt><dd id="blkCount">—</dd></div>
       </dl>
     </div>
@@ -4664,6 +6036,13 @@ HTML = r"""<!doctype html>
   </section>
 
   <div id="errorBox" class="alert" role="alert"><i class="lamp bad"></i><pre id="lastError"></pre></div>
+  <div id="storeBox" class="alert warn" role="status">
+    <i id="storeLamp" class="lamp warn"></i>
+    <div class="alert-body">
+      <p><b id="storeTitle"></b> <span id="storeMsg"></span></p>
+      <button id="storeTake" class="btn sm amber" type="button" hidden>Tomar el control</button>
+    </div>
+  </div>
 
   <div class="cols">
     <!-- Posiciones -->
@@ -4732,7 +6111,7 @@ HTML = r"""<!doctype html>
       </div>
 
       <div id="sec-cfg" class="anchor">
-        <div class="panel-head" style="border-top:1px solid var(--rule)"><h2>Ajustes</h2><span class="muted" style="font-size:13.5px">se guardan y sobreviven a reinicios</span></div>
+        <div class="panel-head" style="border-top:1px solid var(--rule)"><h2>Ajustes</h2><span class="muted" style="font-size:13.5px" id="cfgPersist">—</span></div>
 
         <details class="acc" id="cfg-gstop">
           <summary><span class="acc-name" id="gsName">Stop global por PnL</span><span class="acc-val" id="cvGstop">—</span><span class="chev"></span></summary>
@@ -4969,11 +6348,14 @@ HTML = r"""<!doctype html>
         </div>
       </div>
       <div>
-        <h3 class="sub-h">En cooldown tras cerrar</h3>
+        <div class="sub-h-row">
+          <h3 class="sub-h">En cooldown tras cerrar</h3>
+          <button class="btn sm" id="cdReleaseAll" type="button" hidden>Liberar todos</button>
+        </div>
         <div class="boxed tablewrap">
           <table class="rt">
-            <thead><tr><th>Símbolo</th><th>Tiempo restante</th><th>Se libera (UTC)</th></tr></thead>
-            <tbody id="tbCooldown"><tr><td colspan="3" class="muted">Ningún símbolo en cooldown.</td></tr></tbody>
+            <thead><tr><th>Símbolo</th><th>Tiempo restante</th><th>Se libera (UTC)</th><th><span class="sr-only">Acción</span></th></tr></thead>
+            <tbody id="tbCooldown"><tr><td colspan="4" class="muted">Ningún símbolo en cooldown.</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -5000,6 +6382,10 @@ HTML = r"""<!doctype html>
         <div><span>Executor</span><b id="executorStatus">—</b></div>
         <div><span>Proxies de arranque</span><b id="proxyStatus">—</b></div>
         <div><span>Tiempo activo</span><b id="uptime">—</b></div>
+        <div><span>Memoria (RSS)</span><b id="memRss">—</b></div>
+        <div><span>Reconexiones de velas</span><b id="klResync">—</b></div>
+        <div><span>Memoria Upstash</span><b id="storeState">—</b></div>
+        <div><span>Keep-alive QStash</span><b id="kaState">—</b></div>
       </div>
       <div id="proxyBox" hidden>
         <h3 class="sub-h" id="proxySum">Proxies de arranque</h3>
@@ -5135,6 +6521,13 @@ function busy(btn, on, label) { if (!btn) return; if (on) { btn.dataset.label = 
 
 // ── Estado del cliente ──────────────────────────────────────────────────────
 let _d = null, _gate = null, _closeAll = {};
+let _skew = 0;           // hora del servidor − hora del navegador (s)
+function tickUntil() {
+  const now = Date.now() / 1000 + _skew;
+  document.querySelectorAll('[data-until]').forEach(td => {
+    const r = n(td.dataset.until) - now; setTxt(td, r > 0 ? fmtDur(r) : 'liberado');
+  });
+}
 let _openPos = new Set(), _posSig = '', _posMeta = {};
 let _histFilter = 'ALL';
 let livePollMs = 250, statusPollMs = 1500, pollOk = false, liveOk = false;
@@ -5158,7 +6551,11 @@ function renderGate(g) {
   // 1) Entradas nuevas
   let st = 'ok', val = 'Permitidas', sub = inv ? 'Un cruce EMA abre la posición contraria' : 'Un cruce EMA puede abrir posición';
   const globalRun = !!(_closeAll.running && (_closeAll.origin === 'GLOBAL' || _closeAll.origin === 'GLOBAL_TP'));
-  if (g.close_all_active) {
+  if (g.store_block) {
+    st = 'bad'; val = 'Bloqueadas';
+    sub = g.store_block.charAt(0).toUpperCase() + g.store_block.slice(1);
+  }
+  else if (g.close_all_active) {
     st = 'bad'; val = 'Cerrando todo';
     sub = !globalRun ? 'Cierre masivo en curso' : _closeAll.origin === 'GLOBAL_TP' ? 'TP global alcanzado' : 'Stop global disparado';
   }
@@ -5368,6 +6765,12 @@ function patchPosition(sym, p) {
 }
 
 // ── Historial ───────────────────────────────────────────────────────────────
+// Un cooldown liberado a mano ya no está activo aunque su hora no haya llegado
+function cdUntilTxt(t) {
+  const until = n(t.unblock_ts);
+  if (until && until > Date.now() / 1000 + _skew && !((_d && _d.cooldowns) || {})[t.symbol]) return 'liberado a mano';
+  return t.unblock_at || '—';
+}
 const REASONS = { TP: ['tp', 'Take profit'], SL: ['sl', 'Stop loss'], MANUAL: ['manual', 'Manual'],
                   GLOBAL: ['global', 'Stop global'], GLOBAL_TP: ['gtp', 'TP global'] };
 function renderHistory() {
@@ -5385,13 +6788,86 @@ function renderHistory() {
       <td data-label="Duración">${t.duration_s === undefined ? '—' : fmtDur(t.duration_s)}</td>
       <td data-label="Entrada">${px(t.avg_entry)}</td>
       <td data-label="Cierre">${px(t.close_price)}</td>
-      <td data-label="Cooldown hasta" class="muted">${esc(t.unblock_at || '—')}</td>
+      <td data-label="Cooldown hasta" class="muted">${esc(cdUntilTxt(t))}</td>
       <td data-label="Cerrada" class="muted">${esc(t.closed_at || '')}</td>
     </tr>`;
   }).join('') : `<tr><td colspan="11" class="muted">${!closed.length ? 'Todavía no hay cierres.' : _histFilter === 'INV' ? 'Ninguna posición invertida cerrada.' : 'Ningún cierre con ese motivo.'}</td></tr>`;
   setHTML(q('tbClosed'), html);
   const rp = n(_d && _d.total_realized_pnl);
   setHTML(q('histSum'), closed.length ? `${closed.length} cierres, realizado <b class="${cls(rp)}">${sgn(rp)} USDT</b>` : 'Sin cierres');
+}
+
+// ── Memoria Upstash (aviso, diagnóstico y texto de Ajustes) ─────────────────
+function renderStore(s) {
+  if (!s) return;
+  const holder = s.holder ? `la instancia ${s.holder}` : 'otra instancia';
+  let show = false, lamp = 'warn', title = '', msg = '', take = false;
+  if (s.status === 'waiting') {
+    show = true; take = true; title = 'Esta instancia espera:';
+    msg = `${holder} tiene el control de la memoria. Suele ser un deploy en curso: esta seguirá sola, con todo lo guardado, en cuanto la otra guarde y se detenga (1-2 min). Mientras tanto no opera.`;
+  } else if (s.status === 'standby') {
+    show = true; take = true; title = 'Esta instancia no opera:';
+    msg = `${holder} tomó el control de la memoria y esta se detuvo para no duplicar órdenes. Si la otra ya no debería estar funcionando, toma el control aquí.`;
+  } else if (s.status === 'degraded') {
+    show = true; lamp = 'bad'; title = 'Memoria Upstash sin conexión:';
+    msg = `${s.last_error || s.detail || 'sin respuesta'}. Reintentando sola; mientras tanto el bot gestiona lo abierto pero no abre posiciones nuevas.`;
+  } else if (s.status === 'error') {
+    show = true; lamp = 'bad'; title = 'Memoria Upstash desactivada:';
+    msg = `${s.detail || s.last_error}. El bot opera, pero lo que cambie se perderá si Render lo reinicia.`;
+  } else if (s.status === 'active' && n(s.fail_s) > 60) {
+    show = true; title = 'Memoria Upstash:';
+    msg = `no puedo guardar desde hace ${fmtDur(s.fail_s)} (${s.last_error}). Reintentando; lo último guardado sigue a salvo.`;
+  }
+  const box = q('storeBox');
+  box.style.display = show ? 'flex' : 'none';
+  box.classList.toggle('warn', lamp === 'warn');
+  setLamp(q('storeLamp'), lamp);
+  setTxt('storeTitle', title); setTxt('storeMsg', msg);
+  q('storeTake').hidden = !take;
+
+  const st = q('storeState');
+  const ago = s.last_save_ago === null || s.last_save_ago === undefined ? '' : `, guardado hace ${fmtDur(s.last_save_ago)}`;
+  const TXT = { off: 'Desactivada', connecting: 'Conectando', active: 'Activa' + ago, waiting: 'En espera',
+                standby: 'En espera', degraded: 'Sin conexión', error: 'Error' };
+  setTxt(st, TXT[s.status] || s.status);
+  st.className = s.status === 'active' ? 'pos' : (s.status === 'off' ? 'muted' : (s.status === 'degraded' || s.status === 'error') ? 'neg' : 'warn-t');
+  st.title = s.status === 'off' ? s.detail : `prefijo ${s.prefix} · ${n(s.saves)} guardados · ${n(s.calls)} peticiones · ${s.loaded || ''}`;
+  const ka = s.keepalive || {}, kb = q('kaState');
+  setTxt(kb, ka.status === 'active' ? 'Activo, ' + (ka.cron === '*/10 * * * *' ? 'cada 10 min' : ka.cron)
+           : ka.status === 'error' ? 'Error' : 'Desactivado');
+  kb.className = ka.status === 'active' ? 'pos' : ka.status === 'error' ? 'neg' : 'muted';
+  kb.title = ka.detail || '';
+
+  setTxt('cfgPersist', s.status === 'active' ? 'se guardan en Upstash y sobreviven a reinicios'
+    : s.status === 'degraded' ? 'Upstash sin conexión: se guardarán al reconectar'
+    : (s.status === 'waiting' || s.status === 'standby') ? 'otra instancia tiene el control'
+    : 'se guardan en el servidor; en Render free se pierden al reiniciar');
+}
+async function releaseCooldown(sym, btn) {
+  btn.disabled = true; btn.textContent = 'Liberando…';
+  try {
+    await postJSON(`/api/cooldown/release/${encodeURIComponent(sym)}`);
+    toast(`${sym} liberado: puede abrir con el próximo cruce EMA`, 'ok');
+  } catch (e) { btn.disabled = false; btn.textContent = 'Liberar'; toast(`No se liberó ${sym}: ${e.message}`, 'bad'); }
+  finally { requestFull(true); }
+}
+async function releaseAllCooldowns() {
+  const k = q('tbCooldown').querySelectorAll('button[data-cd-release]').length;
+  if (!k) return;
+  if (!confirm(`¿Liberar los ${k} símbolos en cooldown?\n\nPodrán volver a abrir posición con el próximo cruce EMA.`)) return;
+  const btn = q('cdReleaseAll'); btn.disabled = true;
+  try {
+    const r = await postJSON('/api/cooldown/release-all');
+    toast(r.count === 1 ? '1 símbolo liberado del cooldown' : `${r.count} símbolos liberados del cooldown`, 'ok');
+  } catch (e) { toast('No se liberaron: ' + e.message, 'bad'); }
+  finally { btn.disabled = false; requestFull(true); }
+}
+async function storeTakeover() {
+  if (!confirm('¿Tomar el control en esta instancia?\n\nLa otra dejará de operar en unos segundos. Hazlo solo si la otra ya no debería estar funcionando (por ejemplo, una copia vieja del bot).')) return;
+  const btn = q('storeTake'); btn.disabled = true;
+  try { await postJSON('/api/store/takeover'); toast('Esta instancia tiene ahora el control', 'ok'); }
+  catch (e) { toast('No se pudo tomar el control: ' + e.message, 'bad'); }
+  finally { btn.disabled = false; requestFull(true); }
 }
 
 // ── Cierre masivo ───────────────────────────────────────────────────────────
@@ -5422,6 +6898,8 @@ function renderCloseAll(ca, openN) {
 function render(d) {
   if (!d) return;
   _d = d;
+  if (n(d.ts)) _skew = n(d.ts) - Date.now() / 1000;
+  renderStore(d.store);
   if (n(d.live_poll_ms))   livePollMs   = Math.max(100, n(d.live_poll_ms));
   if (n(d.status_poll_ms)) statusPollMs = Math.max(500, n(d.status_poll_ms));
 
@@ -5465,7 +6943,7 @@ function render(d) {
     setTxt('cvEma', `${n(d.ema_fast)} / ${n(d.ema_slow)}, velas de ${d.ema_interval || ''}`);
     fillVal('emaFastInput', n(d.ema_fast)); fillVal('emaSlowInput', n(d.ema_slow));
     q('emaFastInput').max = q('emaSlowInput').max = n(d.ema_max_period || 500);
-    setTxt('emaNote', `La EMA lenta admite hasta ${n(d.ema_max_period)} (se guardan ${n(d.ema_max_candles)} velas por símbolo; ${n(kw.pairs_with_data)} símbolos listos). Al cambiarlas se recalculan con esas velas, sin descargar nada y sin cruces falsos. Las posiciones abiertas no cambian.`);
+    setTxt('emaNote', `La EMA lenta admite hasta ${n(d.ema_max_period)} (se guardan ${n(d.ema_max_candles)} velas por símbolo; ${n(kw.pairs_with_data)} símbolos listos). Al cambiarlas se recalculan con esas velas, sin descargar nada y sin cruces falsos. Las posiciones abiertas no cambian. Para que sigan así tras un reinicio de Render, ponlas también en Environment como EMA_FAST y EMA_SLOW.`);
   }
   q('edPeriod').max = n(d.ema_max_period || 500);
   ladderSync(d.ladder);
@@ -5473,7 +6951,7 @@ function render(d) {
   // Señales frenadas
   const g = d.gate || {};
   const KIND = { pausa: 'Pausa', exposicion: 'Exposición', btc: 'Filtro BTC', btc_down: 'Filtro BTC bajista',
-                 btc_up: 'Filtro BTC alcista', ema_dca: 'Condición EMA' };
+                 btc_up: 'Filtro BTC alcista', ema_dca: 'Condición EMA', memoria: 'Memoria Upstash' };
   const recent = Array.isArray(g.blocked_recent) ? g.blocked_recent : [];
   setHTML(q('blkList'), recent.length ? recent.map(b => `<li>
       <time>${hhmm(b.ts)}</time><span class="side ${b.side === 'LONG' ? 'long' : 'short'}">${esc(b.side)}</span>
@@ -5489,10 +6967,17 @@ function render(d) {
   setHTML(q('tbWinners'), winners.length ? winners.map(w => `<tr id="wrow_${w.symbol}">
       <td class="sym">${w.symbol}</td><td id="wc_${w.symbol}" class="num ${cls(w.change)}">${pctS(w.change)}</td><td id="wp_${w.symbol}">${px(w.price)}</td></tr>`).join('')
     : '<tr><td colspan="3" class="muted">Nada en el radar.</td></tr>');
-  const cds = Object.entries(d.cooldowns || {}).sort((a, b) => n(a[1].remaining_s) - n(b[1].remaining_s));
-  setHTML(q('tbCooldown'), cds.length ? cds.map(([s, i]) => `<tr><td data-label="Símbolo" class="sym">${s}</td>
-      <td data-label="Restante" class="warn-t" data-cd="${n(i.remaining_s)}">${fmtDur(i.remaining_s)}</td><td data-label="Se libera" class="muted">${esc(i.unblock_utc)}</td></tr>`).join('')
-    : '<tr><td colspan="3" class="muted">Ningún símbolo en cooldown.</td></tr>');
+  // Filas estables (solo cambian si entra o sale un símbolo): el reloj local
+  // actualiza el tiempo restante y los botones no se rehacen bajo el dedo.
+  const cds = Object.entries(d.cooldowns || {}).sort((a, b) => n(a[1].unblock_ts) - n(b[1].unblock_ts));
+  setHTML(q('tbCooldown'), cds.length ? cds.map(([s, i]) => `<tr><td data-label="Símbolo" class="sym">${esc(s)}</td>
+      <td data-label="Restante" class="warn-t" data-until="${n(i.unblock_ts)}">…</td><td data-label="Se libera" class="muted">${esc(i.unblock_utc)}</td>
+      <td data-label="" class="act"><button class="btn sm" type="button" data-cd-release="${esc(s)}" title="Quitar ${esc(s)} del cooldown: podrá abrir con el próximo cruce EMA">Liberar</button></td></tr>`).join('')
+    : '<tr><td colspan="4" class="muted">Ningún símbolo en cooldown.</td></tr>');
+  tickUntil();
+  const ra = q('cdReleaseAll');
+  ra.hidden = cds.length < 2;
+  setTxt(ra, `Liberar los ${cds.length}`);
   setTxt('radarSum', `${winners.length} en el radar, ${cds.length} en cooldown`);
 
   // Diagnóstico
@@ -5513,7 +6998,14 @@ function render(d) {
   renderExecutor(d.executor);
   renderProxy(d.rest_proxy);
   setTxt('uptime', fmtDur(d.uptime_seconds));
-  setTxt('diagSum', `${d.ws_connected ? 'WebSocket conectado' : 'WebSocket desconectado'}, ${fx(d.eval_rate, 0)} evaluaciones/s`);
+  const mem = d.memory || {};
+  if (n(mem.rss_mb)) {
+    setTxt('memRss', `${fx(mem.rss_mb, 0)} MB de ${fx(mem.limit_mb, 0)} (pico ${fx(mem.peak_mb, 0)})`);
+    q('memRss').className = n(mem.rss_mb) >= n(mem.warn_mb) ? 'neg' : n(mem.rss_mb) >= 0.6 * n(mem.limit_mb) ? 'warn-t' : 'pos';
+  }
+  setTxt('klResync', `${n(kw.reconnects)} cortes, ${n(kw.gap_fills)} huecos rellenados, ${n(kw.full_warmups)} siembras completas`);
+  setTxt('diagSum', `${d.ws_connected ? 'WebSocket conectado' : 'WebSocket desconectado'}, ${fx(d.eval_rate, 0)} evaluaciones/s`
+    + (n(mem.rss_mb) ? `, memoria ${fx(mem.rss_mb, 0)} MB` : ''));
 
   const evs = Array.isArray(d.events) ? d.events : [];
   setHTML(q('events'), evs.map(line => {
@@ -6193,6 +7685,17 @@ document.addEventListener('DOMContentLoaded', () => {
   q('caStart').addEventListener('click', closeAll);
   q('caCancel').addEventListener('click', cancelCloseAll);
 
+  // Cooldowns: liberar uno (botón de su fila) o todos de golpe; control de la memoria
+  q('tbCooldown').addEventListener('click', e => {
+    const b = e.target.closest('button[data-cd-release]');
+    if (b && !b.disabled) releaseCooldown(b.dataset.cdRelease, b);
+  });
+  q('cdReleaseAll').addEventListener('click', releaseAllCooldowns);
+  q('storeTake').addEventListener('click', storeTakeover);
+  q('cdCount').addEventListener('click', () => {
+    const s = q('sec-radar'); s.open = true; s.scrollIntoView({ block: 'start' });
+  });
+
   // Pausas con duración y executor
   segInit('pauseSeg', 'pauseMin', 'pauseMin');
   segInit('execSeg', 'execMin', 'execMin');
@@ -6252,11 +7755,19 @@ setInterval(() => {
   Object.entries(_posMeta).forEach(([s, m]) => setTxt('pdur_' + s, fmtDur(now - m.opened)));
   const el = (Date.now() - _lastFull) / 1000;
   document.querySelectorAll('[data-cd]').forEach(td => { const r = n(td.dataset.cd) - el; setTxt(td, r > 0 ? fmtDur(r) : 'liberado'); });
+  tickUntil();
 }, 1000);
 
+// Con la pestaña en segundo plano se refresca mucho menos: el servidor sigue
+// recibiendo visitas (Render no lo duerme) sin gastar CPU en datos que nadie ve.
+const HIDDEN_LIVE_MS = 5000, HIDDEN_STATUS_MS = 15000;
+
 // ── Bucle 1: precios en vivo ────────────────────────────────────────────────
-let liveTimer = null, liveFails = 0;
+let liveTimer = null, liveFails = 0, liveInFlight = false;
 async function livePoll() {
+  if (liveInFlight) return;
+  liveInFlight = true;
+  clearTimeout(liveTimer);
   const t0 = performance.now();
   try {
     const r = await fetch('/api/live', { cache: 'no-store' });
@@ -6265,11 +7776,18 @@ async function livePoll() {
     liveFails = 0; liveOk = true;
   } catch (e) { liveFails++; liveOk = false; }
   finally {
+    liveInFlight = false;
     setLamp(q('lampPoll'), (pollOk && liveOk) ? 'ok' : (pollOk || liveOk) ? 'warn' : 'bad');
     const spent = performance.now() - t0, backoff = liveFails ? Math.min(3000, liveFails * 300) : 0;
-    liveTimer = setTimeout(livePoll, Math.max(0, livePollMs - spent) + backoff);
+    const base = document.hidden ? HIDDEN_LIVE_MS : livePollMs;
+    liveTimer = setTimeout(livePoll, Math.max(0, base - spent) + backoff);
   }
 }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  livePoll();
+  requestFull(true);
+});
 
 // ── Bucle 2: estructura completa ────────────────────────────────────────────
 let statusTimer = null, statusDelay = 1500, statusInFlight = false;
@@ -6280,7 +7798,7 @@ async function pollStatus() {
     const r = await fetch('/api/status', { cache: 'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     render(await r.json());
-    pollOk = true; statusDelay = statusPollMs;
+    pollOk = true; statusDelay = document.hidden ? HIDDEN_STATUS_MS : statusPollMs;
   } catch (e) {
     pollOk = false; statusDelay = Math.min(statusDelay * 1.5, 15000);
     console.warn('Error leyendo /api/status:', e.message);
@@ -6308,6 +7826,56 @@ loadStats();
 # RUTAS FLASK
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _JsonCache:
+    """Respuesta JSON ya serializada que comparten las peticiones que llegan en el
+    mismo instante: con el panel abierto en el PC y en el móvil el servidor ya no
+    construye el snapshot dos veces. Con una sola pestaña no cambia nada (el TTL es
+    la mitad del intervalo de refresco) y cualquier POST lo invalida."""
+
+    def __init__(self, ttl_s: float) -> None:
+        self.ttl = max(0.0, float(ttl_s))
+        self._lock = threading.Lock()
+        self._body: Optional[bytes] = None
+        self._ts = 0.0
+        self._gen = 0
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._body = None
+            self._gen += 1
+
+    def get(self, build) -> bytes:
+        with self._lock:
+            if self._body is not None and time.monotonic() - self._ts < self.ttl:
+                return self._body
+            gen = self._gen
+        body = json.dumps(build(), ensure_ascii=False, separators=(",", ":"),
+                          default=str).encode("utf-8")
+        with self._lock:
+            if gen == self._gen:                  # nadie lo invalidó mientras se construía
+                self._body, self._ts = body, time.monotonic()
+        return body
+
+
+_STATUS_CACHE = _JsonCache(min(1.0, STATUS_POLL_MS / 2000.0))
+_LIVE_CACHE   = _JsonCache(min(0.5, LIVE_POLL_MS / 2000.0))
+
+
+def _json_response(body: bytes):
+    resp = Response(body, mimetype="application/json")
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.after_request
+def _fresh_after_write(resp):
+    """Tras cualquier cambio (POST) el siguiente refresco del panel sale nuevo."""
+    if request.method == "POST":
+        _STATUS_CACHE.invalidate()
+        _LIVE_CACHE.invalidate()
+    return resp
+
+
 @app.get("/")
 def index():
     resp = make_response(HTML)
@@ -6317,17 +7885,13 @@ def index():
 
 @app.get("/api/status")
 def api_status():
-    resp = jsonify(bot.snapshot())
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
-    return resp
+    return _json_response(_STATUS_CACHE.get(bot.snapshot))
 
 
 @app.get("/api/live")
 def api_live():
     """Payload mínimo (precio, cambio y PnL) para el refresco en vivo del navegador."""
-    resp = jsonify(bot.live_payload())
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
-    return resp
+    return _json_response(_LIVE_CACHE.get(bot.live_payload))
 
 
 @app.post("/api/close/<symbol>")
@@ -6456,7 +8020,7 @@ def api_trades():
     except ValueError:
         limit = 200
     with bot._stats_lock:
-        rows = list(bot.trade_stats[-limit:])
+        rows = list(bot.trade_stats)[-limit:]
     rows.reverse()
     resp = jsonify(rows)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
@@ -6465,25 +8029,55 @@ def api_trades():
 
 @app.get("/api/trades.csv")
 def api_trades_csv():
-    """Descarga CSV de todo el histórico (para analizarlo en Excel / pandas)."""
+    """Descarga CSV de todo el histórico (para analizarlo en Excel / pandas).
+    Se lee del archivo línea a línea (en memoria solo están las más recientes)."""
     cols = [
         "trade_id", "symbol", "direction", "inverted", "signal_dir", "reason", "opened_at_ts", "closed_at_ts",
         "duration_s", "avg_entry", "close_price", "qty", "notional", "fills_n", "levels",
         "sl_usd", "target", "pnl", "pnl_pct", "mfe_usd", "mae_usd", "mfe_pct", "mae_pct",
         "time_to_mfe_s", "time_to_mae_s", "low_price", "high_price",
     ]
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(cols)
-    with bot._stats_lock:
-        rows = list(bot.trade_stats)
-    for r in rows:
-        out = []
-        for c in cols:
-            v = r.get(c, "")
-            out.append("|".join(str(x) for x in v) if isinstance(v, list) else v)
-        writer.writerow(out)
-    resp = make_response(buf.getvalue())
+
+    def records():
+        if os.path.exists(STATS_FILE):
+            try:
+                with open(STATS_FILE, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        if isinstance(rec, dict):
+                            yield rec
+                return
+            except OSError:
+                pass
+        with bot._stats_lock:
+            mem = list(bot.trade_stats)
+        yield from mem
+
+    def generate():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(cols)
+        n = 0
+        for r in records():
+            out = []
+            for c in cols:
+                v = r.get(c, "")
+                out.append("|".join(str(x) for x in v) if isinstance(v, list) else v)
+            writer.writerow(out)
+            n += 1
+            if n % 200 == 0:
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate(0)
+        yield buf.getvalue()
+
+    resp = Response(generate(), mimetype="text/csv")
     resp.headers["Content-Type"] = "text/csv; charset=utf-8"
     resp.headers["Content-Disposition"] = "attachment; filename=trade_stats.csv"
     resp.headers["Cache-Control"] = "no-store, max-age=0"
@@ -6539,6 +8133,40 @@ def api_set_ema():
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc) or type(exc).__name__}), 500
     return jsonify({"ok": True, **result})
+
+
+@app.post("/api/cooldown/release/<symbol>")
+def api_cooldown_release(symbol: str):
+    """Libera UN símbolo del cooldown: podrá abrir con el próximo cruce EMA."""
+    symbol = symbol.upper().strip()
+    released = bot.release_cooldowns([symbol])
+    if not released:
+        return jsonify({"ok": False, "error": f"{symbol} no está en cooldown"}), 404
+    return jsonify({"ok": True, "released": released, "count": len(released)})
+
+
+@app.post("/api/cooldown/release-all")
+def api_cooldown_release_all():
+    """Libera TODOS los símbolos en cooldown de una vez."""
+    released = bot.release_cooldowns(None)
+    return jsonify({"ok": True, "released": released, "count": len(released)})
+
+
+@app.get("/api/store")
+def api_store():
+    """Estado de la memoria externa (Upstash) y del keep-alive (QStash)."""
+    resp = jsonify(bot.store.view())
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.post("/api/store/takeover")
+def api_store_takeover():
+    """Esta instancia toma el control de la memoria aunque otra lo tenga."""
+    res = bot.store_takeover()
+    if res.get("ok"):
+        return jsonify(res)
+    return jsonify({"ok": False, "error": res.get("error", "error")}), res.get("code", 500)
 
 
 @app.post("/api/close-all")
@@ -6699,23 +8327,66 @@ def api_close_all_status():
 
 @app.get("/health")
 def health():
-    snap = bot.snapshot()
+    """Ligero a propósito (Render o un pinger lo llaman a menudo): antes construía
+    el snapshot completo del panel en cada llamada."""
+    ws_ok, universe = False, 0
+    pc = bot.price_cache
+    if pc is not None:
+        try:
+            st = pc.get_stats()
+            ws_ok, universe = bool(st.get("connected", False)), int(st.get("active_tickers", 0) or 0)
+        except Exception:
+            pass
+    now = time.time()
+    with bot.lock:
+        cooldowns = sum(1 for ts in bot.symbol_cooldown.values() if ts > now)
     return jsonify({
         "ok":                True,
         "running":           bot.running,
-        "mode":              snap["mode"],
-        "ws_connected":      snap.get("ws_connected", False),
-        "scan_count":        snap["scan_count"],
-        "eval_rate":         snap.get("eval_rate", 0),
-        "latency_avg_ms":    snap.get("latency_avg_ms", 0),
-        "all_symbols_count": snap["all_symbols_count"],
-        "universe_count":    snap.get("universe_count", 0),
-        "subscribed_count":  snap["subscribed_count"],
-        "last_error":        snap["last_error"],
-        "cooldown_count":    snap["cooldown_count"],
+        "mode":              "PAPER" if PAPER_MODE or not LIVE_TRADING else "REAL",
+        "ws_connected":      ws_ok,
+        "scan_count":        bot.scan_count,
+        "eval_rate":         bot.eval_rate,
+        "latency_avg_ms":    bot.latency_avg_ms,
+        "all_symbols_count": len(bot.all_symbols),
+        "universe_count":    universe,
+        "subscribed_count":  len(bot.watch),
+        "last_error":        bot.last_error,
+        "cooldown_count":    cooldowns,
+        "rss_mb":            round(bot._note_rss(), 1),
+        "peak_mb":           round(bot.mem_peak_mb, 1),
+        "uptime_s":          round(now - bot.started_at),
+        "store":             bot.store.status,
+        "keepalive":         bot.store.keepalive.get("status", "off"),
     })
+
+
+# El servidor de Flask escribe una línea de log por petición: con el panel abierto
+# son 4-5 por segundo (/api/live cada 250 ms), que tapan los mensajes del bot en el
+# log de Render y gastan CPU. Se omiten las respuestas correctas de las rutas de
+# refresco; los errores y el resto de rutas se siguen registrando.
+_QUIET_PATHS = frozenset({"/api/live", "/api/status", "/api/stats", "/health"})
+
+try:
+    from werkzeug.serving import WSGIRequestHandler as _WSGIRequestHandler
+
+    class _QuietRequestHandler(_WSGIRequestHandler):
+        def log_request(self, code="-", size="-"):
+            try:
+                c = int(getattr(code, "value", code))
+                if (self.command == "GET" and 200 <= c < 400
+                        and self.path.split("?", 1)[0] in _QUIET_PATHS):
+                    return
+            except Exception:
+                pass
+            super().log_request(code, size)
+except Exception:                                   # werkzeug sin esa clase: log normal
+    _QuietRequestHandler = None
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    run_opts: Dict[str, Any] = {"threaded": True}
+    if _QuietRequestHandler is not None:
+        run_opts["request_handler"] = _QuietRequestHandler
+    app.run(host="0.0.0.0", port=port, **run_opts)
