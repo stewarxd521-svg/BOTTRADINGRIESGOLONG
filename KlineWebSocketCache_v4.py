@@ -1,6 +1,23 @@
 """
-KlineWebSocketCache — v6  (detector de cruces EMA · hasta 1500 velas por símbolo)
+KlineWebSocketCache — v7  (detector de cruces EMA · hasta 1500 velas por símbolo)
 ================================================================================
+
+CAMBIOS v7 (Render free: 512 MB de RAM y 0.1 CPU)
+────────────────────────────────────────────────
+  • El bucle del WebSocket ya no envuelve cada mensaje en asyncio.wait_for
+    (≈800 mensajes/s con 200 símbolos = 800 temporizadores por segundo). El
+    silencio del stream lo vigila una tarea aparte cada pocos segundos.
+  • Con websockets ≥ 13 se reciben bytes (recv(decode=False)): solo se
+    decodifican las velas cerradas, no las ~800 actualizaciones por segundo.
+  • Tras un corte del WebSocket, cada símbolo descarga SOLO las velas que le
+    faltan (1 petición de peso 1-2 y unos KB) en vez de re-sembrar 1500 velas
+    (peso 10, ~200 KB y ~1.5 MB de objetos Python por símbolo, × 200 a la vez).
+  • Si llegaba un hueco mientras el símbolo ya se estaba sembrando, el aviso se
+    perdía y el símbolo podía quedarse sin estar listo para siempre: ahora se
+    repite la siembra al terminar.
+  • El nº de velas guardadas NO depende de los periodos: siempre son hasta
+    max_candles cierres por símbolo (≈2.4 MB para 200 símbolos), igual con
+    EMA 100/200 que con 200/500.
 
 QUÉ HACE
 ────────
@@ -33,7 +50,8 @@ FLUJO
   3. WebSocket único con SUBSCRIBE/UNSUBSCRIBE en caliente. Solo se
      parsean los mensajes con x=true (vela cerrada).
   4. Si falta una vela (corte de red) se detecta por el hueco en
-     open_time y SOLO ese símbolo se re-siembra por REST.
+     open_time y SOLO ese símbolo descarga por REST las velas que le faltan
+     (o, si el hueco es muy grande, se re-siembra entero).
   5. Todo el estado se modifica únicamente desde el hilo/loop del cache
      (también set_periods), así que no hay condiciones de carrera.
 """
@@ -41,6 +59,7 @@ FLUJO
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import random
@@ -119,6 +138,7 @@ class KlineWebSocketCache:
 
     BASE_REST_URL = "https://fapi.binance.com"
     MAX_KLINES    = 1500        # máximo de velas por petición REST de Binance
+    GAP_FILL_MAX  = 300         # huecos de hasta 300 velas se rellenan sin re-sembrar todo
     # Mismo endpoint que usa WS.py (por defecto). Sobrescribible con KLINE_WS_URL.
     DEFAULT_WS_URL = os.environ.get("KLINE_WS_URL", "wss://fstream.binance.com/market/stream")
 
@@ -170,6 +190,7 @@ class KlineWebSocketCache:
         self._states:  Dict[str, _EmaState] = {}
         self._pending: Dict[str, List[Tuple[int, float, int]]] = {}
         self._warming: Set[str] = set()
+        self._rewarm:  Set[str] = set()     # pidieron siembra mientras ya había una en curso
         self._signal_cb: Optional[SignalCallback] = None
 
         # WS
@@ -178,6 +199,7 @@ class KlineWebSocketCache:
         self._req_id = 0
         self._last_msg = 0.0
         self._connected = False
+        self._close_reason = ""
         self._sub_lock: Optional[asyncio.Lock] = None
 
         # REST
@@ -191,6 +213,8 @@ class KlineWebSocketCache:
         self.signals        = 0
         self.stale_signals  = 0
         self.gap_resyncs    = 0
+        self.gap_fills      = 0         # huecos rellenados descargando solo lo que faltaba
+        self.full_warmups   = 0         # siembras completas (1500 velas)
         self.reconnects     = 0
         self.last_error     = ""
 
@@ -399,15 +423,71 @@ class KlineWebSocketCache:
     # ─────────────────────────────────────────────────────────────────────
 
     def _schedule_warmup(self, sym: str) -> None:
-        if not self._running or sym in self._warming or sym not in self._states:
+        if not self._running or sym not in self._states:
+            return
+        if sym in self._warming:
+            # Ya hay una siembra en curso: se repite al terminar si el símbolo sigue
+            # sin estar listo (antes este aviso se perdía y el símbolo se atascaba).
+            self._rewarm.add(sym)
             return
         self._warming.add(sym)
         self._pending.setdefault(sym, [])
         self._spawn(self._warmup(sym))
 
+    async def _gap_fill(self, sym: str, st: _EmaState) -> bool:
+        """Rellena un hueco corto descargando SOLO las velas que faltan (peso 1-2,
+        unos KB) en vez de re-sembrar 1500 velas (peso 10, ~200 KB y ~1.5 MB de
+        objetos Python por símbolo; tras un corte del WS, para los ~200 a la vez).
+        Las EMA siguen de forma incremental, como si no se hubiera perdido nada.
+        Devuelve False si hace falta la siembra completa."""
+        pend = self._pending.get(sym) or ()
+        newest = max((p[0] for p in pend), default=0)
+        if newest <= st.last_ot:
+            return False
+        missing = (newest - st.last_ot) // self._iv_ms     # incluye la vela que destapó el hueco
+        if missing > self.GAP_FILL_MAX:
+            return False
+        limit  = int(missing) + 2
+        params = {"symbol": sym, "interval": self.interval,
+                  "startTime": st.last_ot + self._iv_ms, "limit": limit}
+        async with self._sem:
+            data = await self._fetch(
+                f"{self.BASE_REST_URL}/fapi/v1/klines", params,
+                _TokenBucket.weight_for_limit(limit),
+            )
+        if self._states.get(sym) is not st:
+            return True                                  # salió del universo mientras se descargaba
+        now_ms = int(time.time() * 1000)
+        applied = 0
+        for k in data:
+            ot, ct = int(k[0]), int(k[6])
+            if ct >= now_ms:
+                break                                    # vela aún abierta
+            if ot <= st.last_ot:
+                continue
+            if ot != st.last_ot + self._iv_ms:
+                return False                             # el REST también tiene hueco: siembra completa
+            close = float(k[4])
+            st.last_ot = ot
+            applied += 1
+            cross = self._step(st, close)
+            if cross and st.n >= self.min_candles:
+                self._emit(sym, cross, close, ct)        # _emit descarta los cruces de velas viejas
+        if not applied:
+            return False
+        st.ready = True
+        self.gap_fills += 1
+        for ot, c, ct in self._pending.pop(sym, []):     # velas llegadas mientras tanto
+            self._on_closed(sym, ot, c, ct)
+        return True
+
     async def _warmup(self, sym: str) -> None:
         retry = False
         try:
+            st = self._states.get(sym)
+            if st is not None and st.closes and st.last_ot:
+                if await self._gap_fill(sym, st):
+                    return
             limit  = self.max_candles
             params = {"symbol": sym, "interval": self.interval, "limit": limit}
             async with self._sem:
@@ -431,6 +511,7 @@ class KlineWebSocketCache:
             self._recompute(new)                     # EMA con los periodos ACTUALES
             new.ready = len(new.closes) > 0
             self._states[sym] = new
+            self.full_warmups += 1
 
             for ot, c, ct in self._pending.pop(sym, []):   # velas llegadas durante la siembra
                 self._on_closed(sym, ot, c, ct)
@@ -442,8 +523,14 @@ class KlineWebSocketCache:
             retry = True
         finally:
             self._warming.discard(sym)
-            if retry and self._running and sym in self._states:
-                self._loop.call_later(15.0, self._schedule_warmup, sym)
+            again = sym in self._rewarm
+            self._rewarm.discard(sym)
+            st = self._states.get(sym)
+            if self._running and st is not None and not st.ready:
+                if retry:
+                    self._loop.call_later(15.0, self._schedule_warmup, sym)
+                elif again:
+                    self._loop.call_later(1.0, self._schedule_warmup, sym)
 
     # ─────────────────────────────────────────────────────────────────────
     # Universo (top N más activas)
@@ -551,8 +638,21 @@ class KlineWebSocketCache:
         # Filtro barato: solo velas cerradas. Evita parsear ~99% de mensajes.
         if '"x":true' not in raw:
             return
+        self._parse_closed(raw)
+
+    def _handle_raw_bytes(self, raw) -> None:
+        """Igual que _handle_raw, con los bytes del socket sin decodificar."""
         try:
-            ev = json.loads(raw).get("data")
+            if b'"x":true' not in raw:
+                return
+        except TypeError:                            # llegó texto: se trata como texto
+            self._handle_raw(raw)
+            return
+        self._parse_closed(raw)
+
+    def _parse_closed(self, raw) -> None:
+        try:
+            ev = json.loads(raw).get("data")         # json.loads acepta str y bytes
             if not ev or ev.get("e") != "kline":
                 return
             k = ev["k"]
@@ -561,9 +661,36 @@ class KlineWebSocketCache:
         except Exception:
             pass
 
+    @staticmethod
+    def _recv_bytes_ok(ws) -> bool:
+        """websockets ≥ 13 admite recv(decode=False): entrega bytes sin pasarlos a
+        texto, así solo se decodifican las velas cerradas."""
+        try:
+            return "decode" in inspect.signature(ws.recv).parameters
+        except (TypeError, ValueError):
+            return False
+
+    async def _watchdog(self, ws) -> None:
+        """Detecta un stream silencioso sin crear un temporizador por mensaje
+        (antes cada recv iba dentro de asyncio.wait_for)."""
+        step = max(1.0, min(10.0, self.silence_s / 6.0))
+        while self._running and self._ws is ws:
+            await asyncio.sleep(step)
+            quiet = time.time() - self._last_msg
+            if quiet > self.silence_s:
+                self._close_reason = f"stream silencioso ({quiet:.0f}s sin mensajes)"
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                return
+
     async def _ws_loop(self) -> None:
         delay = 1.0
         while self._running:
+            dog: Optional[asyncio.Task] = None
+            opened = 0.0
+            self._close_reason = ""
             try:
                 async with websockets.connect(
                     self.ws_url,
@@ -575,25 +702,37 @@ class KlineWebSocketCache:
                     self._last_msg = time.time()
                     await self._reconcile()
                     self._connected = True
-                    delay = 1.0
+                    opened = time.time()
                     print(f"✅ Kline WS conectado — {len(self._subscribed)} streams")
+                    dog = asyncio.get_running_loop().create_task(self._watchdog(ws))
 
-                    while self._running:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                        except asyncio.TimeoutError:
-                            if time.time() - self._last_msg > self.silence_s:
-                                raise RuntimeError("stream silencioso")
-                            continue
-                        self._last_msg = time.time()
-                        self._handle_raw(raw)
+                    # Bucle caliente (~800 mensajes/s con 200 símbolos): sin wait_for.
+                    if self._recv_bytes_ok(ws):
+                        handle = self._handle_raw_bytes
+                        while self._running:
+                            raw = await ws.recv(decode=False)
+                            self._last_msg = time.time()
+                            handle(raw)
+                    else:
+                        handle = self._handle_raw
+                        while self._running:
+                            raw = await ws.recv()
+                            self._last_msg = time.time()
+                            handle(raw)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.reconnects += 1
-                self.last_error = f"ws: {e}"
-                print(f"🔴 Kline WS: {e} — reconectando en {delay:.1f}s")
+                if opened and time.time() - opened >= 60.0:
+                    delay = 1.0      # estuvo sana un rato: se reintenta enseguida
+                # (si se cae nada más conectar, la espera sigue creciendo hasta 30 s
+                #  en vez de reconectar cada segundo)
+                why = self._close_reason or str(e) or type(e).__name__
+                self.last_error = f"ws: {why}"
+                print(f"🔴 Kline WS: {why} — reconectando en {delay:.1f}s")
             finally:
+                if dog is not None:
+                    dog.cancel()
                 self._ws = None
                 self._connected = False
             if not self._running:
@@ -627,7 +766,7 @@ class KlineWebSocketCache:
                                                keepalive_timeout=30))
             self._spawn(self._ws_loop())
             self._spawn(self._universe_loop())
-            print(f"🚀 KlineEMA v6: EMA{self.fast_period}/EMA{self.slow_period} "
+            print(f"🚀 KlineEMA v7: EMA{self.fast_period}/EMA{self.slow_period} "
                   f"· {self.interval} · top {self.top_n} más activas "
                   f"· {self.max_candles} velas/símbolo")
 
@@ -662,6 +801,7 @@ class KlineWebSocketCache:
         self._states.clear()
         self._pending.clear()
         self._warming.clear()
+        self._rewarm.clear()
         self._subscribed.clear()
         print("✅ KlineEMA detenido")
 
@@ -694,6 +834,8 @@ class KlineWebSocketCache:
             "signals":           self.signals,
             "stale_signals":     self.stale_signals,
             "gap_resyncs":       self.gap_resyncs,
+            "gap_fills":         self.gap_fills,
+            "full_warmups":      self.full_warmups,
             "connected":         self._connected,
             "reconnects":        self.reconnects,
             "last_error":        self.last_error,
